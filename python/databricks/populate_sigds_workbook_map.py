@@ -373,22 +373,29 @@ print(f"Step 4: {len(new_records)} unique SIGDS tables after deduplication.")
 # ---------------------------------------------------------------------------
 # Step 5 — DESCRIBE DETAIL (parallel) for each new/updated SIGDS table
 # ---------------------------------------------------------------------------
-sigds_bare_names = [r["SIGDS_TABLE"] for r in new_records if r["SIGDS_TABLE"]]
+# Pre-flight: fetch all table names in the schema once so we can identify
+# orphaned WAL records without attempting (and failing) DESCRIBE DETAIL on
+# tables that no longer exist.
+existing_tables = {
+    r.tableName.lower()
+    for r in spark.sql(f"SHOW TABLES IN `{CATALOG}`.`{SCHEMA}`").collect()
+}
+
+all_sigds_names  = [r["SIGDS_TABLE"] for r in new_records if r["SIGDS_TABLE"]]
+orphaned_tables  = {t for t in all_sigds_names if t.lower() not in existing_tables}
+sigds_bare_names = [t for t in all_sigds_names if t.lower() in existing_tables]
+
+if orphaned_tables:
+    print(f"Step 5: {len(orphaned_tables)} orphaned WAL record(s) — SIGDS table not found in schema:")
+    for t in sorted(orphaned_tables):
+        print(f"  {t}")
+
 print(
     f"Step 5: Running DESCRIBE DETAIL on {len(sigds_bare_names)} SIGDS tables "
     f"using {DESCRIBE_WORKERS} workers..."
 )
 detail_map = parallel_describe_sigds(sigds_bare_names)
-
-# Identify orphaned WAL records — SIGDS table referenced in the WAL no longer
-# exists in Databricks (e.g. it was dropped).  These are retained in the MERGE
-# with IS_ORPHANED=True and null physical metadata so they are visible for audit.
-orphaned_tables = {r["SIGDS_TABLE"] for r in new_records if not detail_map.get(r["SIGDS_TABLE"])}
-if orphaned_tables:
-    print(f"Step 5: {len(orphaned_tables)} orphaned WAL record(s) — SIGDS table not found:")
-    for t in sorted(orphaned_tables):
-        print(f"  {t}")
-print(f"Step 5: DESCRIBE DETAIL complete. {len(new_records) - len(orphaned_tables)} valid, {len(orphaned_tables)} orphaned.")
+print(f"Step 5: DESCRIBE DETAIL complete. {len(sigds_bare_names)} valid, {len(orphaned_tables)} orphaned.")
 
 # ---------------------------------------------------------------------------
 # Step 6 — Sigma API enrichment for new WORKBOOK_IDs only  (Option B)
