@@ -19,7 +19,9 @@ Run logic per execution
 6. Fetch Sigma workbook/data-model metadata only for WORKBOOK_IDs not already
    present in the target table.  Resolve owner names via /v2/members.
 7. Merge all changes into SIGDS_WORKBOOK_MAP via a single MERGE statement
-   keyed on SIGDS_TABLE.
+   keyed on SIGDS_TABLE.  Flag records whose WAL table has disappeared as
+   IS_DELETED=TRUE with a DELETED_AT timestamp; clear the flag if the WAL
+   table reappears.
 
 Design notes
 ------------
@@ -277,16 +279,23 @@ stored_rows = spark.sql(f"""
     SELECT WAL_TABLE, WAL_LAST_ALTERED, WORKBOOK_ID,
            WORKBOOK_NAME, WORKBOOK_PATH, OBJECT_TYPE,
            api_url, api_owner_id, api_is_archived,
-           api_owner_first_name, api_owner_last_name
+           api_owner_first_name, api_owner_last_name,
+           IS_DELETED
     FROM   {TARGET_TABLE}
 """).collect()
 
-watermarks       = {}  # {wal_table -> most recent WAL_LAST_ALTERED stored}
-known_wb_ids     = set()
-known_enrichment = {}  # {WORKBOOK_ID -> enrichment dict} for already-seen IDs
+watermarks                = {}   # {wal_table -> most recent WAL_LAST_ALTERED stored}
+known_wb_ids              = set()
+known_enrichment          = {}   # {WORKBOOK_ID -> enrichment dict} for already-seen IDs
+known_wal_tables          = set() # all WAL_TABLEs currently tracked in the map
+previously_deleted_wals   = set() # WAL_TABLEs already flagged IS_DELETED=TRUE
 
 for row in stored_rows:
     wt, ts = row["WAL_TABLE"], row["WAL_LAST_ALTERED"]
+    if wt:
+        known_wal_tables.add(wt)
+        if row["IS_DELETED"]:
+            previously_deleted_wals.add(wt)
     if ts and (wt not in watermarks or ts > watermarks[wt]):
         watermarks[wt] = ts
     wid = row["WORKBOOK_ID"]
@@ -306,7 +315,8 @@ for row in stored_rows:
 
 print(
     f"Step 2: Loaded watermarks for {len(watermarks)} WAL tables; "
-    f"{len(known_wb_ids)} WORKBOOK_IDs already enriched."
+    f"{len(known_wb_ids)} WORKBOOK_IDs already enriched; "
+    f"{len(previously_deleted_wals)} previously flagged as deleted."
 )
 
 # ---------------------------------------------------------------------------
@@ -323,6 +333,25 @@ all_wal_names = [
 ]
 if MAX_WAL_TABLES > 0:
     all_wal_names = all_wal_names[:MAX_WAL_TABLES]
+
+all_wal_set = set(all_wal_names)
+
+# Deletion detection requires the full WAL table list to be reliable.
+# When MAX_WAL_TABLES is set, all_wal_names is only a subset, so any table
+# outside the cap would be wrongly flagged as deleted — skip in that case.
+if MAX_WAL_TABLES == 0:
+    newly_deleted_wals = known_wal_tables - all_wal_set        # in map, gone from schema
+    reappeared_wals    = previously_deleted_wals & all_wal_set # was deleted, now back
+    if newly_deleted_wals:
+        print(f"Step 3: {len(newly_deleted_wals)} WAL table(s) no longer in schema — will be flagged as deleted:")
+        for w in sorted(newly_deleted_wals):
+            print(f"  {w}")
+    if reappeared_wals:
+        print(f"Step 3: {len(reappeared_wals)} previously deleted WAL table(s) have reappeared — deletion flag will be cleared.")
+else:
+    newly_deleted_wals = set()
+    reappeared_wals    = set()
+    print("Step 3: Deletion detection skipped (MAX_WAL_TABLES is set — full WAL list not available).")
 
 print(
     f"Step 3: Discovered {len(all_wal_names)} WAL tables. "
@@ -342,7 +371,7 @@ print(
     f"{len(all_wal_names) - len(to_process)} unchanged and skipped."
 )
 
-if not to_process:
+if not to_process and not newly_deleted_wals and not reappeared_wals:
     print("SIGDS_WORKBOOK_MAP is already up to date. Nothing to do.")
     raise SystemExit(0)
 
@@ -489,6 +518,8 @@ MERGE_SCHEMA = StructType([
     StructField("MAX_EDIT_NUM",         LongType(),      True),
     StructField("WAL_LAST_ALTERED",     TimestampType(), True),
     StructField("IS_ORPHANED",          BooleanType(),   True),
+    StructField("IS_DELETED",           BooleanType(),   True),
+    StructField("DELETED_AT",           TimestampType(), True),
     # Option B archival detection
     StructField("api_url",              StringType(),    True),
     StructField("api_owner_id",         StringType(),    True),
@@ -529,6 +560,8 @@ for r in new_records:
         r["MAX_EDIT_NUM"],
         wal_last_altered.get(r["WAL_TABLE"]),
         r["SIGDS_TABLE"] in orphaned_tables,
+        False,   # IS_DELETED — active record
+        None,    # DELETED_AT — active record
         enrichment.get("api_url"),
         enrichment.get("api_owner_id"),
         enrichment.get("api_is_archived"),
@@ -550,10 +583,33 @@ spark.sql(f"""
 """)
 print(f"Step 7: MERGE complete — {len(rows)} rows upserted into {TARGET_TABLE}.")
 
+# Flag records whose WAL table has disappeared since the last run.
+if newly_deleted_wals:
+    wal_csv = ", ".join(f"'{w}'" for w in newly_deleted_wals)
+    spark.sql(f"""
+        UPDATE {TARGET_TABLE}
+        SET    IS_DELETED = TRUE,
+               DELETED_AT = current_timestamp()
+        WHERE  WAL_TABLE IN ({wal_csv})
+          AND  (IS_DELETED IS NULL OR IS_DELETED = FALSE)
+    """)
+    print(f"Step 7: Flagged {len(newly_deleted_wals)} record(s) as deleted.")
+
+# Clear the deletion flag for WAL tables that have reappeared.
+if reappeared_wals:
+    wal_csv = ", ".join(f"'{w}'" for w in reappeared_wals)
+    spark.sql(f"""
+        UPDATE {TARGET_TABLE}
+        SET    IS_DELETED = FALSE,
+               DELETED_AT = NULL
+        WHERE  WAL_TABLE IN ({wal_csv})
+    """)
+    print(f"Step 7: Cleared deletion flag for {len(reappeared_wals)} reappeared record(s).")
+
 # Sanity check — show most recently modified entries
 spark.sql(f"""
-    SELECT SIGDS_TABLE, WORKBOOK_NAME, OBJECT_TYPE, IS_ORPHANED, api_is_archived,
-           api_owner_first_name, api_owner_last_name,
+    SELECT SIGDS_TABLE, WORKBOOK_NAME, OBJECT_TYPE, IS_ORPHANED, IS_DELETED, DELETED_AT,
+           api_is_archived, api_owner_first_name, api_owner_last_name,
            TABLE_SIZE_BYTES, TABLE_LAST_MODIFIED, MAX_EDIT_NUM, WAL_LAST_ALTERED
     FROM   {TARGET_TABLE}
     ORDER  BY TABLE_LAST_MODIFIED DESC NULLS LAST

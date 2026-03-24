@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS SIGDS_WORKBOOK_MAP (
   -- Data quality flags
   -- ---------------------------------------------------------------------------
   IS_ORPHANED      BOOLEAN   COMMENT 'TRUE when the SIGDS table referenced by the WAL no longer exists in Databricks (e.g. it was dropped). Physical metadata columns will be NULL for orphaned rows.',
+  IS_DELETED       BOOLEAN   COMMENT 'TRUE when the WAL table for this record is no longer present in the schema. Set on the run that first detects the absence; cleared automatically if the WAL table reappears.',
+  DELETED_AT       TIMESTAMP COMMENT 'Timestamp of the run that first flagged this record as deleted. NULL when IS_DELETED is FALSE or when the record has been reinstated.',
 
   -- ---------------------------------------------------------------------------
   -- Sigma API enrichment  (Option B: populated once on first-seen WORKBOOK_ID)
