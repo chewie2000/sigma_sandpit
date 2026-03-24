@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS customer_success.marko_wb.SIGDS_WORKBOOK_MAP (
   -- ---------------------------------------------------------------------------
   -- Incremental processing watermark
   -- ---------------------------------------------------------------------------
-  WAL_LAST_ALTERED TIMESTAMP COMMENT 'lastModified from DESCRIBE DETAIL on the WAL table at the time it was last processed; compared against the current lastModified on each run to skip WAL tables that have not changed, without reading any row data'
+  WAL_LAST_ALTERED TIMESTAMP COMMENT 'lastModified from DESCRIBE DETAIL on the WAL table at the time it was last processed; compared against the current lastModified on each run to skip WAL tables that have not changed, without reading any row data',
+
+  -- ---------------------------------------------------------------------------
+  -- Sigma API enrichment  (Option B: populated once on first-seen WORKBOOK_ID)
+  -- ---------------------------------------------------------------------------
+  api_url              STRING  COMMENT 'Workbook/data-model URL from Sigma API (set once on first enrichment)',
+  api_owner_id         STRING  COMMENT 'Sigma member UUID of the workbook owner (from Sigma API)',
+  api_is_archived      BOOLEAN COMMENT 'Archived state at time of first discovery; never re-checked. FALSE for data models found in the active list.',
+  api_owner_first_name STRING  COMMENT 'Owner first name resolved via GET /v2/members',
+  api_owner_last_name  STRING  COMMENT 'Owner last name resolved via GET /v2/members'
 
 );
