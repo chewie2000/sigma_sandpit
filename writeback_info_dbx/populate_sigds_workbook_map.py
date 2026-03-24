@@ -35,11 +35,11 @@ Design notes
 - All DESCRIBE DETAIL calls (WAL tables and SIGDS tables) are parallelised
   via a shared thread pool — safe because DESCRIBE DETAIL does not scan data.
 - Sigma API calls are skipped entirely when all WORKBOOK_IDs are already known.
-- Option B archival detection: api_is_archived (and the other api_* columns)
-  are populated exactly once when a WORKBOOK_ID is first seen.  Subsequent
-  runs for the same WORKBOOK_ID use the cached values from the target table,
-  so the archived state is a discovery-time snapshot and no extra API calls
-  are made for known workbooks.
+- api_is_archived is refreshed on every run for all known WORKBOOK_IDs by
+  comparing the current Sigma API workbook list against stored values.  A
+  workbook not present in the active list is treated as archived.  Other
+  api_* columns (name, path, owner) are still set once on first discovery
+  and not refreshed.
 """
 
 import base64
@@ -468,25 +468,34 @@ else:
     print("Step 5: Orphan check for existing records skipped (MAX_WAL_TABLES is set).")
 
 # ---------------------------------------------------------------------------
-# Step 6 — Sigma API enrichment for new WORKBOOK_IDs only  (Option B)
+# Step 6 — Sigma API enrichment (new IDs) + archive status refresh (all IDs)
 # ---------------------------------------------------------------------------
-# api_* columns are populated once on first encounter and never refreshed.
-# For known WORKBOOK_IDs the values are carried forward from known_enrichment.
+# New WORKBOOK_IDs receive full enrichment (name, path, owner, archived state).
+# All existing WORKBOOK_IDs have their archive status re-checked on every run;
+# a workbook absent from the active API list is treated as archived.
+# Other api_* columns (name, path, owner) are not refreshed for known IDs.
 new_wb_ids = {
     r["WORKBOOK_ID"]
     for r in new_records
     if r["WORKBOOK_ID"] and r["WORKBOOK_ID"] not in known_wb_ids
 }
-wb_meta = {}  # {WORKBOOK_ID -> full enrichment dict} for newly-seen IDs
+wb_meta         = {}  # {WORKBOOK_ID -> full enrichment dict} for newly-seen IDs
+archive_updates = {}  # {WORKBOOK_ID -> new_is_archived} for changed existing IDs
 
-if new_wb_ids:
-    print(f"Step 6: Fetching Sigma metadata for {len(new_wb_ids)} new WORKBOOK_IDs...")
+all_wb_ids_to_check = new_wb_ids | known_wb_ids
+
+if all_wb_ids_to_check:
+    print(
+        f"Step 6: Fetching Sigma workbook/data-model list "
+        f"({len(new_wb_ids)} new enrichment, {len(known_wb_ids)} archive re-check)..."
+    )
     workbooks  = sigma_paginate(sigma_token, "workbooks")
     datamodels = sigma_paginate(sigma_token, "dataModels")
     print(f"Step 6: Sigma API returned {len(workbooks)} workbook(s), {len(datamodels)} data model(s).")
-    wb_index = build_id_index(workbooks,  new_wb_ids)
-    dm_index = build_id_index(datamodels, new_wb_ids)
+    wb_index = build_id_index(workbooks,  all_wb_ids_to_check)
+    dm_index = build_id_index(datamodels, all_wb_ids_to_check)
 
+    # Full enrichment for newly-seen WORKBOOK_IDs.
     for wid in new_wb_ids:
         norm  = wid.strip().lower()
         entry = wb_index.get(norm) or dm_index.get(norm)
@@ -500,14 +509,12 @@ if new_wb_ids:
             "OBJECT_TYPE":          "WORKBOOK" if is_wb else "DATA_MODEL",
             "api_url":              entry.get("url"),
             "api_owner_id":         entry.get("ownerId"),
-            # Option B: archived state captured at discovery time only.
-            # Data models found in the active list are treated as not archived.
             "api_is_archived":      entry.get("isArchived", False) if is_wb else False,
             "api_owner_first_name": None,
             "api_owner_last_name":  None,
         }
 
-    # Resolve owner display names via /v2/members
+    # Resolve owner display names for new IDs via /v2/members.
     owner_ids = {m["api_owner_id"] for m in wb_meta.values() if m.get("api_owner_id")}
     if owner_ids:
         print(f"Step 6: Fetching Sigma members to resolve {len(owner_ids)} owner ID(s)...")
@@ -525,9 +532,30 @@ if new_wb_ids:
                 meta["api_owner_first_name"] = member.get("firstName")
                 meta["api_owner_last_name"]  = member.get("lastName")
 
-    print(f"Step 6: Resolved {len(wb_meta)} of {len(new_wb_ids)} new WORKBOOK_IDs.")
+    if new_wb_ids:
+        print(f"Step 6: Resolved {len(wb_meta)} of {len(new_wb_ids)} new WORKBOOK_IDs.")
+
+    # Archive status re-check for all existing WORKBOOK_IDs.
+    # Workbooks absent from the active list are treated as archived.
+    # Data models are never considered archived.
+    for wid in known_wb_ids:
+        norm            = wid.strip().lower()
+        stored_archived = known_enrichment.get(wid, {}).get("api_is_archived")
+        if norm in wb_index:
+            current_archived = wb_index[norm].get("isArchived", False)
+        elif norm in dm_index:
+            current_archived = False
+        else:
+            current_archived = True   # not in active list → archived
+        if current_archived != stored_archived:
+            archive_updates[wid] = current_archived
+
+    if archive_updates:
+        print(f"Step 6: Archive status changed for {len(archive_updates)} existing WORKBOOK_ID(s).")
+    else:
+        print("Step 6: No archive status changes detected.")
 else:
-    print("Step 6: No new WORKBOOK_IDs — Sigma API fetch skipped.")
+    print("Step 6: No WORKBOOK_IDs to process — Sigma API fetch skipped.")
 
 # ---------------------------------------------------------------------------
 # Step 7 — Assemble rows and MERGE into SIGDS_WORKBOOK_MAP
@@ -556,7 +584,7 @@ MERGE_SCHEMA = StructType([
     StructField("IS_DELETED",           BooleanType(),   True),
     StructField("DELETED_AT",           TimestampType(), True),
     StructField("IS_LEGACY_WAL",        BooleanType(),   True),
-    # Option B archival detection
+    # Sigma API enrichment fields
     StructField("api_url",              StringType(),    True),
     StructField("api_owner_id",         StringType(),    True),
     StructField("api_is_archived",      BooleanType(),   True),
@@ -633,6 +661,19 @@ if newly_deleted_wals:
           AND  (IS_DELETED IS NULL OR IS_DELETED = FALSE)
     """)
     print(f"Step 7: Flagged {len(newly_deleted_wals)} record(s) as deleted.")
+
+# Apply archive status changes for existing WORKBOOK_IDs.
+if archive_updates:
+    newly_archived   = [w for w, v in archive_updates.items() if v]
+    newly_unarchived = [w for w, v in archive_updates.items() if not v]
+    if newly_archived:
+        wid_csv = ", ".join(f"'{w}'" for w in newly_archived)
+        spark.sql(f"UPDATE {TARGET_TABLE} SET api_is_archived = TRUE  WHERE WORKBOOK_ID IN ({wid_csv})")
+        print(f"Step 7: Marked {len(newly_archived)} workbook(s) as archived.")
+    if newly_unarchived:
+        wid_csv = ", ".join(f"'{w}'" for w in newly_unarchived)
+        spark.sql(f"UPDATE {TARGET_TABLE} SET api_is_archived = FALSE WHERE WORKBOOK_ID IN ({wid_csv})")
+        print(f"Step 7: Marked {len(newly_unarchived)} workbook(s) as unarchived.")
 
 # Update IS_ORPHANED for existing records not covered by the MERGE.
 if newly_orphaned_existing:
