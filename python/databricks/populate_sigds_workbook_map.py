@@ -357,6 +357,19 @@ for idx, batch in enumerate(batches, start=1):
 
 print(f"Step 4: Extracted {len(new_records)} new/updated SIGDS table records.")
 
+# Deduplicate by SIGDS_TABLE (the MERGE key), keeping the highest MAX_EDIT_NUM.
+# Sigma can maintain two WAL tables for the same dataset when it migrates from
+# the old random-UUID naming (sigds_wal_<uuid>) to the DS_ID-based naming
+# (sigds_wal_ds_<ds_id>).  Both appear in SHOW TABLES and both pass the
+# rn=1 filter within their own UNION ALL subquery, so we must dedup here.
+_seen: dict = {}
+for r in new_records:
+    t = r["SIGDS_TABLE"]
+    if t and (t not in _seen or (r["MAX_EDIT_NUM"] or 0) > (_seen[t]["MAX_EDIT_NUM"] or 0)):
+        _seen[t] = r
+new_records = list(_seen.values())
+print(f"Step 4: {len(new_records)} unique SIGDS tables after deduplication.")
+
 # ---------------------------------------------------------------------------
 # Step 5 — DESCRIBE DETAIL (parallel) for each new/updated SIGDS table
 # ---------------------------------------------------------------------------
