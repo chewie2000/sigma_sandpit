@@ -35,11 +35,12 @@ Design notes
 - All DESCRIBE DETAIL calls (WAL tables and SIGDS tables) are parallelised
   via a shared thread pool — safe because DESCRIBE DETAIL does not scan data.
 - Sigma API calls are skipped entirely when all WORKBOOK_IDs are already known.
-- api_is_archived is refreshed on every run for all known WORKBOOK_IDs by
-  comparing the current Sigma API workbook list against stored values.  A
-  workbook not present in the active list is treated as archived.  Other
-  api_* columns (name, path, owner) are still set once on first discovery
-  and not refreshed.
+- api_is_archived is refreshed on every run for all known WORKBOOK_IDs.
+  Only workbooks explicitly returned by the API are updated; a workbook
+  absent from the API response is left unchanged, as the API will always
+  include archived workbooks with isArchived=True rather than omitting them.
+  Data models are always treated as non-archived.  Other api_* columns
+  (name, path, owner) are set once on first discovery and not refreshed.
 """
 
 import base64
@@ -536,17 +537,21 @@ if all_wb_ids_to_check:
         print(f"Step 6: Resolved {len(wb_meta)} of {len(new_wb_ids)} new WORKBOOK_IDs.")
 
     # Archive status re-check for all existing WORKBOOK_IDs.
-    # Workbooks absent from the active list are treated as archived.
-    # Data models are never considered archived.
+    # Only update when the API explicitly provides an archived state:
+    #   - Workbooks in the API response → use the isArchived flag from the record.
+    #   - Data models (in dm_index or previously stored as DATA_MODEL) → False.
+    #   - IDs absent from both indexes → skip; the API is the authoritative source
+    #     for archived state and will always include a workbook record with
+    #     isArchived=True rather than omitting it when archived.
     for wid in known_wb_ids:
         norm            = wid.strip().lower()
         stored_archived = known_enrichment.get(wid, {}).get("api_is_archived")
         if norm in wb_index:
             current_archived = wb_index[norm].get("isArchived", False)
-        elif norm in dm_index:
+        elif norm in dm_index or known_enrichment.get(wid, {}).get("OBJECT_TYPE") == "DATA_MODEL":
             current_archived = False
         else:
-            current_archived = True   # not in active list → archived
+            continue   # not in API response — do not assume archived
         if current_archived != stored_archived:
             archive_updates[wid] = current_archived
 
