@@ -235,10 +235,10 @@ def extract_wal_records_batch(wal_batch: list) -> list:
                 get_json_object(EDIT, '$.updateRow.blameInfo.updatedBy'),
                 get_json_object(EDIT, '$.addRow.blameInfo.updatedBy')
             )                                                   AS LAST_EDIT_BY,
-            element_at(split(coalesce(
+            get(split(coalesce(
                 get_json_object(METADATA, '$.sigmaUrl'),
                 get_json_object(METADATA, '$.workbookUrl')
-            ), '/'), 4)                                         AS ORG_SLUG,
+            ), '/'), 3)                                         AS ORG_SLUG,
             row_number() OVER (
                 PARTITION BY get_json_object(METADATA, '$.tableName')
                 ORDER BY EDIT_NUM DESC
