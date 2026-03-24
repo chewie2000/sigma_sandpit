@@ -379,7 +379,16 @@ print(
     f"using {DESCRIBE_WORKERS} workers..."
 )
 detail_map = parallel_describe_sigds(sigds_bare_names)
-print("Step 5: DESCRIBE DETAIL complete.")
+
+# Identify orphaned WAL records — SIGDS table referenced in the WAL no longer
+# exists in Databricks (e.g. it was dropped).  These are retained in the MERGE
+# with IS_ORPHANED=True and null physical metadata so they are visible for audit.
+orphaned_tables = {r["SIGDS_TABLE"] for r in new_records if not detail_map.get(r["SIGDS_TABLE"])}
+if orphaned_tables:
+    print(f"Step 5: {len(orphaned_tables)} orphaned WAL record(s) — SIGDS table not found:")
+    for t in sorted(orphaned_tables):
+        print(f"  {t}")
+print(f"Step 5: DESCRIBE DETAIL complete. {len(new_records) - len(orphaned_tables)} valid, {len(orphaned_tables)} orphaned.")
 
 # ---------------------------------------------------------------------------
 # Step 6 — Sigma API enrichment for new WORKBOOK_IDs only  (Option B)
@@ -462,6 +471,7 @@ MERGE_SCHEMA = StructType([
     StructField("TABLE_SIZE_BYTES",     LongType(),      True),
     StructField("MAX_EDIT_NUM",         LongType(),      True),
     StructField("WAL_LAST_ALTERED",     TimestampType(), True),
+    StructField("IS_ORPHANED",          BooleanType(),   True),
     # Option B archival detection
     StructField("api_url",              StringType(),    True),
     StructField("api_owner_id",         StringType(),    True),
@@ -501,6 +511,7 @@ for r in new_records:
         detail.get("TABLE_SIZE_BYTES"),
         r["MAX_EDIT_NUM"],
         wal_last_altered.get(r["WAL_TABLE"]),
+        r["SIGDS_TABLE"] in orphaned_tables,
         enrichment.get("api_url"),
         enrichment.get("api_owner_id"),
         enrichment.get("api_is_archived"),
@@ -524,7 +535,7 @@ print(f"Step 7: MERGE complete — {len(rows)} rows upserted into {TARGET_TABLE}
 
 # Sanity check — show most recently modified entries
 spark.sql(f"""
-    SELECT SIGDS_TABLE, WORKBOOK_NAME, OBJECT_TYPE, api_is_archived,
+    SELECT SIGDS_TABLE, WORKBOOK_NAME, OBJECT_TYPE, IS_ORPHANED, api_is_archived,
            api_owner_first_name, api_owner_last_name,
            TABLE_SIZE_BYTES, TABLE_LAST_MODIFIED, MAX_EDIT_NUM, WAL_LAST_ALTERED
     FROM   {TARGET_TABLE}

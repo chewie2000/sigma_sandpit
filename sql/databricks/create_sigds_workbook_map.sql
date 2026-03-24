@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS customer_success.marko_wb.SIGDS_WORKBOOK_MAP (
   WAL_LAST_ALTERED TIMESTAMP COMMENT 'lastModified from DESCRIBE DETAIL on the WAL table at the time it was last processed; compared against the current lastModified on each run to skip WAL tables that have not changed, without reading any row data',
 
   -- ---------------------------------------------------------------------------
+  -- Data quality flags
+  -- ---------------------------------------------------------------------------
+  IS_ORPHANED      BOOLEAN   COMMENT 'TRUE when the SIGDS table referenced by the WAL no longer exists in Databricks (e.g. it was dropped). Physical metadata columns will be NULL for orphaned rows.',
+
+  -- ---------------------------------------------------------------------------
   -- Sigma API enrichment  (Option B: populated once on first-seen WORKBOOK_ID)
   -- ---------------------------------------------------------------------------
   api_url              STRING  COMMENT 'Workbook/data-model URL from Sigma API (set once on first enrichment)',
