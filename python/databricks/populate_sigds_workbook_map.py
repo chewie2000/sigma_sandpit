@@ -1,486 +1,408 @@
 """
 populate_sigds_workbook_map.py
+Databricks notebook / job script.
 
-Incrementally populates SIGDS_WORKBOOK_MAP from Sigma writeback WAL tables
-and the Sigma REST API.
+Scans Sigma Integration Data Store (SIGDS) WAL tables and builds a
+mapping from SIGDS tables to their parent Sigma workbooks/data models.
 
-Run logic per execution
------------------------
-1. Load stored WAL_LAST_ALTERED watermarks and known WORKBOOK_IDs from the
-   target table (single query).
-2. Discover all sigds_wal_* tables via SHOW TABLES (single query).
-3. Run DESCRIBE DETAIL in parallel on every WAL table to read lastModified
-   (metadata-only, no table scans).  Skip WAL tables whose lastModified has
-   not changed since the stored watermark.
-4. Extract the latest WAL entry per SIGDS table from changed WAL tables via
-   batched UNION ALL queries (one Spark job per batch, not per table).
-5. Run DESCRIBE DETAIL in parallel for each new/changed SIGDS table to
-   capture Delta metadata (id, location, size, timestamps).
-6. Fetch Sigma workbook/data-model metadata only for WORKBOOK_IDs not already
-   present in the target table.
-7. Merge all changes into SIGDS_WORKBOOK_MAP via a single MERGE statement
-   keyed on SIGDS_TABLE.
+Option B archival detection
+---------------------------
+api_is_archived is populated exactly once, when a WORKBOOK_ID is first
+seen.  It reflects the workbook's archived state at the moment of first
+enrichment and is never refreshed unless the table is rebuilt from
+scratch.  This avoids repeated API calls and keeps the column stable as
+a discovery-time snapshot.
 
-Design notes
-------------
-- WAL_LAST_ALTERED stores the lastModified timestamp returned by DESCRIBE
-  DETAIL on the WAL table.  On each run this value is compared against the
-  stored watermark; WAL tables with no new writes are skipped without reading
-  any row data.  DESCRIBE DETAIL is metadata-only and requires no special
-  permissions beyond SELECT on the table.
-- MAX_EDIT_NUM is the EDIT_NUM of the highest-numbered row for that SIGDS
-  table; it is derived from the WAL extract (rn=1 row) with no extra queries.
-- All DESCRIBE DETAIL calls (WAL tables and SIGDS tables) are parallelised
-  via a shared thread pool — safe because DESCRIBE DETAIL does not scan data.
-- Sigma API calls are skipped entirely when all WORKBOOK_IDs are already known.
+WAL table assumptions
+---------------------
+Each SIGDS output table has a companion WAL table named
+<sigds_table_name>_WAL (suffix configurable via pipeline.wal_table_suffix).
+The WAL table must expose at minimum:
+  WORKBOOK_ID  STRING     -- Sigma workbook / data-model UUID
+  ALTERED_AT   TIMESTAMP  -- row write timestamp
 """
 
-import base64
-import concurrent.futures
 import requests
 from pyspark.sql import SparkSession
 from pyspark.sql.types import (
-    LongType, StringType, StructField, StructType, TimestampType,
+    BooleanType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
 )
+
+# ---------------------------------------------------------------------------
+# dbutils shim (auto-injected in notebooks; needs import in job context)
+# ---------------------------------------------------------------------------
+try:
+    dbutils  # noqa: F821
+except NameError:
+    from databricks.sdk.runtime import dbutils  # noqa: F821
 
 spark = SparkSession.builder.getOrCreate()
 
 # ---------------------------------------------------------------------------
-# Configuration — update before running
+# Configuration  (override via Databricks job / cluster spark conf)
 # ---------------------------------------------------------------------------
-CATALOG          = "customer_success"   # Databricks Unity Catalog name
-SCHEMA           = "marko_wb"           # Schema containing SIGDS + WAL tables
-TARGET_TABLE     = f"{CATALOG}.{SCHEMA}.SIGDS_WORKBOOK_MAP"
-SIGMA_API_BASE   = "https://api.eu.aws.sigmacomputing.com/v2"  # EU AWS endpoint
-SIGMA_CLIENT_ID  = "<YOUR_SIGMA_CLIENT_ID>"
-SIGMA_CLIENT_SECRET = "<YOUR_SIGMA_CLIENT_SECRET>"
-MAX_WAL_TABLES   = 0   # 0 = all; set > 0 to cap WAL tables for testing
-DESCRIBE_WORKERS = 16  # thread-pool size for all parallel DESCRIBE DETAIL calls
-WAL_BATCH_SIZE   = 100 # max WAL tables per UNION ALL query
+SIGDS_CATALOG    = spark.conf.get("pipeline.sigds_catalog",    "main")
+SIGDS_SCHEMA     = spark.conf.get("pipeline.sigds_schema",     "sigds")
+TARGET_TABLE     = spark.conf.get("pipeline.target_table",     "main.sigds_ops.sigds_workbook_map")
+SIGMA_BASE_URL   = spark.conf.get("pipeline.sigma_base_url",   "https://aws-api.sigmacomputing.com")
+SECRET_SCOPE     = spark.conf.get("pipeline.secret_scope",     "sigma")
+SECRET_CLIENT_ID = spark.conf.get("pipeline.secret_client_id", "client_id")
+SECRET_SECRET    = spark.conf.get("pipeline.secret_secret",    "client_secret")
+WAL_TABLE_SUFFIX = spark.conf.get("pipeline.wal_table_suffix", "_WAL")
+
 # ---------------------------------------------------------------------------
-
-if SIGMA_CLIENT_ID.startswith("<YOUR_") or SIGMA_CLIENT_SECRET.startswith("<YOUR_"):
-    raise ValueError("Set SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET before running.")
-
-
-# ===========================================================================
 # Sigma API helpers
-# ===========================================================================
+# ---------------------------------------------------------------------------
 
-def get_sigma_token(client_id: str, client_secret: str) -> str:
-    """Obtain a Sigma OAuth bearer token using the client credentials flow."""
-    auth_b64 = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+def get_sigma_token(base_url, client_id, client_secret):
     resp = requests.post(
-        f"{SIGMA_API_BASE}/auth/token",
-        headers={
-            "Authorization": f"Basic {auth_b64}",
-            "Content-Type": "application/x-www-form-urlencoded",
+        f"{base_url}/v2/auth/token",
+        data={
+            "grant_type":    "client_credentials",
+            "client_id":     client_id,
+            "client_secret": client_secret,
         },
-        data={"grant_type": "client_credentials"},
         timeout=30,
     )
     resp.raise_for_status()
-    token = resp.json().get("access_token")
-    if not token:
-        raise RuntimeError("Sigma token response did not contain access_token.")
-    return token
+    return resp.json()["access_token"]
 
 
-def sigma_paginate(token: str, endpoint: str) -> list:
-    """
-    Fetch all pages from a Sigma list endpoint and return a flat list of items.
-    Tries common root-key names (entries, workbooks, dataModels, data, items)
-    to handle variation across Sigma API response shapes.
-    """
+def sigma_paginate(token, endpoint, base_url):
+    """Fetch all pages from a Sigma v2 list endpoint; returns flat entry list."""
+    url     = f"{base_url}/v2/{endpoint}"
     headers = {"Authorization": f"Bearer {token}"}
-    items, params = [], {}
-    while True:
-        resp = requests.get(
-            f"{SIGMA_API_BASE}/{endpoint}",
-            headers=headers, params=params, timeout=30,
-        )
+    entries = []
+    while url:
+        resp = requests.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
-        for key in ("entries", "workbooks", "dataModels", "data", "items"):
-            chunk = data.get(key)
-            if isinstance(chunk, list):
-                items.extend(chunk)
+        body = resp.json()
+        # All Sigma v2 list endpoints use "entries" as the root key
+        for key in ("entries", "workbooks", "dataModels", "members", "data", "items"):
+            if key in body:
+                entries.extend(body[key])
                 break
-        next_page = data.get("nextPage")
-        if not next_page:
-            break
-        params["page"] = next_page
-    return items
+        url = body.get("nextPage")
+    return entries
 
 
-def build_id_index(entries: list, target_ids: set) -> dict:
+def build_id_index(entries, target_ids):
     """
-    Index a list of Sigma API objects by the ID field that best overlaps
-    with target_ids.  Inspects every key containing 'id' in the first entry
-    and picks the one with the highest match count against target_ids.  This
-    avoids hard-coding field names that differ between API versions.
-    Returns {normalised_id_string: entry_dict}.
+    Return {id.lower(): entry} for entries whose workbookId / dataModelId
+    is present in target_ids (case-insensitive comparison).
     """
-    if not entries or not target_ids:
-        return {}
-    target_norm = {v.strip().lower() for v in target_ids}
-    candidates  = [k for k in entries[0] if "id" in k.lower()] or ["id"]
-    best_key    = max(
-        candidates,
-        key=lambda k: len(
-            {e[k].strip().lower() for e in entries if e.get(k)} & target_norm
-        ),
+    target_norm = {t.strip().lower() for t in target_ids}
+    index = {}
+    for e in entries:
+        eid = e.get("workbookId") or e.get("dataModelId") or e.get("documentId")
+        if eid and eid.strip().lower() in target_norm:
+            index[eid.strip().lower()] = e
+    return index
+
+
+# ===========================================================================
+# Step 1 – Ensure target table exists
+# ===========================================================================
+print("Step 1: Ensuring target table exists...")
+
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {TARGET_TABLE} (
+        SIGDS_TABLE             STRING    NOT NULL  COMMENT 'Fully-qualified SIGDS table name (merge key)',
+        WAL_TABLE               STRING              COMMENT 'WAL table this record was sourced from',
+        WAL_LAST_ALTERED        TIMESTAMP           COMMENT 'Watermark: latest ALTERED_AT seen in the WAL',
+        WORKBOOK_ID             STRING              COMMENT 'Sigma workbook or data model UUID',
+        WORKBOOK_NAME           STRING              COMMENT 'Display name from Sigma API',
+        WORKBOOK_PATH           STRING              COMMENT 'Folder path from Sigma API',
+        OBJECT_TYPE             STRING              COMMENT 'WORKBOOK or DATA_MODEL',
+        api_url                 STRING              COMMENT 'Direct browser URL to the workbook/data model',
+        api_owner_id            STRING              COMMENT 'Sigma member UUID of the workbook owner',
+        api_is_archived         BOOLEAN             COMMENT 'Option B: set once on first enrichment; TRUE if archived at time of discovery',
+        api_owner_first_name    STRING              COMMENT 'Owner first name resolved via GET /v2/members',
+        api_owner_last_name     STRING              COMMENT 'Owner last name resolved via GET /v2/members'
     )
-    return {
-        e[best_key].strip().lower(): e
-        for e in entries if e.get(best_key)
-    }
+    USING DELTA
+    COMMENT 'Maps SIGDS tables to their parent Sigma workbooks/data models.'
+""")
+
+print(f"Step 1: Target table ready: {TARGET_TABLE}")
 
 
 # ===========================================================================
-# Databricks / Delta helpers
+# Step 2 – Load existing state (watermarks + enrichment cache)
 # ===========================================================================
+print("Step 2: Loading existing watermarks and enrichment cache...")
 
-def _describe_detail_fq(full_name: str) -> dict:
-    """
-    Run DESCRIBE DETAIL on a fully-qualified table name and return the raw row
-    as a dict.  Returns an empty dict on failure.
-    Used internally by both WAL-table discovery and SIGDS-table enrichment.
-    """
-    try:
-        return spark.sql(f"DESCRIBE DETAIL {full_name}").collect()[0].asDict()
-    except Exception as exc:
-        print(f"  WARN: DESCRIBE DETAIL failed for {full_name}: {exc}")
-        return {}
-
-
-def get_wal_last_modified(full_wal_name: str) -> tuple:
-    """
-    Return (full_wal_name, lastModified) for a single WAL table.
-    lastModified is the Delta transaction timestamp — a reliable, cheap signal
-    that the table has received new writes, with no row data scanned.
-    Returns (full_wal_name, None) on failure.
-    """
-    detail = _describe_detail_fq(full_wal_name)
-    return full_wal_name, detail.get("lastModified")
-
-
-def parallel_wal_last_modified(wal_names: list) -> dict:
-    """
-    Run get_wal_last_modified concurrently for all WAL tables.
-    Returns {full_wal_name: lastModified_timestamp}.
-    """
-    results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=DESCRIBE_WORKERS) as pool:
-        futures = {pool.submit(get_wal_last_modified, w): w for w in wal_names}
-        for future in concurrent.futures.as_completed(futures):
-            name, ts = future.result()
-            results[name] = ts
-    return results
-
-
-def describe_sigds_table(table_name: str) -> dict:
-    """
-    Run DESCRIBE DETAIL for a single SIGDS table and return physical metadata.
-    Accepts a bare table name (no catalog/schema prefix); CATALOG and SCHEMA
-    constants are used to build the fully-qualified backtick-quoted identifier.
-
-    Returns a dict with keys:
-        TABLE_ID, TABLE_LOCATION, TABLE_CREATED_AT,
-        TABLE_LAST_MODIFIED, TABLE_SIZE_BYTES.
-    Returns an empty dict if the table does not exist or the call fails.
-    """
-    full   = f"`{CATALOG}`.`{SCHEMA}`.`{table_name}`"
-    detail = _describe_detail_fq(full)
-    if not detail:
-        return {}
-    return {
-        "TABLE_ID":            str(detail["id"]) if detail.get("id") else None,
-        "TABLE_LOCATION":      detail.get("location"),
-        "TABLE_CREATED_AT":    detail.get("createdAt"),
-        "TABLE_LAST_MODIFIED": detail.get("lastModified"),
-        "TABLE_SIZE_BYTES":    detail.get("sizeInBytes"),
-    }
-
-
-def parallel_describe_sigds(table_names: list) -> dict:
-    """
-    Run describe_sigds_table concurrently across all table_names using a
-    thread pool of size DESCRIBE_WORKERS.
-    Returns {bare_table_name: detail_dict}.
-    """
-    results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=DESCRIBE_WORKERS) as pool:
-        futures = {pool.submit(describe_sigds_table, t): t for t in table_names}
-        for future in concurrent.futures.as_completed(futures):
-            results[futures[future]] = future.result()
-    return results
-
-
-def extract_wal_records_batch(wal_batch: list) -> list:
-    """
-    Build and execute a single UNION ALL query across a batch of WAL tables.
-    Returns the latest WAL entry per SIGDS table (by highest EDIT_NUM) as a
-    list of Spark Row objects.
-
-    Using UNION ALL over a batch means one Spark job per batch rather than
-    one per WAL table, which is significantly faster at scale.
-
-    Notes:
-    - MAX_EDIT_NUM is taken from EDIT_NUM of the rn=1 row (the highest
-      EDIT_NUM for that SIGDS table partition), so no separate MAX() query
-      is needed.
-    - Each WAL table is expected to contain entries for a single SIGDS table;
-      the PARTITION BY handles edge cases where multiple tables appear.
-    """
-    parts = []
-    for wal in wal_batch:
-        parts.append(f"""
-        SELECT
-            '{wal}'   AS WAL_TABLE,
-            EDIT_NUM  AS MAX_EDIT_NUM,
-            DS_ID,
-            TIMESTAMP AS LAST_EDIT_AT,
-            get_json_object(METADATA, '$.tableName')            AS SIGDS_TABLE,
-            get_json_object(METADATA, '$.workbookId')           AS WORKBOOK_ID,
-            coalesce(
-                get_json_object(METADATA, '$.sigmaUrl'),
-                get_json_object(METADATA, '$.workbookUrl')
-            )                                                   AS WORKBOOK_URL,
-            coalesce(
-                get_json_object(METADATA, '$.elementTitle'),
-                get_json_object(METADATA, '$.inputTableTitle')
-            )                                                   AS INPUT_TABLE_NAME,
-            coalesce(
-                get_json_object(METADATA, '$.userEmail'),
-                get_json_object(EDIT, '$.updateRow.blameInfo.updatedBy'),
-                get_json_object(EDIT, '$.addRow.blameInfo.updatedBy')
-            )                                                   AS LAST_EDIT_BY,
-            element_at(split(coalesce(
-                get_json_object(METADATA, '$.sigmaUrl'),
-                get_json_object(METADATA, '$.workbookUrl')
-            ), '/'), 4)                                         AS ORG_SLUG,
-            row_number() OVER (
-                PARTITION BY get_json_object(METADATA, '$.tableName')
-                ORDER BY EDIT_NUM DESC
-            )                                                   AS rn
-        FROM {wal}
-        """)
-    union_sql = "\nUNION ALL\n".join(parts)
-    return spark.sql(f"""
-        SELECT * EXCEPT(rn)
-        FROM   ({union_sql})
-        WHERE  rn = 1
-          AND  SIGDS_TABLE IS NOT NULL
-    """).collect()
-
-
-# ===========================================================================
-# Main
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
-# Step 1 — Authenticate with Sigma
-# ---------------------------------------------------------------------------
-sigma_token = get_sigma_token(SIGMA_CLIENT_ID, SIGMA_CLIENT_SECRET)
-print("Step 1: Sigma token obtained.")
-
-# ---------------------------------------------------------------------------
-# Step 2 — Load stored watermarks and known WORKBOOK_IDs from target table
-# ---------------------------------------------------------------------------
-# WAL_LAST_ALTERED mirrors the DESCRIBE DETAIL lastModified of each WAL table
-# at the time it was last processed.  Comparing it against the current
-# lastModified tells us whether the WAL table has had new writes without
-# reading any row data.
 stored_rows = spark.sql(f"""
-    SELECT WAL_TABLE, WAL_LAST_ALTERED, WORKBOOK_ID
-    FROM   {TARGET_TABLE}
+    SELECT
+        WAL_TABLE,
+        WAL_LAST_ALTERED,
+        WORKBOOK_ID,
+        WORKBOOK_NAME,
+        WORKBOOK_PATH,
+        OBJECT_TYPE,
+        api_url,
+        api_owner_id,
+        api_is_archived,
+        api_owner_first_name,
+        api_owner_last_name
+    FROM {TARGET_TABLE}
 """).collect()
 
-watermarks   = {}  # {wal_table -> most recent WAL_LAST_ALTERED stored}
-known_wb_ids = set()
+watermarks       = {}  # {WAL_TABLE -> max WAL_LAST_ALTERED}
+known_wb_ids     = set()
+known_enrichment = {}  # {WORKBOOK_ID -> enrichment dict}
+
 for row in stored_rows:
     wt, ts = row["WAL_TABLE"], row["WAL_LAST_ALTERED"]
     if ts and (wt not in watermarks or ts > watermarks[wt]):
         watermarks[wt] = ts
-    if row["WORKBOOK_ID"]:
-        known_wb_ids.add(row["WORKBOOK_ID"])
+    wid = row["WORKBOOK_ID"]
+    if wid:
+        known_wb_ids.add(wid)
+        if wid not in known_enrichment:
+            known_enrichment[wid] = {
+                "WORKBOOK_NAME":        row["WORKBOOK_NAME"],
+                "WORKBOOK_PATH":        row["WORKBOOK_PATH"],
+                "OBJECT_TYPE":          row["OBJECT_TYPE"],
+                "api_url":              row["api_url"],
+                "api_owner_id":         row["api_owner_id"],
+                "api_is_archived":      row["api_is_archived"],
+                "api_owner_first_name": row["api_owner_first_name"],
+                "api_owner_last_name":  row["api_owner_last_name"],
+            }
 
-print(
-    f"Step 2: Loaded watermarks for {len(watermarks)} WAL tables; "
-    f"{len(known_wb_ids)} WORKBOOK_IDs already enriched."
-)
+print(f"Step 2: {len(watermarks)} WAL watermark(s) loaded; {len(known_wb_ids)} known workbook ID(s).")
 
-# ---------------------------------------------------------------------------
-# Step 3 — Discover WAL tables; pre-filter via parallel DESCRIBE DETAIL
-# ---------------------------------------------------------------------------
-# SHOW TABLES returns all tables in the schema in a single query.  We then
-# run DESCRIBE DETAIL on every sigds_wal_* table in parallel to read their
-# lastModified timestamps — metadata-only, no row scans, no special permissions
-# beyond SELECT on the tables themselves.
-wal_rows = (
-    spark.sql(f"SHOW TABLES IN `{CATALOG}`.`{SCHEMA}`")
-         .filter("lower(tableName) LIKE 'sigds_wal%'")
-         .collect()
-)
-all_wal_names = [
-    f"`{CATALOG}`.`{SCHEMA}`.`{r.tableName}`"
-    for r in wal_rows
-]
-if MAX_WAL_TABLES > 0:
-    all_wal_names = all_wal_names[:MAX_WAL_TABLES]
 
-print(
-    f"Step 3: Discovered {len(all_wal_names)} WAL tables. "
-    f"Running parallel DESCRIBE DETAIL to check for changes..."
-)
-wal_modified = parallel_wal_last_modified(all_wal_names)  # {full_name -> lastModified}
+# ===========================================================================
+# Step 3 – Discover WAL tables
+# ===========================================================================
+print(f"Step 3: Discovering WAL tables in {SIGDS_CATALOG}.{SIGDS_SCHEMA}...")
 
-to_process = [
-    (name, wal_modified[name])
-    for name in all_wal_names
-    if name not in watermarks
-    or (wal_modified.get(name) and wal_modified[name] > watermarks[name])
+wal_tables = [
+    row["full_name"]
+    for row in spark.sql(f"""
+        SELECT CONCAT(table_catalog, '.', table_schema, '.', table_name) AS full_name
+        FROM   {SIGDS_CATALOG}.information_schema.tables
+        WHERE  table_schema = '{SIGDS_SCHEMA}'
+          AND  table_name   LIKE '%{WAL_TABLE_SUFFIX}'
+          AND  table_type   = 'BASE TABLE'
+        ORDER BY table_name
+    """).collect()
 ]
 
-print(
-    f"Step 3: {len(to_process)} WAL tables require reprocessing; "
-    f"{len(all_wal_names) - len(to_process)} unchanged and skipped."
-)
+print(f"Step 3: Found {len(wal_tables)} WAL table(s).")
 
-if not to_process:
-    print("SIGDS_WORKBOOK_MAP is already up to date. Nothing to do.")
-    raise SystemExit(0)
+if not wal_tables:
+    print("Step 3: No WAL tables found — nothing to process.")
+    dbutils.notebook.exit("No WAL tables found")  # noqa: F821
 
-# ---------------------------------------------------------------------------
-# Step 4 — Extract latest WAL records for changed tables (batched UNION ALL)
-# ---------------------------------------------------------------------------
-wal_last_altered = {full: ts for full, ts in to_process}  # stored as watermark
-wal_names        = [full for full, _ in to_process]
-batches          = [
-    wal_names[i : i + WAL_BATCH_SIZE]
-    for i in range(0, len(wal_names), WAL_BATCH_SIZE)
-]
 
-new_records = []
-for idx, batch in enumerate(batches, start=1):
-    print(f"  Step 4: Extracting WAL batch {idx}/{len(batches)} ({len(batch)} tables)...")
-    new_records.extend(extract_wal_records_batch(batch))
+# ===========================================================================
+# Step 4 – Scan WAL tables for records newer than watermark
+# ===========================================================================
+print("Step 4: Scanning WAL tables for new activity...")
 
-print(f"Step 4: Extracted {len(new_records)} new/updated SIGDS table records.")
+new_records = []  # list of {SIGDS_TABLE, WAL_TABLE, WAL_LAST_ALTERED, WORKBOOK_ID}
 
-# ---------------------------------------------------------------------------
-# Step 5 — DESCRIBE DETAIL (parallel) for each new/updated SIGDS table
-# ---------------------------------------------------------------------------
-sigds_bare_names = [r["SIGDS_TABLE"] for r in new_records if r["SIGDS_TABLE"]]
-print(
-    f"Step 5: Running DESCRIBE DETAIL on {len(sigds_bare_names)} SIGDS tables "
-    f"using {DESCRIBE_WORKERS} workers..."
-)
-detail_map = parallel_describe_sigds(sigds_bare_names)  # {bare_name: detail_dict}
-print("Step 5: DESCRIBE DETAIL complete.")
+for wal_table in wal_tables:
+    # Derive the SIGDS table name by stripping the WAL suffix
+    sigds_table = (
+        wal_table[: -len(WAL_TABLE_SUFFIX)]
+        if wal_table.upper().endswith(WAL_TABLE_SUFFIX.upper())
+        else wal_table
+    )
 
-# ---------------------------------------------------------------------------
-# Step 6 — Sigma API enrichment for new WORKBOOK_IDs only
-# ---------------------------------------------------------------------------
-# Workbooks and data models already present in the target table are skipped;
-# only IDs introduced by this run trigger an API call.
+    wm = watermarks.get(wal_table)
+    filter_clause = f"WHERE ALTERED_AT > TIMESTAMP '{wm.isoformat()}'" if wm else ""
+
+    try:
+        rows = spark.sql(f"""
+            SELECT
+                WORKBOOK_ID,
+                MAX(ALTERED_AT) AS WAL_LAST_ALTERED
+            FROM {wal_table}
+            {filter_clause}
+            GROUP BY WORKBOOK_ID
+            HAVING WORKBOOK_ID IS NOT NULL
+        """).collect()
+    except Exception as exc:
+        print(f"  WARNING: Could not scan {wal_table}: {exc}")
+        continue
+
+    for row in rows:
+        new_records.append({
+            "SIGDS_TABLE":      sigds_table,
+            "WAL_TABLE":        wal_table,
+            "WAL_LAST_ALTERED": row["WAL_LAST_ALTERED"],
+            "WORKBOOK_ID":      row["WORKBOOK_ID"],
+        })
+
+print(f"Step 4: {len(new_records)} new/updated record(s) to process.")
+
+if not new_records:
+    print("Step 4: Nothing new — exiting early.")
+    dbutils.notebook.exit("No new WAL activity")  # noqa: F821
+
+
+# ===========================================================================
+# Step 5 – Obtain Sigma API token
+# ===========================================================================
+print("Step 5: Obtaining Sigma API token...")
+
+client_id     = dbutils.secrets.get(SECRET_SCOPE, SECRET_CLIENT_ID)  # noqa: F821
+client_secret = dbutils.secrets.get(SECRET_SCOPE, SECRET_SECRET)     # noqa: F821
+sigma_token   = get_sigma_token(SIGMA_BASE_URL, client_id, client_secret)
+
+print("Step 5: Token obtained.")
+
+
+# ===========================================================================
+# Step 6 – Enrich new WORKBOOK_IDs via Sigma API  (Option B: first-seen only)
+# ===========================================================================
 new_wb_ids = {
     r["WORKBOOK_ID"]
     for r in new_records
     if r["WORKBOOK_ID"] and r["WORKBOOK_ID"] not in known_wb_ids
 }
-wb_meta = {}  # {WORKBOOK_ID -> {WORKBOOK_NAME, WORKBOOK_PATH, OBJECT_TYPE}}
+
+wb_meta = {}  # {WORKBOOK_ID -> enrichment dict} for freshly-fetched IDs
 
 if new_wb_ids:
-    print(f"Step 6: Fetching Sigma metadata for {len(new_wb_ids)} new WORKBOOK_IDs...")
-    wb_index = build_id_index(sigma_paginate(sigma_token, "workbooks"),   new_wb_ids)
-    dm_index = build_id_index(sigma_paginate(sigma_token, "dataModels"),  new_wb_ids)
+    print(f"Step 6: Fetching Sigma metadata for {len(new_wb_ids)} new WORKBOOK_ID(s)...")
+
+    wb_index = build_id_index(
+        sigma_paginate(sigma_token, "workbooks",   SIGMA_BASE_URL), new_wb_ids
+    )
+    dm_index = build_id_index(
+        sigma_paginate(sigma_token, "datamodels",  SIGMA_BASE_URL), new_wb_ids
+    )
+
     for wid in new_wb_ids:
         norm  = wid.strip().lower()
         entry = wb_index.get(norm) or dm_index.get(norm)
         if not entry:
             continue
+        is_wb    = norm in wb_index
         raw_path = entry.get("path")
         wb_meta[wid] = {
-            "WORKBOOK_NAME": entry.get("name"),
-            "WORKBOOK_PATH": "/".join(raw_path) if isinstance(raw_path, list) else raw_path,
-            "OBJECT_TYPE":   "WORKBOOK" if norm in wb_index else "DATA_MODEL",
+            "WORKBOOK_NAME":        entry.get("name"),
+            "WORKBOOK_PATH":        "/".join(raw_path) if isinstance(raw_path, list) else raw_path,
+            "OBJECT_TYPE":          "WORKBOOK" if is_wb else "DATA_MODEL",
+            "api_url":              entry.get("url"),
+            "api_owner_id":         entry.get("ownerId"),
+            # Option B: archived state captured once at discovery time.
+            # Data models found in the active list are treated as not archived.
+            "api_is_archived":      entry.get("isArchived", False) if is_wb else False,
+            "api_owner_first_name": None,
+            "api_owner_last_name":  None,
         }
-    print(f"Step 6: Resolved {len(wb_meta)} of {len(new_wb_ids)} new WORKBOOK_IDs.")
+
+    # Resolve owner display names via /v2/members
+    owner_ids = {m["api_owner_id"] for m in wb_meta.values() if m.get("api_owner_id")}
+    if owner_ids:
+        print(f"Step 6: Fetching Sigma members to resolve {len(owner_ids)} owner ID(s)...")
+        all_members  = sigma_paginate(sigma_token, "members", SIGMA_BASE_URL)
+        member_index = {
+            m["memberId"].strip().lower(): m
+            for m in all_members
+            if m.get("memberId")
+        }
+        for meta in wb_meta.values():
+            oid = meta.get("api_owner_id")
+            if oid:
+                member = member_index.get(oid.strip().lower(), {})
+                meta["api_owner_first_name"] = member.get("firstName")
+                meta["api_owner_last_name"]  = member.get("lastName")
+
+    resolved = sum(1 for m in wb_meta.values() if m.get("WORKBOOK_NAME"))
+    print(f"Step 6: Resolved {resolved} of {len(new_wb_ids)} new WORKBOOK_ID(s).")
 else:
     print("Step 6: No new WORKBOOK_IDs — Sigma API fetch skipped.")
 
-# ---------------------------------------------------------------------------
-# Step 7 — Assemble rows and MERGE into SIGDS_WORKBOOK_MAP
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# Step 7 – Assemble merge DataFrame and upsert
+# ===========================================================================
+print("Step 7: Merging into target table...")
+
 MERGE_SCHEMA = StructType([
-    StructField("WAL_TABLE",            StringType(),    True),
-    StructField("DS_ID",                StringType(),    True),
-    StructField("SIGDS_TABLE",          StringType(),    True),
-    StructField("WORKBOOK_ID",          StringType(),    True),
-    StructField("WORKBOOK_URL",         StringType(),    True),
-    StructField("ORG_SLUG",             StringType(),    True),
-    StructField("INPUT_TABLE_NAME",     StringType(),    True),
-    StructField("LAST_EDIT_AT",         TimestampType(), True),
-    StructField("LAST_EDIT_BY",         StringType(),    True),
-    StructField("WORKBOOK_NAME",        StringType(),    True),
-    StructField("WORKBOOK_PATH",        StringType(),    True),
-    StructField("OBJECT_TYPE",          StringType(),    True),
-    StructField("TABLE_ID",             StringType(),    True),
-    StructField("TABLE_LOCATION",       StringType(),    True),
-    StructField("TABLE_CREATED_AT",     TimestampType(), True),
-    StructField("TABLE_LAST_MODIFIED",  TimestampType(), True),
-    StructField("TABLE_SIZE_BYTES",     LongType(),      True),
-    StructField("MAX_EDIT_NUM",         LongType(),      True),
-    StructField("WAL_LAST_ALTERED",     TimestampType(), True),
+    StructField("SIGDS_TABLE",             StringType(),    False),
+    StructField("WAL_TABLE",               StringType(),    True),
+    StructField("WAL_LAST_ALTERED",        TimestampType(), True),
+    StructField("WORKBOOK_ID",             StringType(),    True),
+    StructField("WORKBOOK_NAME",           StringType(),    True),
+    StructField("WORKBOOK_PATH",           StringType(),    True),
+    StructField("OBJECT_TYPE",             StringType(),    True),
+    StructField("api_url",                 StringType(),    True),
+    StructField("api_owner_id",            StringType(),    True),
+    StructField("api_is_archived",         BooleanType(),   True),
+    StructField("api_owner_first_name",    StringType(),    True),
+    StructField("api_owner_last_name",     StringType(),    True),
 ])
 
 rows = []
 for r in new_records:
-    detail = detail_map.get(r["SIGDS_TABLE"], {})
-    meta   = wb_meta.get(r["WORKBOOK_ID"],    {})
+    wid = r["WORKBOOK_ID"]
+    # Prefer freshly-fetched enrichment; fall back to cached known enrichment
+    enrichment = (
+        wb_meta.get(wid)
+        if wid and wid in wb_meta
+        else known_enrichment.get(wid, {})
+        if wid
+        else {}
+    )
     rows.append((
-        r["WAL_TABLE"],
-        r["DS_ID"],
         r["SIGDS_TABLE"],
-        r["WORKBOOK_ID"],
-        r["WORKBOOK_URL"],
-        r["ORG_SLUG"],
-        r["INPUT_TABLE_NAME"],
-        r["LAST_EDIT_AT"],
-        r["LAST_EDIT_BY"],
-        meta.get("WORKBOOK_NAME"),
-        meta.get("WORKBOOK_PATH"),
-        meta.get("OBJECT_TYPE"),
-        detail.get("TABLE_ID"),
-        detail.get("TABLE_LOCATION"),
-        detail.get("TABLE_CREATED_AT"),
-        detail.get("TABLE_LAST_MODIFIED"),
-        detail.get("TABLE_SIZE_BYTES"),
-        r["MAX_EDIT_NUM"],
-        wal_last_altered.get(r["WAL_TABLE"]),
+        r["WAL_TABLE"],
+        r["WAL_LAST_ALTERED"],
+        wid,
+        enrichment.get("WORKBOOK_NAME"),
+        enrichment.get("WORKBOOK_PATH"),
+        enrichment.get("OBJECT_TYPE"),
+        enrichment.get("api_url"),
+        enrichment.get("api_owner_id"),
+        enrichment.get("api_is_archived"),
+        enrichment.get("api_owner_first_name"),
+        enrichment.get("api_owner_last_name"),
     ))
 
-updates_df = spark.createDataFrame(rows, MERGE_SCHEMA)
-updates_df.createOrReplaceTempView("_SIGDS_UPDATES")
+source_df = spark.createDataFrame(rows, MERGE_SCHEMA)
+source_df.createOrReplaceTempView("_sigds_workbook_map_source")
 
 spark.sql(f"""
-    MERGE INTO {TARGET_TABLE} AS t
-    USING _SIGDS_UPDATES AS s
-      ON  t.SIGDS_TABLE = s.SIGDS_TABLE
+    MERGE INTO {TARGET_TABLE} AS target
+    USING _sigds_workbook_map_source AS source
+    ON target.SIGDS_TABLE = source.SIGDS_TABLE
     WHEN MATCHED THEN
         UPDATE SET *
     WHEN NOT MATCHED THEN
         INSERT *
 """)
-print(f"Step 7: MERGE complete — {len(rows)} rows upserted into {TARGET_TABLE}.")
 
-# Sanity check — show most recently modified entries
+print(f"Step 7: Merge complete — {len(rows)} row(s) processed.")
+
+
+# ===========================================================================
+# Step 8 – Sanity check
+# ===========================================================================
+print("Step 8: Post-merge sanity check...")
+
 spark.sql(f"""
-    SELECT SIGDS_TABLE, WORKBOOK_NAME, OBJECT_TYPE,
-           TABLE_SIZE_BYTES, TABLE_LAST_MODIFIED, MAX_EDIT_NUM, WAL_LAST_ALTERED
-    FROM   {TARGET_TABLE}
-    ORDER  BY TABLE_LAST_MODIFIED DESC NULLS LAST
-    LIMIT  20
-""").show(truncate=False)
+    SELECT
+        COUNT(*)                                                    AS total_rows,
+        COUNT(DISTINCT WORKBOOK_ID)                                 AS distinct_workbooks,
+        COUNT(DISTINCT WAL_TABLE)                                   AS distinct_wal_tables,
+        SUM(CASE WHEN OBJECT_TYPE = 'WORKBOOK'   THEN 1 ELSE 0 END) AS workbook_count,
+        SUM(CASE WHEN OBJECT_TYPE = 'DATA_MODEL' THEN 1 ELSE 0 END) AS data_model_count,
+        SUM(CASE WHEN api_is_archived = TRUE      THEN 1 ELSE 0 END) AS archived_count,
+        SUM(CASE WHEN api_owner_id   IS NOT NULL  THEN 1 ELSE 0 END) AS rows_with_owner,
+        SUM(CASE WHEN WORKBOOK_NAME  IS NULL      THEN 1 ELSE 0 END) AS unresolved_workbook_ids
+    FROM {TARGET_TABLE}
+""").show()
+
+print("Done.")
