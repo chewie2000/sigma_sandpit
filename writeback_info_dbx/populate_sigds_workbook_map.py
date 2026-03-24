@@ -555,6 +555,7 @@ MERGE_SCHEMA = StructType([
     StructField("IS_ORPHANED",          BooleanType(),   True),
     StructField("IS_DELETED",           BooleanType(),   True),
     StructField("DELETED_AT",           TimestampType(), True),
+    StructField("IS_LEGACY_WAL",        BooleanType(),   True),
     # Option B archival detection
     StructField("api_url",              StringType(),    True),
     StructField("api_owner_id",         StringType(),    True),
@@ -597,6 +598,7 @@ for r in new_records:
         r["SIGDS_TABLE"] in orphaned_tables,
         False,   # IS_DELETED — active record
         None,    # DELETED_AT — active record
+        'sigds_wal_ds_' not in (r["WAL_TABLE"] or "").lower(),  # IS_LEGACY_WAL
         enrichment.get("api_url"),
         enrichment.get("api_owner_id"),
         enrichment.get("api_is_archived"),
