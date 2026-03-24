@@ -280,7 +280,7 @@ stored_rows = spark.sql(f"""
            WORKBOOK_NAME, WORKBOOK_PATH, OBJECT_TYPE,
            api_url, api_owner_id, api_is_archived,
            api_owner_first_name, api_owner_last_name,
-           IS_DELETED
+           IS_DELETED, IS_ORPHANED, SIGDS_TABLE
     FROM   {TARGET_TABLE}
 """).collect()
 
@@ -289,6 +289,8 @@ known_wb_ids              = set()
 known_enrichment          = {}   # {WORKBOOK_ID -> enrichment dict} for already-seen IDs
 known_wal_tables          = set() # all WAL_TABLEs currently tracked in the map
 previously_deleted_wals   = set() # WAL_TABLEs already flagged IS_DELETED=TRUE
+known_non_orphaned_sigds  = set() # SIGDS_TABLEs currently IS_ORPHANED=FALSE
+known_orphaned_sigds      = set() # SIGDS_TABLEs currently IS_ORPHANED=TRUE
 
 for row in stored_rows:
     wt, ts = row["WAL_TABLE"], row["WAL_LAST_ALTERED"]
@@ -298,6 +300,12 @@ for row in stored_rows:
             previously_deleted_wals.add(wt)
     if ts and (wt not in watermarks or ts > watermarks[wt]):
         watermarks[wt] = ts
+    st = row["SIGDS_TABLE"]
+    if st:
+        if row["IS_ORPHANED"]:
+            known_orphaned_sigds.add(st)
+        else:
+            known_non_orphaned_sigds.add(st)
     wid = row["WORKBOOK_ID"]
     if wid:
         known_wb_ids.add(wid)
@@ -316,7 +324,8 @@ for row in stored_rows:
 print(
     f"Step 2: Loaded watermarks for {len(watermarks)} WAL tables; "
     f"{len(known_wb_ids)} WORKBOOK_IDs already enriched; "
-    f"{len(previously_deleted_wals)} previously flagged as deleted."
+    f"{len(previously_deleted_wals)} previously flagged as deleted; "
+    f"{len(known_orphaned_sigds)} previously flagged as orphaned."
 )
 
 # ---------------------------------------------------------------------------
@@ -372,8 +381,11 @@ print(
 )
 
 if not to_process and not newly_deleted_wals and not reappeared_wals:
-    print("SIGDS_WORKBOOK_MAP is already up to date. Nothing to do.")
-    raise SystemExit(0)
+    if MAX_WAL_TABLES > 0:
+        # Capped run — orphan checks on existing records are unreliable, so exit.
+        print("SIGDS_WORKBOOK_MAP is already up to date. Nothing to do.")
+        raise SystemExit(0)
+    print("Step 3: No WAL changes — proceeding to check existing records for orphan status changes.")
 
 # ---------------------------------------------------------------------------
 # Step 4 — Extract latest WAL records for changed tables (batched UNION ALL)
@@ -431,6 +443,29 @@ print(
 )
 detail_map = parallel_describe_sigds(sigds_bare_names)
 print(f"Step 5: DESCRIBE DETAIL complete. {len(sigds_bare_names)} valid, {len(orphaned_tables)} orphaned.")
+
+# When running a full scan (MAX_WAL_TABLES == 0), also check existing records
+# in the map that were not part of this run's WAL changes.
+new_record_sigds = {r["SIGDS_TABLE"] for r in new_records if r["SIGDS_TABLE"]}
+if MAX_WAL_TABLES == 0:
+    newly_orphaned_existing = {
+        t for t in known_non_orphaned_sigds
+        if t.lower() not in existing_tables and t not in new_record_sigds
+    }
+    recovered_existing = {
+        t for t in known_orphaned_sigds
+        if t.lower() in existing_tables and t not in new_record_sigds
+    }
+    if newly_orphaned_existing:
+        print(f"Step 5: {len(newly_orphaned_existing)} existing record(s) newly orphaned:")
+        for t in sorted(newly_orphaned_existing):
+            print(f"  {t}")
+    if recovered_existing:
+        print(f"Step 5: {len(recovered_existing)} previously orphaned record(s) have recovered.")
+else:
+    newly_orphaned_existing = set()
+    recovered_existing      = set()
+    print("Step 5: Orphan check for existing records skipped (MAX_WAL_TABLES is set).")
 
 # ---------------------------------------------------------------------------
 # Step 6 — Sigma API enrichment for new WORKBOOK_IDs only  (Option B)
@@ -569,19 +604,21 @@ for r in new_records:
         enrichment.get("api_owner_last_name"),
     ))
 
-updates_df = spark.createDataFrame(rows, MERGE_SCHEMA)
-updates_df.createOrReplaceTempView("_SIGDS_UPDATES")
-
-spark.sql(f"""
-    MERGE INTO {TARGET_TABLE} AS t
-    USING _SIGDS_UPDATES AS s
-      ON  t.SIGDS_TABLE = s.SIGDS_TABLE
-    WHEN MATCHED THEN
-        UPDATE SET *
-    WHEN NOT MATCHED THEN
-        INSERT *
-""")
-print(f"Step 7: MERGE complete — {len(rows)} rows upserted into {TARGET_TABLE}.")
+if rows:
+    updates_df = spark.createDataFrame(rows, MERGE_SCHEMA)
+    updates_df.createOrReplaceTempView("_SIGDS_UPDATES")
+    spark.sql(f"""
+        MERGE INTO {TARGET_TABLE} AS t
+        USING _SIGDS_UPDATES AS s
+          ON  t.SIGDS_TABLE = s.SIGDS_TABLE
+        WHEN MATCHED THEN
+            UPDATE SET *
+        WHEN NOT MATCHED THEN
+            INSERT *
+    """)
+    print(f"Step 7: MERGE complete — {len(rows)} rows upserted into {TARGET_TABLE}.")
+else:
+    print("Step 7: No WAL changes — MERGE skipped.")
 
 # Flag records whose WAL table has disappeared since the last run.
 if newly_deleted_wals:
@@ -594,6 +631,25 @@ if newly_deleted_wals:
           AND  (IS_DELETED IS NULL OR IS_DELETED = FALSE)
     """)
     print(f"Step 7: Flagged {len(newly_deleted_wals)} record(s) as deleted.")
+
+# Update IS_ORPHANED for existing records not covered by the MERGE.
+if newly_orphaned_existing:
+    sigds_csv = ", ".join(f"'{t}'" for t in newly_orphaned_existing)
+    spark.sql(f"""
+        UPDATE {TARGET_TABLE}
+        SET    IS_ORPHANED = TRUE
+        WHERE  SIGDS_TABLE IN ({sigds_csv})
+    """)
+    print(f"Step 7: Marked {len(newly_orphaned_existing)} existing record(s) as orphaned.")
+
+if recovered_existing:
+    sigds_csv = ", ".join(f"'{t}'" for t in recovered_existing)
+    spark.sql(f"""
+        UPDATE {TARGET_TABLE}
+        SET    IS_ORPHANED = FALSE
+        WHERE  SIGDS_TABLE IN ({sigds_csv})
+    """)
+    print(f"Step 7: Cleared orphan flag for {len(recovered_existing)} recovered record(s).")
 
 # Clear the deletion flag for WAL tables that have reappeared.
 if reappeared_wals:
