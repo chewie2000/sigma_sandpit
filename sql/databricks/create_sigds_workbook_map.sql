@@ -4,11 +4,18 @@
 -- DDL for the SIGDS_WORKBOOK_MAP table in Databricks Unity Catalog.
 -- Run this once before executing populate_sigds_workbook_map.py.
 --
+-- Before running, replace <YOUR_CATALOG> and <YOUR_SCHEMA> below with the
+-- Unity Catalog catalog and schema where the table should be created.
+-- These must match the CATALOG and SCHEMA values set in the Python script.
+--
 -- Logical primary key : SIGDS_TABLE  (one row per Sigma input/writeback table)
 -- Merge key           : SIGDS_TABLE  (used in the MERGE statement in the script)
 -- =============================================================================
 
-CREATE TABLE IF NOT EXISTS customer_success.marko_wb.SIGDS_WORKBOOK_MAP (
+USE CATALOG <YOUR_CATALOG>;
+USE SCHEMA  <YOUR_SCHEMA>;
+
+CREATE TABLE IF NOT EXISTS SIGDS_WORKBOOK_MAP (
 
   -- ---------------------------------------------------------------------------
   -- Writeback source identifiers

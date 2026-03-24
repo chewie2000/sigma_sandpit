@@ -53,19 +53,21 @@ spark = SparkSession.builder.getOrCreate()
 # ---------------------------------------------------------------------------
 # Configuration — update before running
 # ---------------------------------------------------------------------------
-CATALOG          = "customer_success"   # Databricks Unity Catalog name
-SCHEMA           = "marko_wb"           # Schema containing SIGDS + WAL tables
+CATALOG          = "<YOUR_CATALOG>"     # Databricks Unity Catalog name
+SCHEMA           = "<YOUR_SCHEMA>"      # Schema containing SIGDS + WAL tables
 TARGET_TABLE     = f"{CATALOG}.{SCHEMA}.SIGDS_WORKBOOK_MAP"
-SIGMA_API_BASE   = "https://api.eu.aws.sigmacomputing.com/v2"  # EU AWS endpoint
-SIGMA_CLIENT_ID  = "<YOUR_SIGMA_CLIENT_ID>"
+# Sigma API base URL — find your regional endpoint at:
+# https://help.sigmacomputing.com/reference/get-started-sigma-api
+SIGMA_API_BASE      = "<YOUR_API_BASE_URL>/v2"
+SIGMA_CLIENT_ID     = "<YOUR_SIGMA_CLIENT_ID>"
 SIGMA_CLIENT_SECRET = "<YOUR_SIGMA_CLIENT_SECRET>"
 MAX_WAL_TABLES   = 0   # 0 = all; set > 0 to cap WAL tables for testing
 DESCRIBE_WORKERS = 16  # thread-pool size for all parallel DESCRIBE DETAIL calls
 WAL_BATCH_SIZE   = 100 # max WAL tables per UNION ALL query
 # ---------------------------------------------------------------------------
 
-if SIGMA_CLIENT_ID.startswith("<YOUR_") or SIGMA_CLIENT_SECRET.startswith("<YOUR_"):
-    raise ValueError("Set SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET before running.")
+if any(v.startswith("<YOUR_") for v in [CATALOG, SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID, SIGMA_CLIENT_SECRET]):
+    raise ValueError("Set CATALOG, SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET before running.")
 
 
 # ===========================================================================
@@ -106,11 +108,15 @@ def sigma_paginate(token: str, endpoint: str) -> list:
         )
         resp.raise_for_status()
         data = resp.json()
+        matched = False
         for key in ("entries", "workbooks", "dataModels", "data", "items"):
             chunk = data.get(key)
             if isinstance(chunk, list):
                 items.extend(chunk)
+                matched = True
                 break
+        if not matched:
+            print(f"  WARN: sigma_paginate({endpoint!r}) — no recognised list key in response: {list(data.keys())}")
         next_page = data.get("nextPage")
         if not next_page:
             break
@@ -411,8 +417,11 @@ wb_meta = {}  # {WORKBOOK_ID -> full enrichment dict} for newly-seen IDs
 
 if new_wb_ids:
     print(f"Step 6: Fetching Sigma metadata for {len(new_wb_ids)} new WORKBOOK_IDs...")
-    wb_index = build_id_index(sigma_paginate(sigma_token, "workbooks"),  new_wb_ids)
-    dm_index = build_id_index(sigma_paginate(sigma_token, "dataModels"), new_wb_ids)
+    workbooks  = sigma_paginate(sigma_token, "workbooks")
+    datamodels = sigma_paginate(sigma_token, "dataModels")
+    print(f"Step 6: Sigma API returned {len(workbooks)} workbook(s), {len(datamodels)} data model(s).")
+    wb_index = build_id_index(workbooks,  new_wb_ids)
+    dm_index = build_id_index(datamodels, new_wb_ids)
 
     for wid in new_wb_ids:
         norm  = wid.strip().lower()
@@ -439,6 +448,7 @@ if new_wb_ids:
     if owner_ids:
         print(f"Step 6: Fetching Sigma members to resolve {len(owner_ids)} owner ID(s)...")
         all_members  = sigma_paginate(sigma_token, "members")
+        print(f"Step 6: Sigma API returned {len(all_members)} member(s).")
         member_index = {
             m["memberId"].strip().lower(): m
             for m in all_members
