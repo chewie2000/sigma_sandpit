@@ -8,14 +8,14 @@ Run logic per execution
 -----------------------
 1. Load stored WAL_LAST_ALTERED watermarks and known WORKBOOK_IDs from the
    target table (single query).
-2. Query information_schema.tables for current last_altered timestamps of all
-   sigds_wal_* tables (single query — no WAL data read at this stage).
-3. Skip WAL tables whose last_altered has not changed since the last run;
-   process only tables with new writes.
+2. Discover all sigds_wal_* tables via SHOW TABLES (single query).
+3. Run DESCRIBE DETAIL in parallel on every WAL table to read lastModified
+   (metadata-only, no table scans).  Skip WAL tables whose lastModified has
+   not changed since the stored watermark.
 4. Extract the latest WAL entry per SIGDS table from changed WAL tables via
    batched UNION ALL queries (one Spark job per batch, not per table).
-5. Run DESCRIBE DETAIL in parallel threads for each new/changed SIGDS table
-   to capture Delta metadata (id, location, size, timestamps).
+5. Run DESCRIBE DETAIL in parallel for each new/changed SIGDS table to
+   capture Delta metadata (id, location, size, timestamps).
 6. Fetch Sigma workbook/data-model metadata only for WORKBOOK_IDs not already
    present in the target table.
 7. Merge all changes into SIGDS_WORKBOOK_MAP via a single MERGE statement
@@ -23,12 +23,15 @@ Run logic per execution
 
 Design notes
 ------------
-- WAL_LAST_ALTERED (from information_schema) is the sole change-detection
-  signal.  It is stored per row so the next run can compare without reading
-  any WAL table that has not been written to.
+- WAL_LAST_ALTERED stores the lastModified timestamp returned by DESCRIBE
+  DETAIL on the WAL table.  On each run this value is compared against the
+  stored watermark; WAL tables with no new writes are skipped without reading
+  any row data.  DESCRIBE DETAIL is metadata-only and requires no special
+  permissions beyond SELECT on the table.
 - MAX_EDIT_NUM is the EDIT_NUM of the highest-numbered row for that SIGDS
   table; it is derived from the WAL extract (rn=1 row) with no extra queries.
-- DESCRIBE DETAIL is metadata-only and safe to parallelise across threads.
+- All DESCRIBE DETAIL calls (WAL tables and SIGDS tables) are parallelised
+  via a shared thread pool — safe because DESCRIBE DETAIL does not scan data.
 - Sigma API calls are skipped entirely when all WORKBOOK_IDs are already known.
 """
 
@@ -52,7 +55,7 @@ SIGMA_API_BASE   = "https://api.eu.aws.sigmacomputing.com/v2"  # EU AWS endpoint
 SIGMA_CLIENT_ID  = "<YOUR_SIGMA_CLIENT_ID>"
 SIGMA_CLIENT_SECRET = "<YOUR_SIGMA_CLIENT_SECRET>"
 MAX_WAL_TABLES   = 0   # 0 = all; set > 0 to cap WAL tables for testing
-DESCRIBE_WORKERS = 16  # thread-pool size for parallel DESCRIBE DETAIL calls
+DESCRIBE_WORKERS = 16  # thread-pool size for all parallel DESCRIBE DETAIL calls
 WAL_BATCH_SIZE   = 100 # max WAL tables per UNION ALL query
 # ---------------------------------------------------------------------------
 
@@ -138,9 +141,47 @@ def build_id_index(entries: list, target_ids: set) -> dict:
 # Databricks / Delta helpers
 # ===========================================================================
 
-def describe_table_detail(table_name: str) -> dict:
+def _describe_detail_fq(full_name: str) -> dict:
     """
-    Run DESCRIBE DETAIL for a single Delta table and return physical metadata.
+    Run DESCRIBE DETAIL on a fully-qualified table name and return the raw row
+    as a dict.  Returns an empty dict on failure.
+    Used internally by both WAL-table discovery and SIGDS-table enrichment.
+    """
+    try:
+        return spark.sql(f"DESCRIBE DETAIL {full_name}").collect()[0].asDict()
+    except Exception as exc:
+        print(f"  WARN: DESCRIBE DETAIL failed for {full_name}: {exc}")
+        return {}
+
+
+def get_wal_last_modified(full_wal_name: str) -> tuple:
+    """
+    Return (full_wal_name, lastModified) for a single WAL table.
+    lastModified is the Delta transaction timestamp — a reliable, cheap signal
+    that the table has received new writes, with no row data scanned.
+    Returns (full_wal_name, None) on failure.
+    """
+    detail = _describe_detail_fq(full_wal_name)
+    return full_wal_name, detail.get("lastModified")
+
+
+def parallel_wal_last_modified(wal_names: list) -> dict:
+    """
+    Run get_wal_last_modified concurrently for all WAL tables.
+    Returns {full_wal_name: lastModified_timestamp}.
+    """
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=DESCRIBE_WORKERS) as pool:
+        futures = {pool.submit(get_wal_last_modified, w): w for w in wal_names}
+        for future in concurrent.futures.as_completed(futures):
+            name, ts = future.result()
+            results[name] = ts
+    return results
+
+
+def describe_sigds_table(table_name: str) -> dict:
+    """
+    Run DESCRIBE DETAIL for a single SIGDS table and return physical metadata.
     Accepts a bare table name (no catalog/schema prefix); CATALOG and SCHEMA
     constants are used to build the fully-qualified backtick-quoted identifier.
 
@@ -149,31 +190,28 @@ def describe_table_detail(table_name: str) -> dict:
         TABLE_LAST_MODIFIED, TABLE_SIZE_BYTES.
     Returns an empty dict if the table does not exist or the call fails.
     """
-    full = f"`{CATALOG}`.`{SCHEMA}`.`{table_name}`"
-    try:
-        row = spark.sql(f"DESCRIBE DETAIL {full}").collect()[0]
-        return {
-            "TABLE_ID":            str(row["id"]) if row["id"] else None,
-            "TABLE_LOCATION":      row["location"],
-            "TABLE_CREATED_AT":    row["createdAt"],
-            "TABLE_LAST_MODIFIED": row["lastModified"],
-            "TABLE_SIZE_BYTES":    row["sizeInBytes"],
-        }
-    except Exception as exc:
-        print(f"  WARN: DESCRIBE DETAIL failed for {full}: {exc}")
+    full   = f"`{CATALOG}`.`{SCHEMA}`.`{table_name}`"
+    detail = _describe_detail_fq(full)
+    if not detail:
         return {}
+    return {
+        "TABLE_ID":            str(detail["id"]) if detail.get("id") else None,
+        "TABLE_LOCATION":      detail.get("location"),
+        "TABLE_CREATED_AT":    detail.get("createdAt"),
+        "TABLE_LAST_MODIFIED": detail.get("lastModified"),
+        "TABLE_SIZE_BYTES":    detail.get("sizeInBytes"),
+    }
 
 
-def parallel_describe_detail(table_names: list) -> dict:
+def parallel_describe_sigds(table_names: list) -> dict:
     """
-    Run describe_table_detail concurrently across all table_names using a
-    thread pool of size DESCRIBE_WORKERS.  DESCRIBE DETAIL is metadata-only
-    and does not scan table data, making it safe to parallelise.
+    Run describe_sigds_table concurrently across all table_names using a
+    thread pool of size DESCRIBE_WORKERS.
     Returns {bare_table_name: detail_dict}.
     """
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=DESCRIBE_WORKERS) as pool:
-        futures = {pool.submit(describe_table_detail, t): t for t in table_names}
+        futures = {pool.submit(describe_sigds_table, t): t for t in table_names}
         for future in concurrent.futures.as_completed(futures):
             results[futures[future]] = future.result()
     return results
@@ -250,9 +288,10 @@ print("Step 1: Sigma token obtained.")
 # ---------------------------------------------------------------------------
 # Step 2 — Load stored watermarks and known WORKBOOK_IDs from target table
 # ---------------------------------------------------------------------------
-# WAL_LAST_ALTERED mirrors information_schema.last_altered at the time each
-# WAL table was last processed.  Comparing it against the current last_altered
-# tells us whether the WAL table has had new writes without reading any WAL data.
+# WAL_LAST_ALTERED mirrors the DESCRIBE DETAIL lastModified of each WAL table
+# at the time it was last processed.  Comparing it against the current
+# lastModified tells us whether the WAL table has had new writes without
+# reading any row data.
 stored_rows = spark.sql(f"""
     SELECT WAL_TABLE, WAL_LAST_ALTERED, WORKBOOK_ID
     FROM   {TARGET_TABLE}
@@ -273,37 +312,40 @@ print(
 )
 
 # ---------------------------------------------------------------------------
-# Step 3 — Discover WAL tables; pre-filter via information_schema.last_altered
+# Step 3 — Discover WAL tables; pre-filter via parallel DESCRIBE DETAIL
 # ---------------------------------------------------------------------------
-# A single information_schema query returns current last_altered for every
-# sigds_wal_* table.  Only tables whose last_altered exceeds the stored
-# watermark (or which are newly discovered) proceed to WAL extraction.
-info_rows = spark.sql(f"""
-    SELECT table_name,
-           last_altered
-    FROM   {CATALOG}.information_schema.tables
-    WHERE  table_schema = '{SCHEMA}'
-      AND  lower(table_name) LIKE 'sigds_wal%'
-""").collect()
-
-all_wal = [
-    (f"{CATALOG}.{SCHEMA}.{r.table_name}", r.last_altered)
-    for r in info_rows
+# SHOW TABLES returns all tables in the schema in a single query.  We then
+# run DESCRIBE DETAIL on every sigds_wal_* table in parallel to read their
+# lastModified timestamps — metadata-only, no row scans, no special permissions
+# beyond SELECT on the tables themselves.
+wal_rows = (
+    spark.sql(f"SHOW TABLES IN `{CATALOG}`.`{SCHEMA}`")
+         .filter("lower(tableName) LIKE 'sigds_wal%'")
+         .collect()
+)
+all_wal_names = [
+    f"`{CATALOG}`.`{SCHEMA}`.`{r.tableName}`"
+    for r in wal_rows
 ]
 if MAX_WAL_TABLES > 0:
-    all_wal = all_wal[:MAX_WAL_TABLES]
+    all_wal_names = all_wal_names[:MAX_WAL_TABLES]
+
+print(
+    f"Step 3: Discovered {len(all_wal_names)} WAL tables. "
+    f"Running parallel DESCRIBE DETAIL to check for changes..."
+)
+wal_modified = parallel_wal_last_modified(all_wal_names)  # {full_name -> lastModified}
 
 to_process = [
-    (full_name, last_altered)
-    for full_name, last_altered in all_wal
-    if full_name not in watermarks
-    or (last_altered and last_altered > watermarks[full_name])
+    (name, wal_modified[name])
+    for name in all_wal_names
+    if name not in watermarks
+    or (wal_modified.get(name) and wal_modified[name] > watermarks[name])
 ]
 
 print(
-    f"Step 3: Discovered {len(all_wal)} WAL tables. "
-    f"{len(to_process)} require reprocessing; "
-    f"{len(all_wal) - len(to_process)} unchanged and skipped."
+    f"Step 3: {len(to_process)} WAL tables require reprocessing; "
+    f"{len(all_wal_names) - len(to_process)} unchanged and skipped."
 )
 
 if not to_process:
@@ -332,17 +374,17 @@ print(f"Step 4: Extracted {len(new_records)} new/updated SIGDS table records.")
 # ---------------------------------------------------------------------------
 sigds_bare_names = [r["SIGDS_TABLE"] for r in new_records if r["SIGDS_TABLE"]]
 print(
-    f"Step 5: Running DESCRIBE DETAIL on {len(sigds_bare_names)} tables "
+    f"Step 5: Running DESCRIBE DETAIL on {len(sigds_bare_names)} SIGDS tables "
     f"using {DESCRIBE_WORKERS} workers..."
 )
-detail_map = parallel_describe_detail(sigds_bare_names)  # {bare_name: detail_dict}
+detail_map = parallel_describe_sigds(sigds_bare_names)  # {bare_name: detail_dict}
 print("Step 5: DESCRIBE DETAIL complete.")
 
 # ---------------------------------------------------------------------------
 # Step 6 — Sigma API enrichment for new WORKBOOK_IDs only
 # ---------------------------------------------------------------------------
 # Workbooks and data models already present in the target table are skipped;
-# only IDs introduced by this run require an API call.
+# only IDs introduced by this run trigger an API call.
 new_wb_ids = {
     r["WORKBOOK_ID"]
     for r in new_records

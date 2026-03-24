@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS customer_success.marko_wb.SIGDS_WORKBOOK_MAP (
   MAX_EDIT_NUM     BIGINT    COMMENT 'Highest EDIT_NUM seen in the WAL for this SIGDS table',
 
   -- ---------------------------------------------------------------------------
-  -- Delta table physical metadata  (populated via DESCRIBE DETAIL)
+  -- SIGDS Delta table physical metadata  (populated via DESCRIBE DETAIL)
   -- ---------------------------------------------------------------------------
   TABLE_ID             STRING    COMMENT 'Delta table GUID returned by DESCRIBE DETAIL',
   TABLE_LOCATION       STRING    COMMENT 'Cloud storage path of the Delta table',
@@ -47,6 +47,6 @@ CREATE TABLE IF NOT EXISTS customer_success.marko_wb.SIGDS_WORKBOOK_MAP (
   -- ---------------------------------------------------------------------------
   -- Incremental processing watermark
   -- ---------------------------------------------------------------------------
-  WAL_LAST_ALTERED TIMESTAMP COMMENT 'information_schema.last_altered of the WAL table at the time it was last processed; compared against the current last_altered on each run to skip WAL tables that have not changed'
+  WAL_LAST_ALTERED TIMESTAMP COMMENT 'lastModified from DESCRIBE DETAIL on the WAL table at the time it was last processed; compared against the current lastModified on each run to skip WAL tables that have not changed, without reading any row data'
 
 );
