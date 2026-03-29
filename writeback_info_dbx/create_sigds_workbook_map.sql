@@ -65,11 +65,18 @@ CREATE TABLE IF NOT EXISTS SIGDS_WORKBOOK_MAP (
   IS_LEGACY_WAL    BOOLEAN   COMMENT 'TRUE when the WAL table follows the old random-UUID naming convention (sigds_wal_<uuid>) rather than the current DS_ID-based convention (sigds_wal_ds_<ds_id>). Legacy WAL tables may have multiple SIGDS tables associated with them.',
 
   -- ---------------------------------------------------------------------------
-  -- Sigma API enrichment  (Option B: populated once on first-seen WORKBOOK_ID)
+  -- Version tag metadata
+  -- ---------------------------------------------------------------------------
+  IS_TAGGED_VERSION    BOOLEAN   COMMENT 'TRUE when the WORKBOOK_ID is a tagged version (e.g. Prod, QA) rather than the source workbook.',
+  VERSION_TAG_NAME     STRING    COMMENT 'Name of the version tag (e.g. Prod (SDLC), QA (SDLC)) when IS_TAGGED_VERSION is TRUE.',
+  PARENT_WORKBOOK_ID   STRING    COMMENT 'Source workbook ID when IS_TAGGED_VERSION is TRUE; NULL for untagged workbooks.',
+
+  -- ---------------------------------------------------------------------------
+  -- Sigma API enrichment  (set once on first-seen WORKBOOK_ID; api_is_archived re-checked every run)
   -- ---------------------------------------------------------------------------
   api_url              STRING  COMMENT 'Workbook/data-model URL from Sigma API (set once on first enrichment)',
   api_owner_id         STRING  COMMENT 'Sigma member UUID of the workbook owner (from Sigma API)',
-  api_is_archived      BOOLEAN COMMENT 'Archived state at time of first discovery; never re-checked. FALSE for data models found in the active list.',
+  api_is_archived      BOOLEAN COMMENT 'Archived state from Sigma API; re-checked on every run. FALSE for data models. IDs absent from the API response are left unchanged.',
   api_owner_first_name STRING  COMMENT 'Owner first name resolved via GET /v2/members',
   api_owner_last_name  STRING  COMMENT 'Owner last name resolved via GET /v2/members'
 

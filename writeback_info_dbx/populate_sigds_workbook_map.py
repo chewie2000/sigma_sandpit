@@ -39,8 +39,16 @@ Design notes
   Only workbooks explicitly returned by the API are updated; a workbook
   absent from the API response is left unchanged, as the API will always
   include archived workbooks with isArchived=True rather than omitting them.
-  Data models are always treated as non-archived.  Other api_* columns
-  (name, path, owner) are set once on first discovery and not refreshed.
+  Data models are always treated as non-archived.  Tagged versions inherit
+  their parent workbook's archive status.  Other api_* columns (name, path,
+  owner) are set once on first discovery and not refreshed.
+- Version tags: Sigma workbooks can be tagged (e.g. Prod, QA), which creates
+  a new workbook ID (taggedWorkbookId) for each tag.  The script fetches all
+  tags via GET /v2/tags, then lists workbooks per tag via
+  GET /v2/tags/{tagId}/workbooks to build a taggedWorkbookId → parent
+  workbook mapping.  WAL records referencing a taggedWorkbookId are enriched
+  from the parent workbook metadata and flagged with IS_TAGGED_VERSION=TRUE,
+  VERSION_TAG_NAME, and PARENT_WORKBOOK_ID.
 """
 
 import base64
@@ -281,6 +289,7 @@ stored_rows = spark.sql(f"""
            WORKBOOK_NAME, WORKBOOK_PATH, OBJECT_TYPE,
            api_url, api_owner_id, api_is_archived,
            api_owner_first_name, api_owner_last_name,
+           IS_TAGGED_VERSION, VERSION_TAG_NAME, PARENT_WORKBOOK_ID,
            IS_DELETED, IS_ORPHANED, SIGDS_TABLE
     FROM   {TARGET_TABLE}
 """).collect()
@@ -320,6 +329,9 @@ for row in stored_rows:
                 "api_is_archived":      row["api_is_archived"],
                 "api_owner_first_name": row["api_owner_first_name"],
                 "api_owner_last_name":  row["api_owner_last_name"],
+                "IS_TAGGED_VERSION":    row["IS_TAGGED_VERSION"],
+                "VERSION_TAG_NAME":     row["VERSION_TAG_NAME"],
+                "PARENT_WORKBOOK_ID":   row["PARENT_WORKBOOK_ID"],
             }
 
 print(
@@ -496,24 +508,71 @@ if all_wb_ids_to_check:
     wb_index = build_id_index(workbooks,  all_wb_ids_to_check)
     dm_index = build_id_index(datamodels, all_wb_ids_to_check)
 
+    # Fetch version tags and build tagged-workbook index so that
+    # taggedWorkbookId values found in WAL records can be resolved
+    # back to their parent workbook metadata.
+    all_tags = sigma_paginate(sigma_token, "tags")
+    print(f"Step 6: Sigma API returned {len(all_tags)} version tag(s).")
+    tagged_wb_index = {}   # {taggedWorkbookId.lower() -> parent/tag info}
+    for tag in all_tags:
+        tag_id   = tag.get("versionTagId")
+        if not tag_id:
+            continue
+        tagged_wbs = sigma_paginate(sigma_token, f"tags/{tag_id}/workbooks")
+        for wb in tagged_wbs:
+            for t in wb.get("tags", []):
+                twid = t.get("taggedWorkbookId")
+                if twid:
+                    raw_path = wb.get("path")
+                    tagged_wb_index[twid.strip().lower()] = {
+                        "parent_workbook_id": wb.get("workbookId"),
+                        "tag_name":           t.get("name"),
+                        "workbook_name":      wb.get("name"),
+                        "workbook_path":      "/".join(raw_path) if isinstance(raw_path, list) else raw_path,
+                        "workbook_url":       wb.get("url"),
+                        "ownerId":            wb.get("ownerId"),
+                    }
+    print(f"Step 6: Built tagged workbook index with {len(tagged_wb_index)} entry(ies).")
+
     # Full enrichment for newly-seen WORKBOOK_IDs.
     for wid in new_wb_ids:
         norm  = wid.strip().lower()
         entry = wb_index.get(norm) or dm_index.get(norm)
-        if not entry:
-            continue
-        is_wb    = norm in wb_index
-        raw_path = entry.get("path")
-        wb_meta[wid] = {
-            "WORKBOOK_NAME":        entry.get("name"),
-            "WORKBOOK_PATH":        "/".join(raw_path) if isinstance(raw_path, list) else raw_path,
-            "OBJECT_TYPE":          "WORKBOOK" if is_wb else "DATA_MODEL",
-            "api_url":              entry.get("url"),
-            "api_owner_id":         entry.get("ownerId"),
-            "api_is_archived":      entry.get("isArchived", False) if is_wb else False,
-            "api_owner_first_name": None,
-            "api_owner_last_name":  None,
-        }
+        tagged = tagged_wb_index.get(norm)
+        if entry:
+            # Standard workbook or data model.
+            is_wb    = norm in wb_index
+            raw_path = entry.get("path")
+            wb_meta[wid] = {
+                "WORKBOOK_NAME":        entry.get("name"),
+                "WORKBOOK_PATH":        "/".join(raw_path) if isinstance(raw_path, list) else raw_path,
+                "OBJECT_TYPE":          "WORKBOOK" if is_wb else "DATA_MODEL",
+                "api_url":              entry.get("url"),
+                "api_owner_id":         entry.get("ownerId"),
+                "api_is_archived":      entry.get("isArchived", False) if is_wb else False,
+                "api_owner_first_name": None,
+                "api_owner_last_name":  None,
+                "IS_TAGGED_VERSION":    False,
+                "VERSION_TAG_NAME":     None,
+                "PARENT_WORKBOOK_ID":   None,
+            }
+        elif tagged:
+            # Tagged version — enrich from parent workbook info.
+            parent_norm = (tagged["parent_workbook_id"] or "").strip().lower()
+            parent_wb   = wb_index.get(parent_norm, {})
+            wb_meta[wid] = {
+                "WORKBOOK_NAME":        tagged.get("workbook_name"),
+                "WORKBOOK_PATH":        tagged.get("workbook_path"),
+                "OBJECT_TYPE":          "WORKBOOK",
+                "api_url":              tagged.get("workbook_url"),
+                "api_owner_id":         tagged.get("ownerId"),
+                "api_is_archived":      parent_wb.get("isArchived", False) if parent_wb else False,
+                "api_owner_first_name": None,
+                "api_owner_last_name":  None,
+                "IS_TAGGED_VERSION":    True,
+                "VERSION_TAG_NAME":     tagged.get("tag_name"),
+                "PARENT_WORKBOOK_ID":   tagged.get("parent_workbook_id"),
+            }
 
     # Resolve owner display names for new IDs via /v2/members.
     owner_ids = {m["api_owner_id"] for m in wb_meta.values() if m.get("api_owner_id")}
@@ -545,11 +604,23 @@ if all_wb_ids_to_check:
     #     isArchived=True rather than omitting it when archived.
     for wid in known_wb_ids:
         norm            = wid.strip().lower()
-        stored_archived = known_enrichment.get(wid, {}).get("api_is_archived")
+        stored          = known_enrichment.get(wid, {})
+        stored_archived = stored.get("api_is_archived")
         if norm in wb_index:
             current_archived = wb_index[norm].get("isArchived", False)
-        elif norm in dm_index or known_enrichment.get(wid, {}).get("OBJECT_TYPE") == "DATA_MODEL":
+        elif norm in dm_index or stored.get("OBJECT_TYPE") == "DATA_MODEL":
             current_archived = False
+        elif stored.get("IS_TAGGED_VERSION"):
+            # Tagged version — inherit archive status from the parent workbook.
+            parent_id = stored.get("PARENT_WORKBOOK_ID")
+            if parent_id:
+                parent_norm = parent_id.strip().lower()
+                if parent_norm in wb_index:
+                    current_archived = wb_index[parent_norm].get("isArchived", False)
+                else:
+                    continue   # parent not in API response — leave unchanged
+            else:
+                continue
         else:
             continue   # not in API response — do not assume archived
         if current_archived != stored_archived:
@@ -589,6 +660,10 @@ MERGE_SCHEMA = StructType([
     StructField("IS_DELETED",           BooleanType(),   True),
     StructField("DELETED_AT",           TimestampType(), True),
     StructField("IS_LEGACY_WAL",        BooleanType(),   True),
+    # Version tag fields
+    StructField("IS_TAGGED_VERSION",   BooleanType(),   True),
+    StructField("VERSION_TAG_NAME",    StringType(),    True),
+    StructField("PARENT_WORKBOOK_ID",  StringType(),    True),
     # Sigma API enrichment fields
     StructField("api_url",              StringType(),    True),
     StructField("api_owner_id",         StringType(),    True),
@@ -632,6 +707,9 @@ for r in new_records:
         False,   # IS_DELETED — active record
         None,    # DELETED_AT — active record
         'sigds_wal_ds_' not in (r["WAL_TABLE"] or "").lower(),  # IS_LEGACY_WAL
+        enrichment.get("IS_TAGGED_VERSION", False),
+        enrichment.get("VERSION_TAG_NAME"),
+        enrichment.get("PARENT_WORKBOOK_ID"),
         enrichment.get("api_url"),
         enrichment.get("api_owner_id"),
         enrichment.get("api_is_archived"),
