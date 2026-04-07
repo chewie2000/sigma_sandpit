@@ -235,7 +235,7 @@ def extract_wal_records_batch(wal_batch: list) -> list:
         SELECT
             '{wal}'   AS WAL_TABLE_FQN,
             EDIT_NUM  AS WAL_MAX_EDIT_NUM,
-            WAL_DS_ID,
+            DS_ID     AS WAL_DS_ID,
             TIMESTAMP AS WAL_LAST_EDIT_AT,
             get_json_object(METADATA, '$.tableName')            AS SIGDS_TABLE,
             get_json_object(METADATA, '$.workbookId')           AS WORKBOOK_ID,
@@ -419,7 +419,7 @@ print(f"Step 4: Extracted {len(new_records)} new/updated SIGDS table records.")
 
 # Deduplicate by SIGDS_TABLE (the MERGE key), keeping the highest WAL_MAX_EDIT_NUM.
 # Sigma can maintain two WAL tables for the same dataset when it migrates from
-# the old random-UUID naming (sigds_wal_<uuid>) to the WAL_DS_ID-based naming
+# the old random-UUID naming (sigds_wal_<uuid>) to the DS_ID-based naming
 # (sigds_wal_ds_<ds_id>).  Both appear in SHOW TABLES and both pass the
 # rn=1 filter within their own UNION ALL subquery, so we must dedup here.
 _seen: dict = {}
