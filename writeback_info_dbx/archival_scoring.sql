@@ -56,42 +56,33 @@
 
 
 -- =============================================================================
--- CTE 1 — base: compute derived age and size fields used across multiple scores
+-- CTE — scored: inner subquery computes age/size fields; outer SELECT adds scores.
+-- Databricks SQL does not support SELECT *, expr in CTEs, so derived fields are
+-- computed in an inline subquery and referenced by name in the outer SELECT.
 -- =============================================================================
 
-WITH base AS (
+WITH scored AS (
 
     SELECT
-        *,
+        -- Identity
+        SIGDS_TABLE,
+        WORKBOOK_NAME,
+        API_OWNER_FIRST_NAME,
+        API_OWNER_LAST_NAME,
+        API_IS_ARCHIVED,
+        IS_ORPHANED,
+        IS_DELETED,
+        IS_LEGACY_WAL,
+        IS_TAGGED_VERSION,
+        VERSION_TAG_NAME,
+        WAL_MAX_EDIT_NUM,
+        SIGDS_TABLE_SIZE_BYTES,
+        WAL_WORKBOOK_URL,
 
-        -- Days elapsed since the last writeback edit (NULL-safe)
-        CASE
-            WHEN WAL_LAST_EDIT_AT IS NULL THEN NULL
-            ELSE DATEDIFF(DAY, WAL_LAST_EDIT_AT, CURRENT_TIMESTAMP())
-        END                                                         AS DAYS_SINCE_LAST_EDIT,
-
-        -- Days elapsed since the SIGDS Delta table was last written (NULL-safe)
-        CASE
-            WHEN SIGDS_TABLE_LAST_MODIFIED IS NULL THEN NULL
-            ELSE DATEDIFF(DAY, SIGDS_TABLE_LAST_MODIFIED, CURRENT_TIMESTAMP())
-        END                                                         AS DAYS_SINCE_SIGDS_MODIFIED,
-
-        -- Table size in MB, rounded to 2 dp (NULL → 0)
-        ROUND(COALESCE(SIGDS_TABLE_SIZE_BYTES, 0) / 1048576.0, 2)  AS SIGDS_TABLE_SIZE_MB
-
-    FROM <YOUR_CATALOG>.<YOUR_SCHEMA>.SIGDS_WORKBOOK_MAP
-
-),
-
-
--- =============================================================================
--- CTE 2 — scored: calculate each component score independently
--- =============================================================================
-
-scored AS (
-
-    SELECT
-        *,
+        -- Derived age and size fields (computed in inner subquery)
+        DAYS_SINCE_LAST_EDIT,
+        DAYS_SINCE_SIGDS_MODIFIED,
+        SIGDS_TABLE_SIZE_MB,
 
         -- -----------------------------------------------------------------
         -- 1. ARCHIVAL / DELETION STATUS (0–30 pts)
@@ -189,7 +180,33 @@ scored AS (
             ELSE 0
         END                                                         AS PENALTY_TAGGED_VERSION
 
-    FROM base
+    FROM (
+        -- Inner subquery: compute age and size fields so the outer SELECT
+        -- can reference them by name in the scoring CASE expressions.
+        SELECT
+            SIGDS_TABLE,
+            WORKBOOK_NAME,
+            API_OWNER_FIRST_NAME,
+            API_OWNER_LAST_NAME,
+            API_IS_ARCHIVED,
+            IS_ORPHANED,
+            IS_DELETED,
+            IS_LEGACY_WAL,
+            IS_TAGGED_VERSION,
+            VERSION_TAG_NAME,
+            WAL_MAX_EDIT_NUM,
+            SIGDS_TABLE_SIZE_BYTES,
+            WAL_WORKBOOK_URL,
+            CASE WHEN WAL_LAST_EDIT_AT IS NULL THEN NULL
+                 ELSE DATEDIFF(DAY, WAL_LAST_EDIT_AT, CURRENT_TIMESTAMP())
+            END                                                     AS DAYS_SINCE_LAST_EDIT,
+            CASE WHEN SIGDS_TABLE_LAST_MODIFIED IS NULL THEN NULL
+                 ELSE DATEDIFF(DAY, SIGDS_TABLE_LAST_MODIFIED, CURRENT_TIMESTAMP())
+            END                                                     AS DAYS_SINCE_SIGDS_MODIFIED,
+            ROUND(COALESCE(SIGDS_TABLE_SIZE_BYTES, 0) / 1048576.0, 2)
+                                                                    AS SIGDS_TABLE_SIZE_MB
+        FROM <YOUR_CATALOG>.<YOUR_SCHEMA>.SIGDS_WORKBOOK_MAP
+    )
 
 )
 
@@ -276,20 +293,10 @@ ORDER BY
 -- grouped by archival tier.
 -- =============================================================================
 
-WITH base AS (
+WITH rollup AS (
     SELECT
-        *,
-        CASE WHEN WAL_LAST_EDIT_AT IS NULL THEN NULL
-             ELSE DATEDIFF(DAY, WAL_LAST_EDIT_AT, CURRENT_TIMESTAMP()) END  AS DAYS_SINCE_LAST_EDIT,
-        CASE WHEN SIGDS_TABLE_LAST_MODIFIED IS NULL THEN NULL
-             ELSE DATEDIFF(DAY, SIGDS_TABLE_LAST_MODIFIED, CURRENT_TIMESTAMP()) END AS DAYS_SINCE_SIGDS_MODIFIED,
-        ROUND(COALESCE(SIGDS_TABLE_SIZE_BYTES, 0) / 1048576.0, 2)           AS SIGDS_TABLE_SIZE_MB
-    FROM <YOUR_CATALOG>.<YOUR_SCHEMA>.SIGDS_WORKBOOK_MAP
-),
-
-scored AS (
-    SELECT
-        *,
+        SIGDS_TABLE_SIZE_BYTES,
+        DAYS_SINCE_LAST_EDIT,
         GREATEST(0, LEAST(100,
             -- Status
             CASE
@@ -337,35 +344,50 @@ scored AS (
             -- Penalty
             CASE WHEN IS_TAGGED_VERSION = TRUE THEN -15 ELSE 0 END
         ))                                                          AS TOTAL_SCORE
-    FROM base
-),
-
-tiered AS (
-    SELECT
-        *,
-        CASE
-            WHEN TOTAL_SCORE >= 75 THEN 'TIER 1 — Strong candidate (quarantine now)'
-            WHEN TOTAL_SCORE >= 50 THEN 'TIER 2 — Likely candidate (review with owner)'
-            WHEN TOTAL_SCORE >= 25 THEN 'TIER 3 — Monitor (check in 90 days)'
-            ELSE                        'TIER 4 — Keep (active or protected)'
-        END AS ARCHIVAL_TIER
-    FROM scored
+    FROM (
+        SELECT
+            IS_ORPHANED,
+            IS_DELETED,
+            API_IS_ARCHIVED,
+            IS_LEGACY_WAL,
+            IS_TAGGED_VERSION,
+            WAL_MAX_EDIT_NUM,
+            SIGDS_TABLE_SIZE_BYTES,
+            CASE WHEN WAL_LAST_EDIT_AT IS NULL THEN NULL
+                 ELSE DATEDIFF(DAY, WAL_LAST_EDIT_AT, CURRENT_TIMESTAMP())
+            END AS DAYS_SINCE_LAST_EDIT,
+            CASE WHEN SIGDS_TABLE_LAST_MODIFIED IS NULL THEN NULL
+                 ELSE DATEDIFF(DAY, SIGDS_TABLE_LAST_MODIFIED, CURRENT_TIMESTAMP())
+            END AS DAYS_SINCE_SIGDS_MODIFIED
+        FROM <YOUR_CATALOG>.<YOUR_SCHEMA>.SIGDS_WORKBOOK_MAP
+    )
 )
 
 SELECT
-    ARCHIVAL_TIER,
+    CASE
+        WHEN TOTAL_SCORE >= 75 THEN 'TIER 1 — Strong candidate (quarantine now)'
+        WHEN TOTAL_SCORE >= 50 THEN 'TIER 2 — Likely candidate (review with owner)'
+        WHEN TOTAL_SCORE >= 25 THEN 'TIER 3 — Monitor (check in 90 days)'
+        ELSE                        'TIER 4 — Keep (active or protected)'
+    END                                                             AS ARCHIVAL_TIER,
     COUNT(*)                                                        AS RECORD_COUNT,
     ROUND(SUM(COALESCE(SIGDS_TABLE_SIZE_BYTES, 0)) / 1073741824.0, 3)
                                                                     AS TOTAL_SIZE_GB,
     ROUND(AVG(TOTAL_SCORE), 1)                                      AS AVG_SCORE,
     MIN(DAYS_SINCE_LAST_EDIT)                                       AS MIN_DAYS_SINCE_LAST_EDIT,
     MAX(DAYS_SINCE_LAST_EDIT)                                       AS MAX_DAYS_SINCE_LAST_EDIT
-FROM tiered
-GROUP BY ARCHIVAL_TIER
+FROM rollup
+GROUP BY
+    CASE
+        WHEN TOTAL_SCORE >= 75 THEN 'TIER 1 — Strong candidate (quarantine now)'
+        WHEN TOTAL_SCORE >= 50 THEN 'TIER 2 — Likely candidate (review with owner)'
+        WHEN TOTAL_SCORE >= 25 THEN 'TIER 3 — Monitor (check in 90 days)'
+        ELSE                        'TIER 4 — Keep (active or protected)'
+    END
 ORDER BY
-    CASE ARCHIVAL_TIER
-        WHEN 'TIER 1 — Strong candidate (quarantine now)'       THEN 1
-        WHEN 'TIER 2 — Likely candidate (review with owner)'    THEN 2
-        WHEN 'TIER 3 — Monitor (check in 90 days)'             THEN 3
+    CASE
+        WHEN TOTAL_SCORE >= 75 THEN 1
+        WHEN TOTAL_SCORE >= 50 THEN 2
+        WHEN TOTAL_SCORE >= 25 THEN 3
         ELSE 4
     END;
