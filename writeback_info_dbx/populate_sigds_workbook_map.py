@@ -6,7 +6,7 @@ and the Sigma REST API.
 
 Run logic per execution
 -----------------------
-1. Load stored WAL_LAST_ALTERED watermarks and known WORKBOOK_IDs from the
+1. Load stored WAL_TABLE_LAST_MODIFIED watermarks and known WORKBOOK_IDs from the
    target table (single query).
 2. Discover all sigds_wal_* tables via SHOW TABLES (single query).
 3. Run DESCRIBE DETAIL in parallel on every WAL table to read lastModified
@@ -25,17 +25,17 @@ Run logic per execution
 
 Design notes
 ------------
-- WAL_LAST_ALTERED stores the lastModified timestamp returned by DESCRIBE
+- WAL_TABLE_LAST_MODIFIED stores the lastModified timestamp returned by DESCRIBE
   DETAIL on the WAL table.  On each run this value is compared against the
   stored watermark; WAL tables with no new writes are skipped without reading
   any row data.  DESCRIBE DETAIL is metadata-only and requires no special
   permissions beyond SELECT on the table.
-- MAX_EDIT_NUM is the EDIT_NUM of the highest-numbered row for that SIGDS
+- WAL_MAX_EDIT_NUM is the EDIT_NUM of the highest-numbered row for that SIGDS
   table; it is derived from the WAL extract (rn=1 row) with no extra queries.
 - All DESCRIBE DETAIL calls (WAL tables and SIGDS tables) are parallelised
   via a shared thread pool — safe because DESCRIBE DETAIL does not scan data.
 - Sigma API calls are skipped entirely when all WORKBOOK_IDs are already known.
-- api_is_archived is refreshed on every run for all known WORKBOOK_IDs.
+- API_IS_ARCHIVED is refreshed on every run for all known WORKBOOK_IDs.
   Only workbooks explicitly returned by the API are updated; a workbook
   absent from the API response is left unchanged, as the API will always
   include archived workbooks with isArchived=True rather than omitting them.
@@ -72,7 +72,7 @@ TARGET_TABLE     = f"{CATALOG}.{SCHEMA}.SIGDS_WORKBOOK_MAP"
 SIGMA_API_BASE      = "<YOUR_API_BASE_URL>/v2"
 SIGMA_CLIENT_ID     = "<YOUR_SIGMA_CLIENT_ID>"
 SIGMA_CLIENT_SECRET = "<YOUR_SIGMA_CLIENT_SECRET>"
-MAX_WAL_TABLES   = 0   # 0 = all; set > 0 to cap WAL tables for testing
+MAX_WAL_TABLE_FQNS   = 0   # 0 = all; set > 0 to cap WAL tables for testing
 DESCRIBE_WORKERS = 16  # thread-pool size for all parallel DESCRIBE DETAIL calls
 WAL_BATCH_SIZE   = 100 # max WAL tables per UNION ALL query
 # ---------------------------------------------------------------------------
@@ -198,19 +198,19 @@ def parallel_wal_last_modified(wal_names: list) -> dict:
 def describe_sigds_table(table_name: str) -> dict:
     """
     Run DESCRIBE DETAIL for a single SIGDS table and return physical metadata.
-    Returns a dict with TABLE_ID, TABLE_LOCATION, TABLE_CREATED_AT,
-    TABLE_LAST_MODIFIED, TABLE_SIZE_BYTES.
+    Returns a dict with SIGDS_TABLE_ID, SIGDS_TABLE_LOCATION, SIGDS_TABLE_CREATED_AT,
+    SIGDS_TABLE_LAST_MODIFIED, SIGDS_TABLE_SIZE_BYTES.
     """
     full   = f"`{CATALOG}`.`{SCHEMA}`.`{table_name}`"
     detail = _describe_detail_fq(full)
     if not detail:
         return {}
     return {
-        "TABLE_ID":            str(detail["id"]) if detail.get("id") else None,
-        "TABLE_LOCATION":      detail.get("location"),
-        "TABLE_CREATED_AT":    detail.get("createdAt"),
-        "TABLE_LAST_MODIFIED": detail.get("lastModified"),
-        "TABLE_SIZE_BYTES":    detail.get("sizeInBytes"),
+        "SIGDS_TABLE_ID":            str(detail["id"]) if detail.get("id") else None,
+        "SIGDS_TABLE_LOCATION":      detail.get("location"),
+        "SIGDS_TABLE_CREATED_AT":    detail.get("createdAt"),
+        "SIGDS_TABLE_LAST_MODIFIED": detail.get("lastModified"),
+        "SIGDS_TABLE_SIZE_BYTES":    detail.get("sizeInBytes"),
     }
 
 
@@ -233,25 +233,25 @@ def extract_wal_records_batch(wal_batch: list) -> list:
     for wal in wal_batch:
         parts.append(f"""
         SELECT
-            '{wal}'   AS WAL_TABLE,
-            EDIT_NUM  AS MAX_EDIT_NUM,
-            DS_ID,
-            TIMESTAMP AS LAST_EDIT_AT,
+            '{wal}'   AS WAL_TABLE_FQN,
+            EDIT_NUM  AS WAL_MAX_EDIT_NUM,
+            WAL_DS_ID,
+            TIMESTAMP AS WAL_LAST_EDIT_AT,
             get_json_object(METADATA, '$.tableName')            AS SIGDS_TABLE,
             get_json_object(METADATA, '$.workbookId')           AS WORKBOOK_ID,
             coalesce(
                 get_json_object(METADATA, '$.sigmaUrl'),
                 get_json_object(METADATA, '$.workbookUrl')
-            )                                                   AS WORKBOOK_URL,
+            )                                                   AS WAL_WORKBOOK_URL,
             coalesce(
                 get_json_object(METADATA, '$.elementTitle'),
                 get_json_object(METADATA, '$.inputTableTitle')
-            )                                                   AS INPUT_TABLE_NAME,
+            )                                                   AS WAL_INPUT_TABLE_NAME,
             coalesce(
                 get_json_object(METADATA, '$.userEmail'),
                 get_json_object(EDIT, '$.updateRow.blameInfo.updatedBy'),
                 get_json_object(EDIT, '$.addRow.blameInfo.updatedBy')
-            )                                                   AS LAST_EDIT_BY,
+            )                                                   AS WAL_LAST_EDIT_BY,
             get(split(coalesce(
                 get_json_object(METADATA, '$.sigmaUrl'),
                 get_json_object(METADATA, '$.workbookUrl')
@@ -285,25 +285,25 @@ print("Step 1: Sigma token obtained.")
 # Step 2 — Load stored watermarks, known WORKBOOK_IDs, and enrichment cache
 # ---------------------------------------------------------------------------
 stored_rows = spark.sql(f"""
-    SELECT WAL_TABLE, WAL_LAST_ALTERED, WORKBOOK_ID,
+    SELECT WAL_TABLE_FQN, WAL_TABLE_LAST_MODIFIED, WORKBOOK_ID,
            WORKBOOK_NAME, WORKBOOK_PATH, OBJECT_TYPE,
-           api_url, api_owner_id, api_is_archived,
-           api_owner_first_name, api_owner_last_name,
+           API_WORKBOOK_URL, API_OWNER_ID, API_IS_ARCHIVED,
+           API_OWNER_FIRST_NAME, API_OWNER_LAST_NAME,
            IS_TAGGED_VERSION, VERSION_TAG_NAME, PARENT_WORKBOOK_ID,
            IS_DELETED, IS_ORPHANED, SIGDS_TABLE
     FROM   {TARGET_TABLE}
 """).collect()
 
-watermarks                = {}   # {wal_table -> most recent WAL_LAST_ALTERED stored}
+watermarks                = {}   # {wal_table -> most recent WAL_TABLE_LAST_MODIFIED stored}
 known_wb_ids              = set()
 known_enrichment          = {}   # {WORKBOOK_ID -> enrichment dict} for already-seen IDs
-known_wal_tables          = set() # all WAL_TABLEs currently tracked in the map
-previously_deleted_wals   = set() # WAL_TABLEs already flagged IS_DELETED=TRUE
+known_wal_tables          = set() # all WAL_TABLE_FQNs currently tracked in the map
+previously_deleted_wals   = set() # WAL_TABLE_FQNs already flagged IS_DELETED=TRUE
 known_non_orphaned_sigds  = set() # SIGDS_TABLEs currently IS_ORPHANED=FALSE
 known_orphaned_sigds      = set() # SIGDS_TABLEs currently IS_ORPHANED=TRUE
 
 for row in stored_rows:
-    wt, ts = row["WAL_TABLE"], row["WAL_LAST_ALTERED"]
+    wt, ts = row["WAL_TABLE_FQN"], row["WAL_TABLE_LAST_MODIFIED"]
     if wt:
         known_wal_tables.add(wt)
         if row["IS_DELETED"]:
@@ -324,11 +324,11 @@ for row in stored_rows:
                 "WORKBOOK_NAME":        row["WORKBOOK_NAME"],
                 "WORKBOOK_PATH":        row["WORKBOOK_PATH"],
                 "OBJECT_TYPE":          row["OBJECT_TYPE"],
-                "api_url":              row["api_url"],
-                "api_owner_id":         row["api_owner_id"],
-                "api_is_archived":      row["api_is_archived"],
-                "api_owner_first_name": row["api_owner_first_name"],
-                "api_owner_last_name":  row["api_owner_last_name"],
+                "API_WORKBOOK_URL":              row["API_WORKBOOK_URL"],
+                "API_OWNER_ID":         row["API_OWNER_ID"],
+                "API_IS_ARCHIVED":      row["API_IS_ARCHIVED"],
+                "API_OWNER_FIRST_NAME": row["API_OWNER_FIRST_NAME"],
+                "API_OWNER_LAST_NAME":  row["API_OWNER_LAST_NAME"],
                 "IS_TAGGED_VERSION":    row["IS_TAGGED_VERSION"],
                 "VERSION_TAG_NAME":     row["VERSION_TAG_NAME"],
                 "PARENT_WORKBOOK_ID":   row["PARENT_WORKBOOK_ID"],
@@ -353,15 +353,15 @@ all_wal_names = [
     f"`{CATALOG}`.`{SCHEMA}`.`{r.tableName}`"
     for r in wal_rows
 ]
-if MAX_WAL_TABLES > 0:
-    all_wal_names = all_wal_names[:MAX_WAL_TABLES]
+if MAX_WAL_TABLE_FQNS > 0:
+    all_wal_names = all_wal_names[:MAX_WAL_TABLE_FQNS]
 
 all_wal_set = set(all_wal_names)
 
 # Deletion detection requires the full WAL table list to be reliable.
-# When MAX_WAL_TABLES is set, all_wal_names is only a subset, so any table
+# When MAX_WAL_TABLE_FQNS is set, all_wal_names is only a subset, so any table
 # outside the cap would be wrongly flagged as deleted — skip in that case.
-if MAX_WAL_TABLES == 0:
+if MAX_WAL_TABLE_FQNS == 0:
     newly_deleted_wals = known_wal_tables - all_wal_set        # in map, gone from schema
     reappeared_wals    = previously_deleted_wals & all_wal_set # was deleted, now back
     if newly_deleted_wals:
@@ -373,7 +373,7 @@ if MAX_WAL_TABLES == 0:
 else:
     newly_deleted_wals = set()
     reappeared_wals    = set()
-    print("Step 3: Deletion detection skipped (MAX_WAL_TABLES is set — full WAL list not available).")
+    print("Step 3: Deletion detection skipped (MAX_WAL_TABLE_FQNS is set — full WAL list not available).")
 
 print(
     f"Step 3: Discovered {len(all_wal_names)} WAL tables. "
@@ -394,7 +394,7 @@ print(
 )
 
 if not to_process and not newly_deleted_wals and not reappeared_wals:
-    if MAX_WAL_TABLES > 0:
+    if MAX_WAL_TABLE_FQNS > 0:
         # Capped run — orphan checks on existing records are unreliable, so exit.
         print("SIGDS_WORKBOOK_MAP is already up to date. Nothing to do.")
         raise SystemExit(0)
@@ -417,15 +417,15 @@ for idx, batch in enumerate(batches, start=1):
 
 print(f"Step 4: Extracted {len(new_records)} new/updated SIGDS table records.")
 
-# Deduplicate by SIGDS_TABLE (the MERGE key), keeping the highest MAX_EDIT_NUM.
+# Deduplicate by SIGDS_TABLE (the MERGE key), keeping the highest WAL_MAX_EDIT_NUM.
 # Sigma can maintain two WAL tables for the same dataset when it migrates from
-# the old random-UUID naming (sigds_wal_<uuid>) to the DS_ID-based naming
+# the old random-UUID naming (sigds_wal_<uuid>) to the WAL_DS_ID-based naming
 # (sigds_wal_ds_<ds_id>).  Both appear in SHOW TABLES and both pass the
 # rn=1 filter within their own UNION ALL subquery, so we must dedup here.
 _seen: dict = {}
 for r in new_records:
     t = r["SIGDS_TABLE"]
-    if t and (t not in _seen or (r["MAX_EDIT_NUM"] or 0) > (_seen[t]["MAX_EDIT_NUM"] or 0)):
+    if t and (t not in _seen or (r["WAL_MAX_EDIT_NUM"] or 0) > (_seen[t]["WAL_MAX_EDIT_NUM"] or 0)):
         _seen[t] = r
 new_records = list(_seen.values())
 print(f"Step 4: {len(new_records)} unique SIGDS tables after deduplication.")
@@ -457,10 +457,10 @@ print(
 detail_map = parallel_describe_sigds(sigds_bare_names)
 print(f"Step 5: DESCRIBE DETAIL complete. {len(sigds_bare_names)} valid, {len(orphaned_tables)} orphaned.")
 
-# When running a full scan (MAX_WAL_TABLES == 0), also check existing records
+# When running a full scan (MAX_WAL_TABLE_FQNS == 0), also check existing records
 # in the map that were not part of this run's WAL changes.
 new_record_sigds = {r["SIGDS_TABLE"] for r in new_records if r["SIGDS_TABLE"]}
-if MAX_WAL_TABLES == 0:
+if MAX_WAL_TABLE_FQNS == 0:
     newly_orphaned_existing = {
         t for t in known_non_orphaned_sigds
         if t.lower() not in existing_tables and t not in new_record_sigds
@@ -478,7 +478,7 @@ if MAX_WAL_TABLES == 0:
 else:
     newly_orphaned_existing = set()
     recovered_existing      = set()
-    print("Step 5: Orphan check for existing records skipped (MAX_WAL_TABLES is set).")
+    print("Step 5: Orphan check for existing records skipped (MAX_WAL_TABLE_FQNS is set).")
 
 # ---------------------------------------------------------------------------
 # Step 6 — Sigma API enrichment (new IDs) + archive status refresh (all IDs)
@@ -547,11 +547,11 @@ if all_wb_ids_to_check:
                 "WORKBOOK_NAME":        entry.get("name"),
                 "WORKBOOK_PATH":        "/".join(raw_path) if isinstance(raw_path, list) else raw_path,
                 "OBJECT_TYPE":          "WORKBOOK" if is_wb else "DATA_MODEL",
-                "api_url":              entry.get("url"),
-                "api_owner_id":         entry.get("ownerId"),
-                "api_is_archived":      entry.get("isArchived", False) if is_wb else False,
-                "api_owner_first_name": None,
-                "api_owner_last_name":  None,
+                "API_WORKBOOK_URL":              entry.get("url"),
+                "API_OWNER_ID":         entry.get("ownerId"),
+                "API_IS_ARCHIVED":      entry.get("isArchived", False) if is_wb else False,
+                "API_OWNER_FIRST_NAME": None,
+                "API_OWNER_LAST_NAME":  None,
                 "IS_TAGGED_VERSION":    False,
                 "VERSION_TAG_NAME":     None,
                 "PARENT_WORKBOOK_ID":   None,
@@ -564,18 +564,18 @@ if all_wb_ids_to_check:
                 "WORKBOOK_NAME":        tagged.get("workbook_name"),
                 "WORKBOOK_PATH":        tagged.get("workbook_path"),
                 "OBJECT_TYPE":          "WORKBOOK",
-                "api_url":              tagged.get("workbook_url"),
-                "api_owner_id":         tagged.get("ownerId"),
-                "api_is_archived":      parent_wb.get("isArchived", False) if parent_wb else False,
-                "api_owner_first_name": None,
-                "api_owner_last_name":  None,
+                "API_WORKBOOK_URL":              tagged.get("workbook_url"),
+                "API_OWNER_ID":         tagged.get("ownerId"),
+                "API_IS_ARCHIVED":      parent_wb.get("isArchived", False) if parent_wb else False,
+                "API_OWNER_FIRST_NAME": None,
+                "API_OWNER_LAST_NAME":  None,
                 "IS_TAGGED_VERSION":    True,
                 "VERSION_TAG_NAME":     tagged.get("tag_name"),
                 "PARENT_WORKBOOK_ID":   tagged.get("parent_workbook_id"),
             }
 
     # Resolve owner display names for new IDs via /v2/members.
-    owner_ids = {m["api_owner_id"] for m in wb_meta.values() if m.get("api_owner_id")}
+    owner_ids = {m["API_OWNER_ID"] for m in wb_meta.values() if m.get("API_OWNER_ID")}
     if owner_ids:
         print(f"Step 6: Fetching Sigma members to resolve {len(owner_ids)} owner ID(s)...")
         all_members  = sigma_paginate(sigma_token, "members")
@@ -586,11 +586,11 @@ if all_wb_ids_to_check:
             if m.get("memberId")
         }
         for meta in wb_meta.values():
-            oid = meta.get("api_owner_id")
+            oid = meta.get("API_OWNER_ID")
             if oid:
                 member = member_index.get(oid.strip().lower(), {})
-                meta["api_owner_first_name"] = member.get("firstName")
-                meta["api_owner_last_name"]  = member.get("lastName")
+                meta["API_OWNER_FIRST_NAME"] = member.get("firstName")
+                meta["API_OWNER_LAST_NAME"]  = member.get("lastName")
 
     if new_wb_ids:
         print(f"Step 6: Resolved {len(wb_meta)} of {len(new_wb_ids)} new WORKBOOK_IDs.")
@@ -605,7 +605,7 @@ if all_wb_ids_to_check:
     for wid in known_wb_ids:
         norm            = wid.strip().lower()
         stored          = known_enrichment.get(wid, {})
-        stored_archived = stored.get("api_is_archived")
+        stored_archived = stored.get("API_IS_ARCHIVED")
         if norm in wb_index:
             current_archived = wb_index[norm].get("isArchived", False)
         elif norm in dm_index or stored.get("OBJECT_TYPE") == "DATA_MODEL":
@@ -637,25 +637,25 @@ else:
 # Step 7 — Assemble rows and MERGE into SIGDS_WORKBOOK_MAP
 # ---------------------------------------------------------------------------
 MERGE_SCHEMA = StructType([
-    StructField("WAL_TABLE",            StringType(),    True),
-    StructField("DS_ID",                StringType(),    True),
+    StructField("WAL_TABLE_FQN",            StringType(),    True),
+    StructField("WAL_DS_ID",                StringType(),    True),
     StructField("SIGDS_TABLE",          StringType(),    True),
     StructField("WORKBOOK_ID",          StringType(),    True),
-    StructField("WORKBOOK_URL",         StringType(),    True),
+    StructField("WAL_WORKBOOK_URL",         StringType(),    True),
     StructField("ORG_SLUG",             StringType(),    True),
-    StructField("INPUT_TABLE_NAME",     StringType(),    True),
-    StructField("LAST_EDIT_AT",         TimestampType(), True),
-    StructField("LAST_EDIT_BY",         StringType(),    True),
+    StructField("WAL_INPUT_TABLE_NAME",     StringType(),    True),
+    StructField("WAL_LAST_EDIT_AT",         TimestampType(), True),
+    StructField("WAL_LAST_EDIT_BY",         StringType(),    True),
     StructField("WORKBOOK_NAME",        StringType(),    True),
     StructField("WORKBOOK_PATH",        StringType(),    True),
     StructField("OBJECT_TYPE",          StringType(),    True),
-    StructField("TABLE_ID",             StringType(),    True),
-    StructField("TABLE_LOCATION",       StringType(),    True),
-    StructField("TABLE_CREATED_AT",     TimestampType(), True),
-    StructField("TABLE_LAST_MODIFIED",  TimestampType(), True),
-    StructField("TABLE_SIZE_BYTES",     LongType(),      True),
-    StructField("MAX_EDIT_NUM",         LongType(),      True),
-    StructField("WAL_LAST_ALTERED",     TimestampType(), True),
+    StructField("SIGDS_TABLE_ID",             StringType(),    True),
+    StructField("SIGDS_TABLE_LOCATION",       StringType(),    True),
+    StructField("SIGDS_TABLE_CREATED_AT",     TimestampType(), True),
+    StructField("SIGDS_TABLE_LAST_MODIFIED",  TimestampType(), True),
+    StructField("SIGDS_TABLE_SIZE_BYTES",     LongType(),      True),
+    StructField("WAL_MAX_EDIT_NUM",         LongType(),      True),
+    StructField("WAL_TABLE_LAST_MODIFIED",     TimestampType(), True),
     StructField("IS_ORPHANED",          BooleanType(),   True),
     StructField("IS_DELETED",           BooleanType(),   True),
     StructField("DELETED_AT",           TimestampType(), True),
@@ -665,11 +665,11 @@ MERGE_SCHEMA = StructType([
     StructField("VERSION_TAG_NAME",    StringType(),    True),
     StructField("PARENT_WORKBOOK_ID",  StringType(),    True),
     # Sigma API enrichment fields
-    StructField("api_url",              StringType(),    True),
-    StructField("api_owner_id",         StringType(),    True),
-    StructField("api_is_archived",      BooleanType(),   True),
-    StructField("api_owner_first_name", StringType(),    True),
-    StructField("api_owner_last_name",  StringType(),    True),
+    StructField("API_WORKBOOK_URL",              StringType(),    True),
+    StructField("API_OWNER_ID",         StringType(),    True),
+    StructField("API_IS_ARCHIVED",      BooleanType(),   True),
+    StructField("API_OWNER_FIRST_NAME", StringType(),    True),
+    StructField("API_OWNER_LAST_NAME",  StringType(),    True),
 ])
 
 rows = []
@@ -684,37 +684,37 @@ for r in new_records:
         else {}
     )
     rows.append((
-        r["WAL_TABLE"],
-        r["DS_ID"],
+        r["WAL_TABLE_FQN"],
+        r["WAL_DS_ID"],
         r["SIGDS_TABLE"],
         r["WORKBOOK_ID"],
-        r["WORKBOOK_URL"],
+        r["WAL_WORKBOOK_URL"],
         r["ORG_SLUG"],
-        r["INPUT_TABLE_NAME"],
-        r["LAST_EDIT_AT"],
-        r["LAST_EDIT_BY"],
+        r["WAL_INPUT_TABLE_NAME"],
+        r["WAL_LAST_EDIT_AT"],
+        r["WAL_LAST_EDIT_BY"],
         enrichment.get("WORKBOOK_NAME"),
         enrichment.get("WORKBOOK_PATH"),
         enrichment.get("OBJECT_TYPE"),
-        detail.get("TABLE_ID"),
-        detail.get("TABLE_LOCATION"),
-        detail.get("TABLE_CREATED_AT"),
-        detail.get("TABLE_LAST_MODIFIED"),
-        detail.get("TABLE_SIZE_BYTES"),
-        r["MAX_EDIT_NUM"],
-        wal_last_altered.get(r["WAL_TABLE"]),
+        detail.get("SIGDS_TABLE_ID"),
+        detail.get("SIGDS_TABLE_LOCATION"),
+        detail.get("SIGDS_TABLE_CREATED_AT"),
+        detail.get("SIGDS_TABLE_LAST_MODIFIED"),
+        detail.get("SIGDS_TABLE_SIZE_BYTES"),
+        r["WAL_MAX_EDIT_NUM"],
+        wal_last_altered.get(r["WAL_TABLE_FQN"]),
         r["SIGDS_TABLE"] in orphaned_tables,
         False,   # IS_DELETED — active record
         None,    # DELETED_AT — active record
-        'sigds_wal_ds_' not in (r["WAL_TABLE"] or "").lower(),  # IS_LEGACY_WAL
+        'sigds_wal_ds_' not in (r["WAL_TABLE_FQN"] or "").lower(),  # IS_LEGACY_WAL
         enrichment.get("IS_TAGGED_VERSION", False),
         enrichment.get("VERSION_TAG_NAME"),
         enrichment.get("PARENT_WORKBOOK_ID"),
-        enrichment.get("api_url"),
-        enrichment.get("api_owner_id"),
-        enrichment.get("api_is_archived"),
-        enrichment.get("api_owner_first_name"),
-        enrichment.get("api_owner_last_name"),
+        enrichment.get("API_WORKBOOK_URL"),
+        enrichment.get("API_OWNER_ID"),
+        enrichment.get("API_IS_ARCHIVED"),
+        enrichment.get("API_OWNER_FIRST_NAME"),
+        enrichment.get("API_OWNER_LAST_NAME"),
     ))
 
 if rows:
@@ -740,7 +740,7 @@ if newly_deleted_wals:
         UPDATE {TARGET_TABLE}
         SET    IS_DELETED = TRUE,
                DELETED_AT = current_timestamp()
-        WHERE  WAL_TABLE IN ({wal_csv})
+        WHERE  WAL_TABLE_FQN IN ({wal_csv})
           AND  (IS_DELETED IS NULL OR IS_DELETED = FALSE)
     """)
     print(f"Step 7: Flagged {len(newly_deleted_wals)} record(s) as deleted.")
@@ -751,11 +751,11 @@ if archive_updates:
     newly_unarchived = [w for w, v in archive_updates.items() if not v]
     if newly_archived:
         wid_csv = ", ".join(f"'{w}'" for w in newly_archived)
-        spark.sql(f"UPDATE {TARGET_TABLE} SET api_is_archived = TRUE  WHERE WORKBOOK_ID IN ({wid_csv})")
+        spark.sql(f"UPDATE {TARGET_TABLE} SET API_IS_ARCHIVED = TRUE  WHERE WORKBOOK_ID IN ({wid_csv})")
         print(f"Step 7: Marked {len(newly_archived)} workbook(s) as archived.")
     if newly_unarchived:
         wid_csv = ", ".join(f"'{w}'" for w in newly_unarchived)
-        spark.sql(f"UPDATE {TARGET_TABLE} SET api_is_archived = FALSE WHERE WORKBOOK_ID IN ({wid_csv})")
+        spark.sql(f"UPDATE {TARGET_TABLE} SET API_IS_ARCHIVED = FALSE WHERE WORKBOOK_ID IN ({wid_csv})")
         print(f"Step 7: Marked {len(newly_unarchived)} workbook(s) as unarchived.")
 
 # Update IS_ORPHANED for existing records not covered by the MERGE.
@@ -784,16 +784,16 @@ if reappeared_wals:
         UPDATE {TARGET_TABLE}
         SET    IS_DELETED = FALSE,
                DELETED_AT = NULL
-        WHERE  WAL_TABLE IN ({wal_csv})
+        WHERE  WAL_TABLE_FQN IN ({wal_csv})
     """)
     print(f"Step 7: Cleared deletion flag for {len(reappeared_wals)} reappeared record(s).")
 
 # Sanity check — show most recently modified entries
 spark.sql(f"""
     SELECT SIGDS_TABLE, WORKBOOK_NAME, OBJECT_TYPE, IS_ORPHANED, IS_DELETED, DELETED_AT,
-           api_is_archived, api_owner_first_name, api_owner_last_name,
-           TABLE_SIZE_BYTES, TABLE_LAST_MODIFIED, MAX_EDIT_NUM, WAL_LAST_ALTERED
+           API_IS_ARCHIVED, API_OWNER_FIRST_NAME, API_OWNER_LAST_NAME,
+           SIGDS_TABLE_SIZE_BYTES, SIGDS_TABLE_LAST_MODIFIED, WAL_MAX_EDIT_NUM, WAL_TABLE_LAST_MODIFIED
     FROM   {TARGET_TABLE}
-    ORDER  BY TABLE_LAST_MODIFIED DESC NULLS LAST
+    ORDER  BY SIGDS_TABLE_LAST_MODIFIED DESC NULLS LAST
     LIMIT  20
 """).show(truncate=False)
