@@ -120,31 +120,29 @@ Both `helper_queries.sql` and `geninfo_queries.sql` contain the same five querie
 
 Scores every record in `SIGDS_WORKBOOK_MAP` across eight weighted signals to produce a ranked list of archival candidates.
 
-### Scoring model
+### Scoring model (total = 100 pts, higher = stronger archival candidate)
 
-| Signal | Max score | Description |
+| Dimension | Max | Logic |
 |---|---|---|
-| `API_IS_ARCHIVED` | 35 | Workbook explicitly archived in Sigma — strongest signal |
-| `IS_ORPHANED` | 30 | SIGDS data table no longer exists in Databricks |
-| `IS_DELETED` | 30 | WAL table no longer exists in Databricks |
-| Inactivity (`WAL_LAST_EDIT_AT`) | 20 | >365 days = 20 / >180 = 15 / >90 = 8 / >30 = 3 |
-| Low edit count (`WAL_MAX_EDIT_NUM`) | 10 | 0 = 10 / ≤5 = 7 / ≤20 = 3 |
-| Small table (`SIGDS_TABLE_SIZE_BYTES`) | 10 | Empty/NULL = 10 / <1 MB = 7 / <10 MB = 3 |
-| `IS_LEGACY_WAL` | 8 | Old UUID-based WAL naming — likely older/unowned |
-| Table age (`SIGDS_TABLE_CREATED_AT`) | 7 | >2 years = 7 / >1 year = 4 |
+| Archival / deletion status | 30 | `IS_ORPHANED`=TRUE → 30 / `IS_DELETED`=TRUE → 25 / `API_IS_ARCHIVED`=TRUE → 20 |
+| WAL edit recency | 25 | >365 days (or NULL) → 25 / >180 → 18 / >90 → 10 / >30 → 4 |
+| SIGDS table modification | 15 | >365 days (or NULL) → 15 / >180 → 10 / >90 → 5 |
+| Edit volume (`WAL_MAX_EDIT_NUM`) | 10 | 0/NULL → 10 / ≤10 → 8 / ≤50 → 5 / ≤200 → 2 |
+| Legacy WAL flag | 10 | Legacy + active (<180 days) → 10 / Legacy + inactive → 5 |
+| Storage reclamation | 10 | >1 GB → 10 / >100 MB → 7 / >10 MB → 4 / else → 1 |
 
-**Maximum possible score: 150**
+**Risk penalty:** `IS_TAGGED_VERSION` = TRUE → subtract 15 pts (floor at 0). Tagged versions (Prod, QA) are high-risk to archive and are penalised to prevent automatic tier promotion.
 
 ### Confidence tiers
 
 | Score | Tier | Recommendation |
 |---|---|---|
-| ≥ 70 | **CRITICAL** | Multiple strong signals — prioritise for archival |
-| ≥ 40 | **HIGH** | Strong candidate — review and action |
-| ≥ 20 | **MEDIUM** | Worth monitoring — verify with owner before actioning |
-| < 20 | **LOW** | Active or recently used — retain |
+| ≥ 75 | **TIER 1** | Strong candidate — quarantine now |
+| 50–74 | **TIER 2** | Likely candidate — review with owner |
+| 25–49 | **TIER 3** | Monitor — check in 90 days |
+| < 25 | **TIER 4** | Keep — active or protected |
 
-The query outputs every individual score component alongside the total, making it easy to understand why a record scored highly and to tune thresholds for your organisation. A summary rollup at the end of the file groups counts and total storage by tier.
+The query outputs every individual score component alongside the total, making it easy to understand why a record scored highly and to tune thresholds for your organisation. A tier summary rollup at the end of the file groups record counts, total storage (GB), average score, and min/max edit age by tier.
 
 > **Important — read before taking any action based on these scores.**
 >
