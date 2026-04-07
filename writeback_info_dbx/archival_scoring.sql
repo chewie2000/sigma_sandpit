@@ -66,7 +66,7 @@ WITH scored AS (
     SELECT
         -- Identity
         SIGDS_TABLE,
-        SOURCE_SCHEMA,
+        SCAN_SCHEMA,
         WORKBOOK_NAME,
         API_OWNER_FIRST_NAME,
         API_OWNER_LAST_NAME,
@@ -186,7 +186,7 @@ WITH scored AS (
         -- can reference them by name in the scoring CASE expressions.
         SELECT
             SIGDS_TABLE,
-            SOURCE_SCHEMA,
+            SCAN_SCHEMA,
             WORKBOOK_NAME,
             API_OWNER_FIRST_NAME,
             API_OWNER_LAST_NAME,
@@ -221,7 +221,7 @@ SELECT
 
     -- Identity
     SIGDS_TABLE,
-    SOURCE_SCHEMA,
+    SCAN_SCHEMA,
     WORKBOOK_NAME,
     TRIM(
         COALESCE(API_OWNER_FIRST_NAME, '') || ' ' || COALESCE(API_OWNER_LAST_NAME, '')

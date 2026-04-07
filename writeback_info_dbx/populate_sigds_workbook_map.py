@@ -65,13 +65,11 @@ spark = SparkSession.builder.getOrCreate()
 # Configuration — update before running
 # ---------------------------------------------------------------------------
 CATALOG          = "<YOUR_CATALOG>"     # Databricks Unity Catalog name
-SCHEMA           = "<YOUR_SCHEMA>"      # Schema containing the sigds_wal_* and sigds_* tables to scan
-TARGET_SCHEMA    = "<YOUR_SCHEMA>"      # Schema where SIGDS_WORKBOOK_MAP lives (can differ from SCHEMA)
-# SOURCE_SCHEMA labels every row written by this run so multiple writeback
-# schemas can share one SIGDS_WORKBOOK_MAP table.  Defaults to SCHEMA — only
-# override if you want a shorter alias (e.g. "prod" or "dev").
-SOURCE_SCHEMA    = SCHEMA
-TARGET_TABLE     = f"{CATALOG}.{TARGET_SCHEMA}.SIGDS_WORKBOOK_MAP"
+SCAN_SCHEMA      = "<YOUR_SCAN_SCHEMA>" # Schema to scan for sigds_wal_* and sigds_* tables
+MAP_SCHEMA       = "<YOUR_MAP_SCHEMA>"  # Schema where SIGDS_WORKBOOK_MAP lives
+#   Single schema:  set SCAN_SCHEMA = MAP_SCHEMA = your writeback schema
+#   Multi-schema:   keep MAP_SCHEMA fixed; change SCAN_SCHEMA each run
+TARGET_TABLE     = f"{CATALOG}.{MAP_SCHEMA}.SIGDS_WORKBOOK_MAP"
 # Sigma API base URL — find your regional endpoint at:
 # https://help.sigmacomputing.com/reference/get-started-sigma-api
 SIGMA_API_BASE      = "<YOUR_API_BASE_URL>/v2"
@@ -82,8 +80,8 @@ DESCRIBE_WORKERS = 16  # thread-pool size for all parallel DESCRIBE DETAIL calls
 WAL_BATCH_SIZE   = 100 # max WAL tables per UNION ALL query
 # ---------------------------------------------------------------------------
 
-if any(v.startswith("<YOUR_") for v in [CATALOG, SCHEMA, TARGET_SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID, SIGMA_CLIENT_SECRET]):
-    raise ValueError("Set CATALOG, SCHEMA, TARGET_SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET before running.")
+if any(v.startswith("<YOUR_") for v in [CATALOG, SCAN_SCHEMA, MAP_SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID, SIGMA_CLIENT_SECRET]):
+    raise ValueError("Set CATALOG, SCAN_SCHEMA, MAP_SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET before running.")
 
 
 # ===========================================================================
@@ -206,7 +204,7 @@ def describe_sigds_table(table_name: str) -> dict:
     Returns a dict with SIGDS_TABLE_ID, SIGDS_TABLE_LOCATION, SIGDS_TABLE_CREATED_AT,
     SIGDS_TABLE_LAST_MODIFIED, SIGDS_TABLE_SIZE_BYTES.
     """
-    full   = f"`{CATALOG}`.`{SCHEMA}`.`{table_name}`"
+    full   = f"`{CATALOG}`.`{SCAN_SCHEMA}`.`{table_name}`"
     detail = _describe_detail_fq(full)
     if not detail:
         return {}
@@ -295,14 +293,14 @@ stored_rows = spark.sql(f"""
            API_WORKBOOK_URL, API_OWNER_ID, API_IS_ARCHIVED,
            API_OWNER_FIRST_NAME, API_OWNER_LAST_NAME,
            IS_TAGGED_VERSION, VERSION_TAG_NAME, PARENT_WORKBOOK_ID,
-           IS_DELETED, IS_ORPHANED, SIGDS_TABLE, SOURCE_SCHEMA
+           IS_DELETED, IS_ORPHANED, SIGDS_TABLE, SCAN_SCHEMA
     FROM   {TARGET_TABLE}
 """).collect()
 
 watermarks                = {}   # {wal_table -> most recent WAL_TABLE_LAST_MODIFIED stored}
 known_wb_ids              = set()
 known_enrichment          = {}   # {WORKBOOK_ID -> enrichment dict} for already-seen IDs
-# WAL tracking and orphan state are scoped to SOURCE_SCHEMA so that a run
+# WAL tracking and orphan state are scoped to SCAN_SCHEMA so that a run
 # against one schema does not flag another schema's tables as deleted/orphaned.
 known_wal_tables          = set()
 previously_deleted_wals   = set()
@@ -327,8 +325,8 @@ for row in stored_rows:
                 "VERSION_TAG_NAME":     row["VERSION_TAG_NAME"],
                 "PARENT_WORKBOOK_ID":   row["PARENT_WORKBOOK_ID"],
             }
-    # WAL tracking and orphan state scoped to current SOURCE_SCHEMA only
-    if row["SOURCE_SCHEMA"] != SOURCE_SCHEMA:
+    # WAL tracking and orphan state scoped to current SCAN_SCHEMA only
+    if row["SCAN_SCHEMA"] != SCAN_SCHEMA:
         continue
     wt, ts = row["WAL_TABLE_FQN"], row["WAL_TABLE_LAST_MODIFIED"]
     if wt:
@@ -345,7 +343,7 @@ for row in stored_rows:
             known_non_orphaned_sigds.add(st)
 
 print(
-    f"Step 2: Loaded watermarks for {len(watermarks)} WAL tables (schema={SOURCE_SCHEMA}); "
+    f"Step 2: Loaded watermarks for {len(watermarks)} WAL tables (schema={SCAN_SCHEMA}); "
     f"{len(known_wb_ids)} WORKBOOK_IDs already enriched (all schemas); "
     f"{len(previously_deleted_wals)} previously flagged as deleted; "
     f"{len(known_orphaned_sigds)} previously flagged as orphaned."
@@ -355,12 +353,12 @@ print(
 # Step 3 — Discover WAL tables; pre-filter via parallel DESCRIBE DETAIL
 # ---------------------------------------------------------------------------
 wal_rows = (
-    spark.sql(f"SHOW TABLES IN `{CATALOG}`.`{SCHEMA}`")
+    spark.sql(f"SHOW TABLES IN `{CATALOG}`.`{SCAN_SCHEMA}`")
          .filter("lower(tableName) LIKE 'sigds_wal%'")
          .collect()
 )
 all_wal_names = [
-    f"`{CATALOG}`.`{SCHEMA}`.`{r.tableName}`"
+    f"`{CATALOG}`.`{SCAN_SCHEMA}`.`{r.tableName}`"
     for r in wal_rows
 ]
 if MAX_WAL_TABLE_FQNS > 0:
@@ -448,7 +446,7 @@ print(f"Step 4: {len(new_records)} unique SIGDS tables after deduplication.")
 # tables that no longer exist.
 existing_tables = {
     r.tableName.lower()
-    for r in spark.sql(f"SHOW TABLES IN `{CATALOG}`.`{SCHEMA}`").collect()
+    for r in spark.sql(f"SHOW TABLES IN `{CATALOG}`.`{SCAN_SCHEMA}`").collect()
 }
 
 all_sigds_names  = [r["SIGDS_TABLE"] for r in new_records if r["SIGDS_TABLE"]]
@@ -650,7 +648,7 @@ MERGE_SCHEMA = StructType([
     StructField("WAL_TABLE_FQN",            StringType(),    True),
     StructField("WAL_DS_ID",                StringType(),    True),
     StructField("SIGDS_TABLE",              StringType(),    True),
-    StructField("SOURCE_SCHEMA",            StringType(),    True),
+    StructField("SCAN_SCHEMA",              StringType(),    True),
     StructField("WORKBOOK_ID",          StringType(),    True),
     StructField("WAL_WORKBOOK_URL",         StringType(),    True),
     StructField("ORG_SLUG",             StringType(),    True),
@@ -698,7 +696,7 @@ for r in new_records:
         r["WAL_TABLE_FQN"],
         r["WAL_DS_ID"],
         r["SIGDS_TABLE"],
-        SOURCE_SCHEMA,
+        SCAN_SCHEMA,
         r["WORKBOOK_ID"],
         r["WAL_WORKBOOK_URL"],
         r["ORG_SLUG"],
@@ -736,7 +734,7 @@ if rows:
         MERGE INTO {TARGET_TABLE} AS t
         USING _SIGDS_UPDATES AS s
           ON  t.SIGDS_TABLE    = s.SIGDS_TABLE
-          AND t.SOURCE_SCHEMA  = s.SOURCE_SCHEMA
+          AND t.SCAN_SCHEMA    = s.SCAN_SCHEMA
         WHEN MATCHED THEN
             UPDATE SET *
         WHEN NOT MATCHED THEN
@@ -753,7 +751,7 @@ if newly_deleted_wals:
         UPDATE {TARGET_TABLE}
         SET    IS_DELETED = TRUE,
                DELETED_AT = current_timestamp()
-        WHERE  SOURCE_SCHEMA  = '{SOURCE_SCHEMA}'
+        WHERE  SCAN_SCHEMA    = '{SCAN_SCHEMA}'
           AND  WAL_TABLE_FQN IN ({wal_csv})
           AND  (IS_DELETED IS NULL OR IS_DELETED = FALSE)
     """)
@@ -778,7 +776,7 @@ if newly_orphaned_existing:
     spark.sql(f"""
         UPDATE {TARGET_TABLE}
         SET    IS_ORPHANED = TRUE
-        WHERE  SOURCE_SCHEMA = '{SOURCE_SCHEMA}'
+        WHERE  SCAN_SCHEMA = '{SCAN_SCHEMA}'
           AND  SIGDS_TABLE IN ({sigds_csv})
     """)
     print(f"Step 7: Marked {len(newly_orphaned_existing)} existing record(s) as orphaned.")
@@ -788,7 +786,7 @@ if recovered_existing:
     spark.sql(f"""
         UPDATE {TARGET_TABLE}
         SET    IS_ORPHANED = FALSE
-        WHERE  SOURCE_SCHEMA = '{SOURCE_SCHEMA}'
+        WHERE  SCAN_SCHEMA = '{SCAN_SCHEMA}'
           AND  SIGDS_TABLE IN ({sigds_csv})
     """)
     print(f"Step 7: Cleared orphan flag for {len(recovered_existing)} recovered record(s).")
@@ -800,18 +798,18 @@ if reappeared_wals:
         UPDATE {TARGET_TABLE}
         SET    IS_DELETED = FALSE,
                DELETED_AT = NULL
-        WHERE  SOURCE_SCHEMA  = '{SOURCE_SCHEMA}'
+        WHERE  SCAN_SCHEMA    = '{SCAN_SCHEMA}'
           AND  WAL_TABLE_FQN IN ({wal_csv})
     """)
     print(f"Step 7: Cleared deletion flag for {len(reappeared_wals)} reappeared record(s).")
 
 # Sanity check — show most recently modified entries
 spark.sql(f"""
-    SELECT SIGDS_TABLE, SOURCE_SCHEMA, WORKBOOK_NAME, OBJECT_TYPE, IS_ORPHANED, IS_DELETED, DELETED_AT,
+    SELECT SIGDS_TABLE, SCAN_SCHEMA, WORKBOOK_NAME, OBJECT_TYPE, IS_ORPHANED, IS_DELETED, DELETED_AT,
            API_IS_ARCHIVED, API_OWNER_FIRST_NAME, API_OWNER_LAST_NAME,
            SIGDS_TABLE_SIZE_BYTES, SIGDS_TABLE_LAST_MODIFIED, WAL_MAX_EDIT_NUM, WAL_TABLE_LAST_MODIFIED
     FROM   {TARGET_TABLE}
-    WHERE  SOURCE_SCHEMA = '{SOURCE_SCHEMA}'
+    WHERE  SCAN_SCHEMA = '{SCAN_SCHEMA}'
     ORDER  BY SIGDS_TABLE_LAST_MODIFIED DESC NULLS LAST
     LIMIT  20
 """).show(truncate=False)

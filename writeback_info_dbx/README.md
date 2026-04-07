@@ -46,23 +46,23 @@ Run the script from a Databricks notebook or job attached to a cluster with acce
 
 ### Multiple writeback schemas
 
-`SIGDS_WORKBOOK_MAP` supports multiple writeback schemas in a single table. Every row is stamped with a `SOURCE_SCHEMA` column (defaults to `SCHEMA`) so results from different schemas remain distinguishable. The MERGE key is the composite `SIGDS_TABLE + SOURCE_SCHEMA`, preventing collisions when the same bare table name exists in more than one schema.
+`SIGDS_WORKBOOK_MAP` supports multiple writeback schemas in a single table. Every row is stamped with the `SCAN_SCHEMA` value from the run that produced it, so results from different schemas remain distinguishable. The MERGE key is the composite `SIGDS_TABLE + SCAN_SCHEMA`, preventing collisions when the same bare table name exists in more than one schema.
 
 To cover multiple schemas, run the script once per schema — either manually or as separate tasks in a Databricks job:
 
 ```python
 # Run 1 — production writeback schema
-CATALOG       = "my_catalog"
-SCHEMA        = "prod_writes"
-SOURCE_SCHEMA = "prod_writes"   # optional label override, e.g. "prod"
+CATALOG     = "my_catalog"
+SCAN_SCHEMA = "prod_writes"   # schema to scan for sigds_wal_* tables
+MAP_SCHEMA  = "prod_writes"   # schema where SIGDS_WORKBOOK_MAP lives
 
-# Run 2 — development writeback schema
-CATALOG       = "my_catalog"
-SCHEMA        = "dev_writes"
-SOURCE_SCHEMA = "dev_writes"    # optional label override, e.g. "dev"
+# Run 2 — development writeback schema (map table stays the same)
+CATALOG     = "my_catalog"
+SCAN_SCHEMA = "dev_writes"    # change this each run
+MAP_SCHEMA  = "prod_writes"   # always points to the shared map table
 ```
 
-Both runs write to the same `SIGDS_WORKBOOK_MAP` table. All analysis queries (`archival_scoring.sql`, `helper_queries.sql`, `geninfo_queries.sql`) include `SOURCE_SCHEMA` in their output so you can filter or group by schema. Sigma API enrichment (workbook names, owner details) is shared across schemas — a `WORKBOOK_ID` seen in any previous run is not re-fetched.
+Both runs write to the same `SIGDS_WORKBOOK_MAP` table. All analysis queries (`archival_scoring.sql`, `helper_queries.sql`, `geninfo_queries.sql`) include `SCAN_SCHEMA` in their output so you can filter or group by schema. Sigma API enrichment (workbook names, owner details) is shared across schemas — a `WORKBOOK_ID` seen in any previous run is not re-fetched.
 
 ---
 
