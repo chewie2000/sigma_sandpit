@@ -49,12 +49,12 @@ Run the script from a Databricks notebook or job attached to a cluster with acce
 
 Each run follows these steps:
 
-1. **Load watermarks** — reads stored `WAL_LAST_ALTERED` timestamps and known `WORKBOOK_ID`s from `SIGDS_WORKBOOK_MAP` in a single query.
+1. **Load watermarks** — reads stored `WAL_TABLE_LAST_MODIFIED` timestamps and known `WORKBOOK_ID`s from `SIGDS_WORKBOOK_MAP` in a single query.
 2. **Discover WAL tables** — runs `SHOW TABLES` to find all `sigds_wal_*` tables in the schema.
 3. **Skip unchanged WAL tables** — runs `DESCRIBE DETAIL` in parallel on every WAL table and compares `lastModified` against the stored watermark. WAL tables with no new writes are skipped entirely (no row scans).
 4. **Extract latest WAL entries** — reads the most recent WAL row per SIGDS table from changed WAL tables using batched `UNION ALL` queries (one Spark job per batch of up to 100 tables).
 5. **Delta metadata** — runs `DESCRIBE DETAIL` in parallel for each new or changed SIGDS table to capture table ID, location, size, and timestamps.
-6. **Sigma API enrichment** — fetches workbook/data-model metadata only for `WORKBOOK_ID`s not already in the table. Resolves owner names via `GET /v2/members`. `api_is_archived` is re-checked on every run for all known IDs.
+6. **Sigma API enrichment** — fetches workbook/data-model metadata only for `WORKBOOK_ID`s not already in the table. Resolves owner names via `GET /v2/members`. `API_IS_ARCHIVED` is re-checked on every run for all known IDs.
 7. **Version tag resolution** — fetches all version tags via `GET /v2/tags`, then lists workbooks per tag to build a `taggedWorkbookId → parent workbook` mapping. Tagged version records are flagged with `IS_TAGGED_VERSION=TRUE`, `VERSION_TAG_NAME`, and `PARENT_WORKBOOK_ID`.
 8. **MERGE** — writes all changes into `SIGDS_WORKBOOK_MAP` via a single `MERGE` keyed on `SIGDS_TABLE`. Records whose WAL table has disappeared are flagged `IS_DELETED=TRUE`; the flag is cleared if the WAL table reappears.
 
@@ -62,24 +62,42 @@ Each run follows these steps:
 
 ## SIGDS_WORKBOOK_MAP — key columns
 
+Column names use consistent prefixes to make the data source immediately obvious:
+- **`WAL_`** — sourced from WAL row data or WAL table metadata
+- **`SIGDS_`** — sourced from `DESCRIBE DETAIL` on the writeback data table
+- **`API_`** — sourced from the Sigma REST API
+
 | Column | Description |
 |---|---|
 | `SIGDS_TABLE` | Bare SIGDS table name — logical primary key |
-| `WAL_TABLE` | Fully-qualified WAL table name |
-| `DS_ID` | Input table dataset ID from the WAL record |
+| `WAL_TABLE_FQN` | Fully-qualified WAL table name (`catalog.schema.sigds_wal_*`) |
+| `WAL_DS_ID` | Input table dataset ID extracted from the WAL record |
+| `WAL_WORKBOOK_URL` | Workbook URL extracted from WAL METADATA (`sigmaUrl` / `workbookUrl`) |
+| `WAL_INPUT_TABLE_NAME` | Input table element title extracted from WAL METADATA |
+| `WAL_LAST_EDIT_AT` | Timestamp of the latest WAL row for this SIGDS table |
+| `WAL_LAST_EDIT_BY` | Email of the user who made the last edit, from WAL METADATA |
+| `WAL_MAX_EDIT_NUM` | Highest `EDIT_NUM` seen in the WAL for this SIGDS table |
+| `WAL_TABLE_LAST_MODIFIED` | Watermark — `lastModified` from `DESCRIBE DETAIL` on the WAL table at last processing |
+| `SIGDS_TABLE_ID` | Delta table GUID from `DESCRIBE DETAIL` on the SIGDS table |
+| `SIGDS_TABLE_LOCATION` | Cloud storage path of the SIGDS Delta table |
+| `SIGDS_TABLE_CREATED_AT` | Timestamp when the SIGDS Delta table was first created |
+| `SIGDS_TABLE_LAST_MODIFIED` | Timestamp of the most recent write to the SIGDS Delta table |
+| `SIGDS_TABLE_SIZE_BYTES` | Current on-disk size of the SIGDS Delta table in bytes |
 | `WORKBOOK_ID` | Sigma workbook or data model ID |
-| `WORKBOOK_URL` | Direct URL to the workbook in Sigma |
 | `WORKBOOK_NAME / PATH` | Display name and folder path (from Sigma API) |
 | `OBJECT_TYPE` | `WORKBOOK` or `DATA_MODEL` |
-| `LAST_EDIT_AT / BY` | Timestamp and user email of the most recent writeback edit |
-| `TABLE_SIZE_BYTES` | Current on-disk size of the SIGDS Delta table |
-| `WAL_LAST_ALTERED` | Watermark — `lastModified` of the WAL table at last processing |
+| `ORG_SLUG` | Sigma org slug parsed from the workbook URL |
 | `IS_ORPHANED` | `TRUE` when the SIGDS data table no longer exists in Databricks |
 | `IS_DELETED` | `TRUE` when the WAL table has disappeared from the schema |
 | `IS_LEGACY_WAL` | `TRUE` for old `sigds_wal_<uuid>` naming (pre-DS_ID convention) |
 | `IS_TAGGED_VERSION` | `TRUE` when the workbook ID is a version tag (e.g. Prod, QA) |
-| `api_is_archived` | Archived state from Sigma API — refreshed every run |
-| `api_owner_first_name / last_name` | Owner name resolved via Sigma API — set once on first discovery |
+| `VERSION_TAG_NAME` | Name of the version tag when `IS_TAGGED_VERSION` is TRUE |
+| `PARENT_WORKBOOK_ID` | Source workbook ID when `IS_TAGGED_VERSION` is TRUE |
+| `API_WORKBOOK_URL` | Workbook URL from the Sigma API — set once on first enrichment |
+| `API_OWNER_ID` | Sigma member UUID of the workbook owner (from Sigma API) |
+| `API_IS_ARCHIVED` | Archived state from Sigma API — refreshed every run |
+| `API_OWNER_FIRST_NAME` | Owner first name resolved via `GET /v2/members` — set once |
+| `API_OWNER_LAST_NAME` | Owner last name resolved via `GET /v2/members` — set once |
 
 ---
 
