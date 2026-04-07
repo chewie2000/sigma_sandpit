@@ -66,6 +66,10 @@ spark = SparkSession.builder.getOrCreate()
 # ---------------------------------------------------------------------------
 CATALOG          = "<YOUR_CATALOG>"     # Databricks Unity Catalog name
 SCHEMA           = "<YOUR_SCHEMA>"      # Schema containing SIGDS + WAL tables
+# SOURCE_SCHEMA labels every row written by this run so multiple schemas can
+# share one SIGDS_WORKBOOK_MAP table.  Defaults to SCHEMA — only override if
+# you need a different label (e.g. an alias like "prod" or "dev").
+SOURCE_SCHEMA    = SCHEMA
 TARGET_TABLE     = f"{CATALOG}.{SCHEMA}.SIGDS_WORKBOOK_MAP"
 # Sigma API base URL — find your regional endpoint at:
 # https://help.sigmacomputing.com/reference/get-started-sigma-api
@@ -290,19 +294,41 @@ stored_rows = spark.sql(f"""
            API_WORKBOOK_URL, API_OWNER_ID, API_IS_ARCHIVED,
            API_OWNER_FIRST_NAME, API_OWNER_LAST_NAME,
            IS_TAGGED_VERSION, VERSION_TAG_NAME, PARENT_WORKBOOK_ID,
-           IS_DELETED, IS_ORPHANED, SIGDS_TABLE
+           IS_DELETED, IS_ORPHANED, SIGDS_TABLE, SOURCE_SCHEMA
     FROM   {TARGET_TABLE}
 """).collect()
 
 watermarks                = {}   # {wal_table -> most recent WAL_TABLE_LAST_MODIFIED stored}
 known_wb_ids              = set()
 known_enrichment          = {}   # {WORKBOOK_ID -> enrichment dict} for already-seen IDs
-known_wal_tables          = set() # all WAL_TABLE_FQNs currently tracked in the map
-previously_deleted_wals   = set() # WAL_TABLE_FQNs already flagged IS_DELETED=TRUE
-known_non_orphaned_sigds  = set() # SIGDS_TABLEs currently IS_ORPHANED=FALSE
-known_orphaned_sigds      = set() # SIGDS_TABLEs currently IS_ORPHANED=TRUE
+# WAL tracking and orphan state are scoped to SOURCE_SCHEMA so that a run
+# against one schema does not flag another schema's tables as deleted/orphaned.
+known_wal_tables          = set()
+previously_deleted_wals   = set()
+known_non_orphaned_sigds  = set()
+known_orphaned_sigds      = set()
 
 for row in stored_rows:
+    wid = row["WORKBOOK_ID"]
+    if wid:
+        known_wb_ids.add(wid)
+        if wid not in known_enrichment:
+            known_enrichment[wid] = {
+                "WORKBOOK_NAME":        row["WORKBOOK_NAME"],
+                "WORKBOOK_PATH":        row["WORKBOOK_PATH"],
+                "OBJECT_TYPE":          row["OBJECT_TYPE"],
+                "API_WORKBOOK_URL":     row["API_WORKBOOK_URL"],
+                "API_OWNER_ID":         row["API_OWNER_ID"],
+                "API_IS_ARCHIVED":      row["API_IS_ARCHIVED"],
+                "API_OWNER_FIRST_NAME": row["API_OWNER_FIRST_NAME"],
+                "API_OWNER_LAST_NAME":  row["API_OWNER_LAST_NAME"],
+                "IS_TAGGED_VERSION":    row["IS_TAGGED_VERSION"],
+                "VERSION_TAG_NAME":     row["VERSION_TAG_NAME"],
+                "PARENT_WORKBOOK_ID":   row["PARENT_WORKBOOK_ID"],
+            }
+    # WAL tracking and orphan state scoped to current SOURCE_SCHEMA only
+    if row["SOURCE_SCHEMA"] != SOURCE_SCHEMA:
+        continue
     wt, ts = row["WAL_TABLE_FQN"], row["WAL_TABLE_LAST_MODIFIED"]
     if wt:
         known_wal_tables.add(wt)
@@ -316,27 +342,10 @@ for row in stored_rows:
             known_orphaned_sigds.add(st)
         else:
             known_non_orphaned_sigds.add(st)
-    wid = row["WORKBOOK_ID"]
-    if wid:
-        known_wb_ids.add(wid)
-        if wid not in known_enrichment:
-            known_enrichment[wid] = {
-                "WORKBOOK_NAME":        row["WORKBOOK_NAME"],
-                "WORKBOOK_PATH":        row["WORKBOOK_PATH"],
-                "OBJECT_TYPE":          row["OBJECT_TYPE"],
-                "API_WORKBOOK_URL":              row["API_WORKBOOK_URL"],
-                "API_OWNER_ID":         row["API_OWNER_ID"],
-                "API_IS_ARCHIVED":      row["API_IS_ARCHIVED"],
-                "API_OWNER_FIRST_NAME": row["API_OWNER_FIRST_NAME"],
-                "API_OWNER_LAST_NAME":  row["API_OWNER_LAST_NAME"],
-                "IS_TAGGED_VERSION":    row["IS_TAGGED_VERSION"],
-                "VERSION_TAG_NAME":     row["VERSION_TAG_NAME"],
-                "PARENT_WORKBOOK_ID":   row["PARENT_WORKBOOK_ID"],
-            }
 
 print(
-    f"Step 2: Loaded watermarks for {len(watermarks)} WAL tables; "
-    f"{len(known_wb_ids)} WORKBOOK_IDs already enriched; "
+    f"Step 2: Loaded watermarks for {len(watermarks)} WAL tables (schema={SOURCE_SCHEMA}); "
+    f"{len(known_wb_ids)} WORKBOOK_IDs already enriched (all schemas); "
     f"{len(previously_deleted_wals)} previously flagged as deleted; "
     f"{len(known_orphaned_sigds)} previously flagged as orphaned."
 )
@@ -639,7 +648,8 @@ else:
 MERGE_SCHEMA = StructType([
     StructField("WAL_TABLE_FQN",            StringType(),    True),
     StructField("WAL_DS_ID",                StringType(),    True),
-    StructField("SIGDS_TABLE",          StringType(),    True),
+    StructField("SIGDS_TABLE",              StringType(),    True),
+    StructField("SOURCE_SCHEMA",            StringType(),    True),
     StructField("WORKBOOK_ID",          StringType(),    True),
     StructField("WAL_WORKBOOK_URL",         StringType(),    True),
     StructField("ORG_SLUG",             StringType(),    True),
@@ -687,6 +697,7 @@ for r in new_records:
         r["WAL_TABLE_FQN"],
         r["WAL_DS_ID"],
         r["SIGDS_TABLE"],
+        SOURCE_SCHEMA,
         r["WORKBOOK_ID"],
         r["WAL_WORKBOOK_URL"],
         r["ORG_SLUG"],
@@ -723,7 +734,8 @@ if rows:
     spark.sql(f"""
         MERGE INTO {TARGET_TABLE} AS t
         USING _SIGDS_UPDATES AS s
-          ON  t.SIGDS_TABLE = s.SIGDS_TABLE
+          ON  t.SIGDS_TABLE    = s.SIGDS_TABLE
+          AND t.SOURCE_SCHEMA  = s.SOURCE_SCHEMA
         WHEN MATCHED THEN
             UPDATE SET *
         WHEN NOT MATCHED THEN
@@ -740,7 +752,8 @@ if newly_deleted_wals:
         UPDATE {TARGET_TABLE}
         SET    IS_DELETED = TRUE,
                DELETED_AT = current_timestamp()
-        WHERE  WAL_TABLE_FQN IN ({wal_csv})
+        WHERE  SOURCE_SCHEMA  = '{SOURCE_SCHEMA}'
+          AND  WAL_TABLE_FQN IN ({wal_csv})
           AND  (IS_DELETED IS NULL OR IS_DELETED = FALSE)
     """)
     print(f"Step 7: Flagged {len(newly_deleted_wals)} record(s) as deleted.")
@@ -764,7 +777,8 @@ if newly_orphaned_existing:
     spark.sql(f"""
         UPDATE {TARGET_TABLE}
         SET    IS_ORPHANED = TRUE
-        WHERE  SIGDS_TABLE IN ({sigds_csv})
+        WHERE  SOURCE_SCHEMA = '{SOURCE_SCHEMA}'
+          AND  SIGDS_TABLE IN ({sigds_csv})
     """)
     print(f"Step 7: Marked {len(newly_orphaned_existing)} existing record(s) as orphaned.")
 
@@ -773,7 +787,8 @@ if recovered_existing:
     spark.sql(f"""
         UPDATE {TARGET_TABLE}
         SET    IS_ORPHANED = FALSE
-        WHERE  SIGDS_TABLE IN ({sigds_csv})
+        WHERE  SOURCE_SCHEMA = '{SOURCE_SCHEMA}'
+          AND  SIGDS_TABLE IN ({sigds_csv})
     """)
     print(f"Step 7: Cleared orphan flag for {len(recovered_existing)} recovered record(s).")
 
@@ -784,16 +799,18 @@ if reappeared_wals:
         UPDATE {TARGET_TABLE}
         SET    IS_DELETED = FALSE,
                DELETED_AT = NULL
-        WHERE  WAL_TABLE_FQN IN ({wal_csv})
+        WHERE  SOURCE_SCHEMA  = '{SOURCE_SCHEMA}'
+          AND  WAL_TABLE_FQN IN ({wal_csv})
     """)
     print(f"Step 7: Cleared deletion flag for {len(reappeared_wals)} reappeared record(s).")
 
 # Sanity check — show most recently modified entries
 spark.sql(f"""
-    SELECT SIGDS_TABLE, WORKBOOK_NAME, OBJECT_TYPE, IS_ORPHANED, IS_DELETED, DELETED_AT,
+    SELECT SIGDS_TABLE, SOURCE_SCHEMA, WORKBOOK_NAME, OBJECT_TYPE, IS_ORPHANED, IS_DELETED, DELETED_AT,
            API_IS_ARCHIVED, API_OWNER_FIRST_NAME, API_OWNER_LAST_NAME,
            SIGDS_TABLE_SIZE_BYTES, SIGDS_TABLE_LAST_MODIFIED, WAL_MAX_EDIT_NUM, WAL_TABLE_LAST_MODIFIED
     FROM   {TARGET_TABLE}
+    WHERE  SOURCE_SCHEMA = '{SOURCE_SCHEMA}'
     ORDER  BY SIGDS_TABLE_LAST_MODIFIED DESC NULLS LAST
     LIMIT  20
 """).show(truncate=False)

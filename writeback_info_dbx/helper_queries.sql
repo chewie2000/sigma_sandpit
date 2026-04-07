@@ -19,6 +19,7 @@ USE SCHEMA  <YOUR_SCHEMA>;
 -- =============================================================================
 
 SELECT
+  SOURCE_SCHEMA,
   SIGDS_TABLE,
   WAL_TABLE_FQN,
   WORKBOOK_ID,
@@ -34,7 +35,7 @@ WHERE
   IS_ORPHANED = FALSE
   AND API_IS_ARCHIVED = TRUE
   AND WAL_LAST_EDIT_AT < CURRENT_TIMESTAMP() - INTERVAL 90 DAY
-ORDER BY SIGDS_TABLE_SIZE_BYTES DESC NULLS LAST;
+ORDER BY SOURCE_SCHEMA, SIGDS_TABLE_SIZE_BYTES DESC NULLS LAST;
 
 -- =============================================================================
 -- 2) Active workbooks — largest stale SIGDS tables (manual review)
@@ -43,6 +44,7 @@ ORDER BY SIGDS_TABLE_SIZE_BYTES DESC NULLS LAST;
 -- =============================================================================
 
 SELECT
+  SOURCE_SCHEMA,
   SIGDS_TABLE,
   WAL_TABLE_FQN,
   WORKBOOK_ID,
@@ -55,7 +57,7 @@ WHERE
   IS_ORPHANED = FALSE
   AND API_IS_ARCHIVED = FALSE
   AND WAL_LAST_EDIT_AT < CURRENT_TIMESTAMP() - INTERVAL 180 DAY
-ORDER BY SIGDS_TABLE_SIZE_BYTES DESC NULLS LAST;
+ORDER BY SOURCE_SCHEMA, SIGDS_TABLE_SIZE_BYTES DESC NULLS LAST;
 
 -- =============================================================================
 -- 3) Orphaned WAL records — SIGDS table dropped, WAL still present
@@ -63,6 +65,7 @@ ORDER BY SIGDS_TABLE_SIZE_BYTES DESC NULLS LAST;
 -- =============================================================================
 
 SELECT
+  SOURCE_SCHEMA,
   WAL_TABLE_FQN,
   WAL_DS_ID,
   WORKBOOK_ID,
@@ -76,7 +79,7 @@ WHERE
   IS_ORPHANED = TRUE
   AND IS_DELETED = FALSE
   AND WAL_LAST_EDIT_AT < CURRENT_TIMESTAMP() - INTERVAL 90 DAY
-ORDER BY WAL_LAST_EDIT_AT ASC;
+ORDER BY SOURCE_SCHEMA, WAL_LAST_EDIT_AT ASC;
 
 -- =============================================================================
 -- 4) Stale legacy WAL tables
@@ -85,6 +88,7 @@ ORDER BY WAL_LAST_EDIT_AT ASC;
 -- =============================================================================
 
 SELECT
+  SOURCE_SCHEMA,
   WAL_TABLE_FQN,
   WAL_DS_ID,
   WORKBOOK_ID,
@@ -95,7 +99,7 @@ FROM SIGDS_WORKBOOK_MAP
 WHERE
   IS_LEGACY_WAL = TRUE
   AND WAL_LAST_EDIT_AT < CURRENT_TIMESTAMP() - INTERVAL 180 DAY
-ORDER BY WAL_LAST_EDIT_AT ASC;
+ORDER BY SOURCE_SCHEMA, WAL_LAST_EDIT_AT ASC;
 
 -- =============================================================================
 -- 5) Status flag summary — overview of cleanup opportunity
@@ -103,6 +107,7 @@ ORDER BY WAL_LAST_EDIT_AT ASC;
 -- =============================================================================
 
 SELECT
+  SOURCE_SCHEMA,
   IS_ORPHANED,
   IS_DELETED,
   IS_LEGACY_WAL,
@@ -111,8 +116,9 @@ SELECT
   SUM(SIGDS_TABLE_SIZE_BYTES) AS total_size_bytes
 FROM SIGDS_WORKBOOK_MAP
 GROUP BY
+  SOURCE_SCHEMA,
   IS_ORPHANED,
   IS_DELETED,
   IS_LEGACY_WAL,
   API_IS_ARCHIVED
-ORDER BY num_entries DESC;
+ORDER BY SOURCE_SCHEMA, num_entries DESC;

@@ -8,8 +8,8 @@
 -- Unity Catalog catalog and schema where the table should be created.
 -- These must match the CATALOG and SCHEMA values set in the Python script.
 --
--- Logical primary key : SIGDS_TABLE  (one row per Sigma input/writeback table)
--- Merge key           : SIGDS_TABLE  (used in the MERGE statement in the script)
+-- Logical primary key : SIGDS_TABLE + SOURCE_SCHEMA  (one row per table per schema)
+-- Merge key           : SIGDS_TABLE + SOURCE_SCHEMA  (composite key in the MERGE statement)
 -- =============================================================================
 
 USE CATALOG <YOUR_CATALOG>;
@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS SIGDS_WORKBOOK_MAP (
   -- ---------------------------------------------------------------------------
   WAL_TABLE_FQN        STRING    COMMENT 'Fully-qualified WAL table name (catalog.schema.sigds_wal_*)',
   WAL_DS_ID            STRING    COMMENT 'Input table dataset ID (WAL_DS_ID) from the WAL record',
-  SIGDS_TABLE      STRING    COMMENT 'Bare SIGDS table name within the writeback schema (logical PK)',
+  SIGDS_TABLE          STRING    COMMENT 'Bare SIGDS table name within the writeback schema (part of composite PK)',
+  SOURCE_SCHEMA        STRING    COMMENT 'Schema where the WAL and SIGDS tables reside; part of the composite merge key (SIGDS_TABLE + SOURCE_SCHEMA). Allows multiple writeback schemas to share one SIGDS_WORKBOOK_MAP table.',
 
   -- ---------------------------------------------------------------------------
   -- Sigma workbook / data-model metadata
