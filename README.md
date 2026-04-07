@@ -1,21 +1,22 @@
 # Sigma Sandpit
 
-A generic sandpit for Sigma Computing related projects, covering Python, SQL, and React across Databricks and Snowflake environments.
+A sandpit for Sigma Computing related projects, focused on Databricks and Snowflake integrations.
 
 ## Structure
 
 ```
 sigma_sandpit/
-├── python/     # Python scripts, notebooks, and utilities
-├── sql/        # SQL queries, models, and transformations
-└── react/      # React components and Sigma embedded analytics
+├── DataSetMigrateHelper_SF/   # Snowflake — dataset dependency graph and workbook migration analysis
+└── writeback_info_dbx/        # Databricks — writeback (input table) inventory and cleanup toolkit
 ```
 
-## Stack
+## Projects
 
-- **Python** — data pipelines, API integrations, Databricks notebooks
-- **SQL** — Snowflake queries, dbt models, transformations
-- **React** — Sigma embedded analytics, custom UI components
+### [DataSetMigrateHelper_SF](DataSetMigrateHelper_SF/README.md)
+Snowflake-native toolkit for mapping Sigma dataset dependency chains and workbook source relationships to support the Dataset → Data Model migration. Includes Snowflake stored procedures, recursive SQL analysis queries, and crossover (fork/merge point) analysis.
+
+### [writeback_info_dbx](writeback_info_dbx/README.md)
+Databricks toolkit for inventorying and monitoring Sigma writeback (input table) activity. Maps every active WAL table to its Sigma workbook or data model, enriches records with Delta metadata and Sigma API ownership data, and populates `SIGDS_WORKBOOK_MAP` for reporting and cleanup planning.
 
 ## Platforms
 
