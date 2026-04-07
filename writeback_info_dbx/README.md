@@ -12,6 +12,7 @@ When Sigma writebacks are enabled, Sigma creates a WAL table (`sigds_wal_*`) and
 |---|---|
 | `create_sigds_workbook_map.sql` | DDL — creates the `SIGDS_WORKBOOK_MAP` table in Unity Catalog (run once) |
 | `populate_sigds_workbook_map.py` | Main script — incrementally populates `SIGDS_WORKBOOK_MAP` from WAL tables and the Sigma API |
+| `archival_scoring.sql` | Weighted confidence scoring matrix — scores every record across multiple signals to surface archival candidates |
 | `helper_queries.sql` | Housekeeping queries — identifies stale, orphaned, archived, and legacy records for cleanup |
 | `geninfo_queries.sql` | General information queries — same query set as helper_queries, for read-only reporting |
 
@@ -112,6 +113,38 @@ Both `helper_queries.sql` and `geninfo_queries.sql` contain the same five querie
 | 3. Orphaned WAL records | SIGDS table dropped but WAL table still exists — WAL DROP candidates |
 | 4. Stale legacy WAL tables | Old UUID-named WAL tables with no edits in 180+ days |
 | 5. Status flag summary | Rollup of record counts and total storage by status flag combination |
+
+---
+
+## Archival Scoring (`archival_scoring.sql`)
+
+Scores every record in `SIGDS_WORKBOOK_MAP` across eight weighted signals to produce a ranked list of archival candidates.
+
+### Scoring model
+
+| Signal | Max score | Description |
+|---|---|---|
+| `API_IS_ARCHIVED` | 35 | Workbook explicitly archived in Sigma — strongest signal |
+| `IS_ORPHANED` | 30 | SIGDS data table no longer exists in Databricks |
+| `IS_DELETED` | 30 | WAL table no longer exists in Databricks |
+| Inactivity (`WAL_LAST_EDIT_AT`) | 20 | >365 days = 20 / >180 = 15 / >90 = 8 / >30 = 3 |
+| Low edit count (`WAL_MAX_EDIT_NUM`) | 10 | 0 = 10 / ≤5 = 7 / ≤20 = 3 |
+| Small table (`SIGDS_TABLE_SIZE_BYTES`) | 10 | Empty/NULL = 10 / <1 MB = 7 / <10 MB = 3 |
+| `IS_LEGACY_WAL` | 8 | Old UUID-based WAL naming — likely older/unowned |
+| Table age (`SIGDS_TABLE_CREATED_AT`) | 7 | >2 years = 7 / >1 year = 4 |
+
+**Maximum possible score: 150**
+
+### Confidence tiers
+
+| Score | Tier | Recommendation |
+|---|---|---|
+| ≥ 70 | **CRITICAL** | Multiple strong signals — prioritise for archival |
+| ≥ 40 | **HIGH** | Strong candidate — review and action |
+| ≥ 20 | **MEDIUM** | Worth monitoring — verify with owner before actioning |
+| < 20 | **LOW** | Active or recently used — retain |
+
+The query outputs every individual score component alongside the total, making it easy to understand why a record scored highly and to tune thresholds for your organisation. A summary rollup at the end of the file groups counts and total storage by tier.
 
 ---
 
