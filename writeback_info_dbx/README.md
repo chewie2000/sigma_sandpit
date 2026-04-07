@@ -97,6 +97,31 @@ Both `helper_queries.sql` and `geninfo_queries.sql` contain the same five querie
 
 ---
 
+## Safe Deletion of SIGDS and WAL Tables
+
+> **Best practice: move first, delete later — never drop directly.**
+
+Sigma stores the exact fully-qualified table name of both the SIGDS data table and the WAL table in its internal metadata. When Sigma looks up an input table it searches for a table matching the exact `SIGDS_<uuid>` identifier in the writeback schema configured on the connection. If the table has been dropped or renamed, workbooks will immediately fail with errors such as:
+
+```
+Object '<DB>.<SCHEMA>."SIGDS_WAL_xxx"' does not exist or not authorized
+```
+
+This applies equally to the WAL table — Sigma holds the WAL table name in its metadata and requires an exact match.
+
+### Recommended process
+
+1. **Identify candidates** using the helper queries (archived, orphaned, or stale records).
+2. **Move** the SIGDS and WAL tables to a quarantine schema (e.g. `<SCHEMA>_quarantine`) using `ALTER TABLE ... RENAME TO`. Do not drop them yet.
+3. **Monitor** for a safe period (recommended: 30 days minimum) to confirm no workbook errors are raised and no users report missing data.
+4. **Drop** the tables from the quarantine schema once the safe period has passed.
+
+### Why this matters
+
+If a table is moved or renamed rather than dropped outright, recovery is straightforward — rename the table back to its original location (`<CATALOG>.<SCHEMA>.<SIGDS_TABLE_NAME>`) and the workbook resumes functioning immediately. A direct `DROP TABLE` is irreversible and eliminates this recovery path.
+
+---
+
 ## Prerequisites
 
 - Databricks cluster with Unity Catalog access and `SELECT` + `MODIFY` on the target catalog/schema
