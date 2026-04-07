@@ -146,6 +146,12 @@ Scores every record in `SIGDS_WORKBOOK_MAP` across eight weighted signals to pro
 
 The query outputs every individual score component alongside the total, making it easy to understand why a record scored highly and to tune thresholds for your organisation. A summary rollup at the end of the file groups counts and total storage by tier.
 
+> **Important — read before taking any action based on these scores.**
+>
+> The confidence tiers and weights in this model are entirely subjective. What constitutes an appropriate threshold for archival will vary significantly from customer to customer depending on usage patterns, business criticality, data retention policies, and team workflows. The scores are a starting point for investigation, not a directive.
+>
+> **Incorrectly removing a SIGDS table or its associated WAL table can cause irreparable impact to the related Sigma content.** Workbooks and input tables that depend on these objects will break immediately and, if the tables have been dropped rather than moved, may not be recoverable. Always follow the safe deletion process (move to quarantine first, monitor, then delete) and ensure the record has been reviewed and approved by the workbook owner before any action is taken.
+
 ---
 
 ## Safe Deletion of SIGDS and WAL Tables

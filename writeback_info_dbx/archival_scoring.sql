@@ -8,6 +8,27 @@
 -- Before running, replace <YOUR_CATALOG> and <YOUR_SCHEMA> below.
 --
 -- =============================================================================
+-- !! IMPORTANT — READ BEFORE ACTING ON THESE SCORES !!
+-- =============================================================================
+--
+-- The confidence tiers and weights in this model are entirely subjective.
+-- Appropriate thresholds will vary significantly from customer to customer
+-- depending on usage patterns, business criticality, data retention policies,
+-- and team workflows. Treat scores as a starting point for investigation,
+-- not as a directive to delete.
+--
+-- Incorrectly removing a SIGDS table or its associated WAL table can cause
+-- IRREPARABLE impact to the related Sigma content. Workbooks and input tables
+-- that depend on these objects will break immediately. If the tables are
+-- dropped rather than moved, recovery may not be possible.
+--
+-- Always follow the safe deletion process:
+--   1. Move to a quarantine schema first — do NOT drop directly.
+--   2. Monitor for a minimum of 30 days.
+--   3. Confirm with the workbook owner before taking any action.
+--   4. Only drop from quarantine once the safe period has passed with no issues.
+--
+-- =============================================================================
 -- SCORING MODEL
 -- =============================================================================
 --
