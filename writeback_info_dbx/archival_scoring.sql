@@ -385,9 +385,9 @@ GROUP BY
         ELSE                        'TIER 4 — Keep (active or protected)'
     END
 ORDER BY
-    CASE
-        WHEN TOTAL_SCORE >= 75 THEN 1
-        WHEN TOTAL_SCORE >= 50 THEN 2
-        WHEN TOTAL_SCORE >= 25 THEN 3
+    CASE ARCHIVAL_TIER
+        WHEN 'TIER 1 — Strong candidate (quarantine now)'    THEN 1
+        WHEN 'TIER 2 — Likely candidate (review with owner)' THEN 2
+        WHEN 'TIER 3 — Monitor (check in 90 days)'          THEN 3
         ELSE 4
     END;
