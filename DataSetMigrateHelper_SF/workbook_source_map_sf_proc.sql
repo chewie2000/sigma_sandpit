@@ -237,6 +237,7 @@ def main(session):
             -- Workbook attributes
             WORKBOOK_ID              STRING,
             WORKBOOK_NAME            STRING,
+            WORKBOOK_URL             STRING,
             WORKBOOK_PATH            STRING,
             OWNER_NAME               STRING,
             OWNER_EMAIL              STRING,
@@ -309,6 +310,7 @@ def main(session):
     for wb in all_workbooks:
         wb_id   = wb.get("workbookId")
         wb_name = wb.get("name", wb_id)
+        wb_url  = wb.get("url")
         wb_path = wb.get("path")
         owner   = wb.get("owner") or {}
 
@@ -386,6 +388,7 @@ def main(session):
                 now_ts,
                 wb_id,
                 wb_name,
+                wb_url,
                 wb_path,
                 owner.get("name"),
                 owner.get("email"),
@@ -406,7 +409,7 @@ def main(session):
     if summary_rows:
         summary_cols = [
             "RUN_ID", "CREATED_AT",
-            "WORKBOOK_ID", "WORKBOOK_NAME", "WORKBOOK_PATH",
+            "WORKBOOK_ID", "WORKBOOK_NAME", "WORKBOOK_URL", "WORKBOOK_PATH",
             "OWNER_NAME", "OWNER_EMAIL",
             "WORKBOOK_CREATED_AT", "WORKBOOK_UPDATED_AT",
             "TOTAL_SOURCES", "DATASET_SOURCE_COUNT", "DATA_MODEL_SOURCE_COUNT",
@@ -432,9 +435,9 @@ def main(session):
         session.create_dataframe(detail_rows, schema=detail_cols) \
                .write.mode("append").save_as_table(FQ_DETAILS_SNOWPARK)
 
-    fully_migrated = sum(1 for r in summary_rows if r[13] == "FULLY MIGRATED")
-    partially      = sum(1 for r in summary_rows if r[13] == "PARTIALLY MIGRATED")
-    not_migrated   = sum(1 for r in summary_rows if r[13] == "NOT MIGRATED")
+    fully_migrated = sum(1 for r in summary_rows if r[14] == "FULLY MIGRATED")
+    partially      = sum(1 for r in summary_rows if r[14] == "PARTIALLY MIGRATED")
+    not_migrated   = sum(1 for r in summary_rows if r[14] == "NOT MIGRATED")
 
     return (
         f"workbooks_scanned={len(all_workbooks)} | "

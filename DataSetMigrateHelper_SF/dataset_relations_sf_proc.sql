@@ -247,6 +247,8 @@ def main(session):
             DATASET_NAME             STRING,
             DATASET_PATH             STRING,
             DATASET_URL              STRING,
+            DATASET_CREATED_BY       STRING,
+            DATASET_OWNER            STRING,
             DATASET_MIGRATION_STATUS STRING,
 
             -- Migration event (when/who migrated this dataset to a data model)
@@ -353,6 +355,8 @@ def main(session):
             ds_meta.get("name", ds_id),
             ds_meta.get("path"),
             ds_meta.get("url"),
+            ds_meta.get("createdBy"),
+            ds_meta.get("owner"),
             ds_meta.get("migrationStatus"),
             # Migration event
             *migration_fields(ds_meta),
@@ -389,7 +393,7 @@ def main(session):
         schema_cols = [
             "RUN_ID", "CREATED_AT",
             "RELATION_TYPE",
-            "DATASET_ID", "DATASET_NAME", "DATASET_PATH", "DATASET_URL", "DATASET_MIGRATION_STATUS",
+            "DATASET_ID", "DATASET_NAME", "DATASET_PATH", "DATASET_URL", "DATASET_CREATED_BY", "DATASET_OWNER", "DATASET_MIGRATION_STATUS",
             "MIGRATED_AT", "MIGRATED_BY",
             "DATA_MODEL_ID", "DATA_MODEL_NAME", "DATA_MODEL_URL", "DATA_MODEL_PATH",
             "DATA_MODEL_CREATED_AT", "DATA_MODEL_UPDATED_AT",
