@@ -65,12 +65,13 @@ spark = SparkSession.builder.getOrCreate()
 # Configuration — update before running
 # ---------------------------------------------------------------------------
 CATALOG          = "<YOUR_CATALOG>"     # Databricks Unity Catalog name
-SCHEMA           = "<YOUR_SCHEMA>"      # Schema containing SIGDS + WAL tables
-# SOURCE_SCHEMA labels every row written by this run so multiple schemas can
-# share one SIGDS_WORKBOOK_MAP table.  Defaults to SCHEMA — only override if
-# you need a different label (e.g. an alias like "prod" or "dev").
+SCHEMA           = "<YOUR_SCHEMA>"      # Schema containing the sigds_wal_* and sigds_* tables to scan
+TARGET_SCHEMA    = "<YOUR_SCHEMA>"      # Schema where SIGDS_WORKBOOK_MAP lives (can differ from SCHEMA)
+# SOURCE_SCHEMA labels every row written by this run so multiple writeback
+# schemas can share one SIGDS_WORKBOOK_MAP table.  Defaults to SCHEMA — only
+# override if you want a shorter alias (e.g. "prod" or "dev").
 SOURCE_SCHEMA    = SCHEMA
-TARGET_TABLE     = f"{CATALOG}.{SCHEMA}.SIGDS_WORKBOOK_MAP"
+TARGET_TABLE     = f"{CATALOG}.{TARGET_SCHEMA}.SIGDS_WORKBOOK_MAP"
 # Sigma API base URL — find your regional endpoint at:
 # https://help.sigmacomputing.com/reference/get-started-sigma-api
 SIGMA_API_BASE      = "<YOUR_API_BASE_URL>/v2"
@@ -81,8 +82,8 @@ DESCRIBE_WORKERS = 16  # thread-pool size for all parallel DESCRIBE DETAIL calls
 WAL_BATCH_SIZE   = 100 # max WAL tables per UNION ALL query
 # ---------------------------------------------------------------------------
 
-if any(v.startswith("<YOUR_") for v in [CATALOG, SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID, SIGMA_CLIENT_SECRET]):
-    raise ValueError("Set CATALOG, SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET before running.")
+if any(v.startswith("<YOUR_") for v in [CATALOG, SCHEMA, TARGET_SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID, SIGMA_CLIENT_SECRET]):
+    raise ValueError("Set CATALOG, SCHEMA, TARGET_SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET before running.")
 
 
 # ===========================================================================
