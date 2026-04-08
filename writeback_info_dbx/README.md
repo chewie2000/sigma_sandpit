@@ -36,13 +36,36 @@ Edit the configuration block at the top of `populate_sigds_workbook_map.py`:
 
 ```python
 CATALOG             = "<YOUR_CATALOG>"
-SCHEMA              = "<YOUR_SCHEMA>"
+SCAN_SCHEMA         = "<YOUR_SCAN_SCHEMA>"  # schema containing sigds_wal_* tables to scan
+MAP_SCHEMA          = "<YOUR_MAP_SCHEMA>"   # schema where SIGDS_WORKBOOK_MAP lives
 SIGMA_API_BASE      = "<YOUR_API_BASE_URL>/v2"
 SIGMA_CLIENT_ID     = "<YOUR_SIGMA_CLIENT_ID>"
 SIGMA_CLIENT_SECRET = "<YOUR_SIGMA_CLIENT_SECRET>"
 ```
 
+For a single-schema setup, set `SCAN_SCHEMA` and `MAP_SCHEMA` to the same value.
+
 Run the script from a Databricks notebook or job attached to a cluster with access to the Unity Catalog schema containing your `sigds_wal_*` and `sigds_*` tables.
+
+### Upgrading an existing table (SOURCE_SCHEMA → SCAN_SCHEMA)
+
+If you ran an earlier version of the script, your table will have a column called `SOURCE_SCHEMA`. Delta requires column mapping to be enabled before a rename can be performed:
+
+```sql
+-- Step 1: enable column mapping (one-time, metadata-only)
+ALTER TABLE <YOUR_CATALOG>.<YOUR_MAP_SCHEMA>.SIGDS_WORKBOOK_MAP
+SET TBLPROPERTIES (
+  'delta.columnMapping.mode' = 'name',
+  'delta.minReaderVersion'   = '2',
+  'delta.minWriterVersion'   = '5'
+);
+
+-- Step 2: rename the column
+ALTER TABLE <YOUR_CATALOG>.<YOUR_MAP_SCHEMA>.SIGDS_WORKBOOK_MAP
+  RENAME COLUMN SOURCE_SCHEMA TO SCAN_SCHEMA;
+```
+
+No data is rewritten — both steps are metadata-only operations.
 
 ### Multiple writeback schemas
 
@@ -77,7 +100,7 @@ Each run follows these steps:
 5. **Delta metadata** — runs `DESCRIBE DETAIL` in parallel for each new or changed SIGDS table to capture table ID, location, size, and timestamps.
 6. **Sigma API enrichment** — fetches workbook/data-model metadata only for `WORKBOOK_ID`s not already in the table. Resolves owner names via `GET /v2/members`. `API_IS_ARCHIVED` is re-checked on every run for all known IDs.
 7. **Version tag resolution** — fetches all version tags via `GET /v2/tags`, then lists workbooks per tag to build a `taggedWorkbookId → parent workbook` mapping. Tagged version records are flagged with `IS_TAGGED_VERSION=TRUE`, `VERSION_TAG_NAME`, and `PARENT_WORKBOOK_ID`.
-8. **MERGE** — writes all changes into `SIGDS_WORKBOOK_MAP` via a single `MERGE` keyed on `SIGDS_TABLE`. Records whose WAL table has disappeared are flagged `IS_DELETED=TRUE`; the flag is cleared if the WAL table reappears.
+8. **MERGE** — writes all changes into `SIGDS_WORKBOOK_MAP` via a single `MERGE` keyed on the composite `SIGDS_TABLE + SCAN_SCHEMA`. Records whose WAL table has disappeared are flagged `IS_DELETED=TRUE`; the flag is cleared if the WAL table reappears. All deletion and orphan flag updates are scoped to the current `SCAN_SCHEMA` so other schemas' rows are never affected.
 
 ---
 
@@ -90,7 +113,8 @@ Column names use consistent prefixes to make the data source immediately obvious
 
 | Column | Description |
 |---|---|
-| `SIGDS_TABLE` | Bare SIGDS table name — logical primary key |
+| `SIGDS_TABLE` | Bare SIGDS table name — part of composite primary key |
+| `SCAN_SCHEMA` | Schema that was scanned to produce this row — part of composite primary key |
 | `WAL_TABLE_FQN` | Fully-qualified WAL table name (`catalog.schema.sigds_wal_*`) |
 | `WAL_DS_ID` | Input table dataset ID extracted from the WAL record |
 | `WAL_WORKBOOK_URL` | Workbook URL extracted from WAL METADATA (`sigmaUrl` / `workbookUrl`) |
