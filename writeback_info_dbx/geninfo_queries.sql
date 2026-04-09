@@ -193,33 +193,44 @@ ORDER BY SCAN_SCHEMA, RECLAIMABLE_SIZE_GB DESC, ARCHIVED_COUNT DESC;
 
 -- =============================================================================
 -- 6) Workbooks with multiple input tables
---    Identifies workbooks that have more than one SIGDS table associated.
---    Multi-table workbooks are higher-risk cleanup targets because removing
---    one table may break sibling tables in the same workbook.
---    TABLES_AT_RISK = count of input tables that are archived, orphaned, or stale.
+--    Groups by SOURCE workbook — resolving tagged versions (IS_TAGGED_VERSION=TRUE)
+--    back to their PARENT_WORKBOOK_ID so QA/Prod versions are not counted as
+--    separate workbooks. A tagged workbook version that is updated repeatedly
+--    creates new SIGDS files each time (for the same input element), so raw
+--    COUNT(*) is misleading. This query separates:
+--      NAMED_INPUT_ELEMENTS — COUNT(DISTINCT WAL_INPUT_TABLE_NAME): unique named
+--        elements, stable across version updates. Best proxy for true input count.
+--      TOTAL_SIGDS_FILES    — COUNT(*): all SIGDS files including version duplicates.
+--        Will exceed NAMED_INPUT_ELEMENTS for workbooks with repeated tag updates.
+--      TAGGED_VERSION_FILES — count of files that belong to a tagged version,
+--        useful for understanding how much of the footprint is from versioning.
+--      SCHEMA_COUNT         — how many writeback schemas this workbook spans
+--        (source schema + any Prod/QA tag schemas).
+--    HAVING filters to workbooks with more than one named input element.
 -- =============================================================================
 
 SELECT
-  SCAN_SCHEMA,
-  WORKBOOK_ID,
-  WORKBOOK_NAME,
+  COALESCE(PARENT_WORKBOOK_ID, WORKBOOK_ID)                                    AS SOURCE_WORKBOOK_ID,
+  COALESCE(
+    MAX(CASE WHEN IS_TAGGED_VERSION = FALSE THEN WORKBOOK_NAME END),
+    MAX(WORKBOOK_NAME)
+  )                                                                              AS WORKBOOK_NAME,
   TRIM(
     COALESCE(MAX(API_OWNER_FIRST_NAME), '') || ' ' || COALESCE(MAX(API_OWNER_LAST_NAME), '')
   )                                                                              AS OWNER_FULL_NAME,
-  COUNT(*)                                                                       AS INPUT_TABLE_COUNT,
-  COUNT(CASE WHEN API_IS_ARCHIVED = TRUE
-               OR IS_ORPHANED     = TRUE
-               OR (WAL_LAST_EDIT_AT < CURRENT_TIMESTAMP() - INTERVAL 180 DAY)
-             THEN 1 END)                                                         AS TABLES_AT_RISK,
+  COUNT(DISTINCT WAL_INPUT_TABLE_NAME)                                           AS NAMED_INPUT_ELEMENTS,
+  COUNT(*)                                                                       AS TOTAL_SIGDS_FILES,
+  COUNT(CASE WHEN IS_TAGGED_VERSION = TRUE THEN 1 END)                          AS TAGGED_VERSION_FILES,
+  COUNT(DISTINCT SCAN_SCHEMA)                                                    AS SCHEMA_COUNT,
   SUM(WAL_MAX_EDIT_NUM)                                                         AS TOTAL_EDITS,
   MAX(WAL_LAST_EDIT_AT)                                                         AS LAST_EDIT_AT,
   ROUND(SUM(COALESCE(SIGDS_TABLE_SIZE_BYTES, 0)) / 1073741824.0, 3)            AS TOTAL_SIZE_GB,
   MAX(CASE WHEN API_IS_ARCHIVED = TRUE THEN 'Yes' ELSE 'No' END)                AS WORKBOOK_ARCHIVED
 FROM SIGDS_WORKBOOK_MAP
 WHERE WORKBOOK_ID IS NOT NULL
-GROUP BY SCAN_SCHEMA, WORKBOOK_ID, WORKBOOK_NAME
-HAVING COUNT(*) > 1
-ORDER BY SCAN_SCHEMA, INPUT_TABLE_COUNT DESC, TABLES_AT_RISK DESC;
+GROUP BY COALESCE(PARENT_WORKBOOK_ID, WORKBOOK_ID)
+HAVING COUNT(DISTINCT WAL_INPUT_TABLE_NAME) > 1
+ORDER BY NAMED_INPUT_ELEMENTS DESC, TOTAL_SIGDS_FILES DESC;
 
 
 -- =============================================================================

@@ -156,7 +156,7 @@ Column names use consistent prefixes to make the data source immediately obvious
 | 3. Active workbooks going stale | Active workbooks where writeback activity has dropped off, grouped into inactivity bands (31–90 / 91–180 / 181–365 / >365 days) |
 | 4. Most active writeback tables | Highest-edit-volume input tables — the inverse archival view; useful for identifying business-critical tables before any cleanup nearby |
 | 5. Owner accountability summary | Cleanup burden rolled up by workbook owner: archived, orphaned, stale counts and reclaimable GB per owner |
-| 6. Workbooks with multiple input tables | Workbooks with more than one SIGDS table — higher-risk cleanup targets; includes a count of tables at risk within each workbook |
+| 6. Workbooks with multiple input tables | Groups by source workbook (resolving tagged versions to their parent) to find workbooks with more than one named input element. Shows named element count, total SIGDS file count (inflated by repeated tag updates), and how many schemas the workbook spans |
 | 7. Legacy WAL inventory | All `sigds_wal_<uuid>` tables, split by migration priority: active legacy WALs (still being written) flagged as urgent; inactive as low-priority |
 
 ---
