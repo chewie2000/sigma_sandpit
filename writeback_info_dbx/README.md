@@ -148,7 +148,7 @@ Column names use consistent prefixes to make the data source immediately obvious
 
 ## Analysis Queries
 
-Both `helper_queries.sql` and `geninfo_queries.sql` contain the same five queries. Replace `<YOUR_CATALOG>` and `<YOUR_SCHEMA>` before running.
+`helper_queries.sql` and `geninfo_queries.sql` contain the same query set. Replace `<YOUR_CATALOG>` and `<YOUR_SCHEMA>` before running. `helper_queries.sql` is intended for administrators performing cleanup actions; `geninfo_queries.sql` is a read-only equivalent for reporting.
 
 | Query | What it finds |
 |---|---|
