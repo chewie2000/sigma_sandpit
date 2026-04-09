@@ -38,17 +38,9 @@ Edit the non-credential configuration constants at the top of each procedure's P
 ### 3. Call the procedures in order
 
 ```sql
-CALL sigma_dataset_dependencies(
-    'https://api.eu.aws.sigmacomputing.com',  -- your Sigma API base URL
-    'MY_DATABASE',
-    'MY_SCHEMA'
-);
+CALL sigma_dataset_dependencies('MY_DATABASE', 'MY_SCHEMA');
 
-CALL sigma_workbook_source_map(
-    'https://api.eu.aws.sigmacomputing.com',  -- your Sigma API base URL
-    'MY_DATABASE',
-    'MY_SCHEMA'
-);
+CALL sigma_workbook_source_map('MY_DATABASE', 'MY_SCHEMA');
 ```
 
 ---
@@ -78,23 +70,18 @@ Crawls all datasets org-wide via the Sigma API and writes one row per dataset-to
 
 | Parameter | Required | Default | Description |
 |---|---|---|---|
-| `SIGMA_BASE_URL` | Yes | — | Sigma API base URL for your cloud/region (see Prerequisites) |
 | `TARGET_DATABASE` | Yes | — | Snowflake database where the output table will be written |
 | `TARGET_SCHEMA` | Yes | — | Snowflake schema where the output table will be written |
 | `TARGET_TABLE` | No | `SIGMA_DATASET_DEPENDENCIES` | Output table name |
 | `TRUNCATE_BEFORE_INSERT` | No | `TRUE` | `TRUE` = snapshot mode (replace on each run); `FALSE` = append |
 
+`SIGMA_BASE_URL`, `SIGMA_CLIENT_ID`, and `SIGMA_CLIENT_SECRET` are all read at runtime from Snowflake Secrets — they are never passed as parameters or hardcoded. All three are set once in `setup_prerequisites.sql`.
+
 **Example call:**
 
 ```sql
-CALL sigma_dataset_dependencies(
-    'https://api.eu.aws.sigmacomputing.com',
-    'MY_DATABASE',
-    'MY_SCHEMA'
-);
+CALL sigma_dataset_dependencies('MY_DATABASE', 'MY_SCHEMA');
 ```
-
-Credentials are read at runtime from Snowflake Secrets — they are never passed as parameters or hardcoded.
 
 > **Note:** Uses the deprecated `GET /v2/datasets` endpoint intentionally — it is the only endpoint that exposes `migrationStatus`.
 
@@ -110,7 +97,6 @@ Scans all workbooks org-wide, resolves each source against `SIGMA_DATASET_DEPEND
 
 | Parameter | Required | Default | Description |
 |---|---|---|---|
-| `SIGMA_BASE_URL` | Yes | — | Sigma API base URL for your cloud/region (see Prerequisites) |
 | `TARGET_DATABASE` | Yes | — | Snowflake database where output tables will be written |
 | `TARGET_SCHEMA` | Yes | — | Snowflake schema where output tables will be written |
 | `DEPENDENCIES_TABLE` | No | `SIGMA_DATASET_DEPENDENCIES` | Source table populated by `sigma_dataset_dependencies()` |
@@ -118,17 +104,13 @@ Scans all workbooks org-wide, resolves each source against `SIGMA_DATASET_DEPEND
 | `DETAILS_TABLE` | No | `SIGMA_WORKBOOK_SOURCE_DETAILS` | Output details table name |
 | `TRUNCATE_BEFORE_INSERT` | No | `TRUE` | `TRUE` = snapshot mode (replace on each run); `FALSE` = append |
 
+`SIGMA_BASE_URL`, `SIGMA_CLIENT_ID`, and `SIGMA_CLIENT_SECRET` are all read at runtime from Snowflake Secrets — they are never passed as parameters or hardcoded. All three are set once in `setup_prerequisites.sql`.
+
 **Example call:**
 
 ```sql
-CALL sigma_workbook_source_map(
-    'https://api.eu.aws.sigmacomputing.com',
-    'MY_DATABASE',
-    'MY_SCHEMA'
-);
+CALL sigma_workbook_source_map('MY_DATABASE', 'MY_SCHEMA');
 ```
-
-Credentials are read at runtime from Snowflake Secrets — they are never passed as parameters or hardcoded.
 
 **Output tables:**
 
@@ -189,12 +171,16 @@ These are OAuth 2.0 client credentials generated from within Sigma. You will nee
 6. Click **Create**.
 7. Copy both the **Client ID** and **Client Secret** immediately and store them somewhere secure — the secret is displayed only once and cannot be retrieved again. If lost, you must delete the credential and create a new one.
 
-Once copied, paste the values into the `CREATE SECRET` statements in `setup_prerequisites.sql`:
+Once copied, fill in all three secrets in `setup_prerequisites.sql`:
 
 ```sql
+CREATE SECRET IF NOT EXISTS sigma_base_url
+  TYPE          = GENERIC_STRING
+  SECRET_STRING = 'https://api.eu.aws.sigmacomputing.com';  -- your cloud/region URL
+
 CREATE SECRET IF NOT EXISTS sigma_client_id
   TYPE          = GENERIC_STRING
-  SECRET_STRING = '<YOUR_SIGMA_CLIENT_ID>';   -- paste Client ID here
+  SECRET_STRING = '<YOUR_SIGMA_CLIENT_ID>';      -- paste Client ID here
 
 CREATE SECRET IF NOT EXISTS sigma_client_secret
   TYPE          = GENERIC_STRING
@@ -216,7 +202,7 @@ The `SIGMA_BASE_URL` in each procedure depends on the cloud and region your Sigm
 | Azure US | `https://api.us.azure.sigmacomputing.com` |
 | GCP US | `https://api.us.gcp.sigmacomputing.com` |
 
-See [Sigma API getting started](https://help.sigmacomputing.com/reference/get-started-sigma-api) for the full list. The same host (without `/v2`) is used as both `SIGMA_BASE_URL` in the procedure and in `setup_prerequisites.sql`.
+See [Sigma API getting started](https://help.sigmacomputing.com/reference/get-started-sigma-api) for the full list. The base URL is stored as the `sigma_base_url` secret in `setup_prerequisites.sql` — the same host used in the network rule, so it only needs to be set in one place.
 
 ### Credential storage — Snowflake Secrets (recommended)
 

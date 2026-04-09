@@ -11,22 +11,20 @@
 -- All other configuration is passed as procedure parameters at call time.
 --
 -- Parameters:
---   SIGMA_BASE_URL         — Sigma API base URL for your cloud/region (required)
 --   TARGET_DATABASE        — Snowflake database where the output table will be written (required)
 --   TARGET_SCHEMA          — Snowflake schema where the output table will be written (required)
 --   TARGET_TABLE           — Output table name (optional, default: SIGMA_DATASET_DEPENDENCIES)
 --   TRUNCATE_BEFORE_INSERT — TRUE = snapshot mode, replace on each run (optional, default: TRUE)
 --
+--   SIGMA_BASE_URL, SIGMA_CLIENT_ID, and SIGMA_CLIENT_SECRET are all read at
+--   runtime from Snowflake Secrets created in setup_prerequisites.sql.
+--   They are never passed as parameters or hardcoded.
+--
 -- Example call:
---   CALL sigma_dataset_dependencies(
---       'https://api.eu.aws.sigmacomputing.com',
---       'MY_DATABASE',
---       'MY_SCHEMA'
---   );
+--   CALL sigma_dataset_dependencies('MY_DATABASE', 'MY_SCHEMA');
 -- ==============================================================================
 
 CREATE OR REPLACE PROCEDURE sigma_dataset_dependencies(
-    SIGMA_BASE_URL         STRING,
     TARGET_DATABASE        STRING,
     TARGET_SCHEMA          STRING,
     TARGET_TABLE           STRING DEFAULT 'SIGMA_DATASET_DEPENDENCIES',
@@ -37,7 +35,7 @@ LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
 PACKAGES = ('snowflake-snowpark-python', 'requests')
 EXTERNAL_ACCESS_INTEGRATIONS = (sigma_api_access)
-SECRETS = ('sigma_client_id' = sigma_client_id, 'sigma_client_secret' = sigma_client_secret)
+SECRETS = ('sigma_base_url' = sigma_base_url, 'sigma_client_id' = sigma_client_id, 'sigma_client_secret' = sigma_client_secret)
 HANDLER = 'main'
 AS
 $$
@@ -49,14 +47,14 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 def main(session,
-         SIGMA_BASE_URL: str,
          TARGET_DATABASE: str,
          TARGET_SCHEMA: str,
          TARGET_TABLE: str = 'SIGMA_DATASET_DEPENDENCIES',
          TRUNCATE_BEFORE_INSERT: bool = True):
 
-    # Credentials are read from Snowflake Secrets at runtime — never hardcoded.
+    # All Sigma API configuration is read from Snowflake Secrets at runtime.
     # Secrets are created in setup_prerequisites.sql.
+    SIGMA_BASE_URL      = _snowflake.get_generic_secret_string('sigma_base_url')
     SIGMA_CLIENT_ID     = _snowflake.get_generic_secret_string('sigma_client_id')
     SIGMA_CLIENT_SECRET = _snowflake.get_generic_secret_string('sigma_client_secret')
 
