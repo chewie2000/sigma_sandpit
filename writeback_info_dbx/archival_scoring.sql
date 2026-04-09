@@ -1,9 +1,12 @@
 -- =============================================================================
 -- archival_scoring.sql
 --
--- Replace <YOUR_CATALOG> and <YOUR_SCHEMA> with the Unity Catalog catalog
--- and schema where SIGDS_WORKBOOK_MAP resides before running.
+-- Before running, replace <YOUR_CATALOG> and <YOUR_SCHEMA> below with the
+-- Unity Catalog catalog and schema where SIGDS_WORKBOOK_MAP resides.
 -- =============================================================================
+
+USE CATALOG <YOUR_CATALOG>;
+USE SCHEMA  <YOUR_SCHEMA>;
 --
 -- SCORING MODEL OVERVIEW (total = 100 pts, higher = stronger archival candidate)
 -- -----------------------------------------------------------------------------
