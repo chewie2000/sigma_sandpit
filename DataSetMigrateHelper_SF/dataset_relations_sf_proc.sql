@@ -46,26 +46,16 @@ import _snowflake
 import requests
 import uuid
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime, timezone
 
-def main(session,
-         TARGET_DATABASE: str,
-         TARGET_SCHEMA: str,
-         TARGET_TABLE: str = 'SIGMA_DATASET_DEPENDENCIES',
-         TRUNCATE_BEFORE_INSERT: bool = True):
-
-    # All Sigma API configuration is read from Snowflake Secrets at runtime.
-    # Secrets are created in setup_prerequisites.sql.
-    SIGMA_BASE_URL      = _snowflake.get_generic_secret_string('sigma_base_url')
-    SIGMA_CLIENT_ID     = _snowflake.get_generic_secret_string('sigma_client_id')
-    SIGMA_CLIENT_SECRET = _snowflake.get_generic_secret_string('sigma_client_secret')
-
-    # Pause between per-dataset API calls. Increase if Sigma rate-limits you.
-    API_CALL_DELAY_SECONDS = 0.1
-
-    FQ_TABLE_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{TARGET_TABLE}"'
-    FQ_TABLE_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{TARGET_TABLE}"
+# ------------------------------------------------------------------------------
+# MODULE-LEVEL SECRETS
+# Read once at module load so all helpers below can reference them as globals.
+# ------------------------------------------------------------------------------
+SIGMA_BASE_URL      = _snowflake.get_generic_secret_string('sigma_base_url')
+SIGMA_CLIENT_ID     = _snowflake.get_generic_secret_string('sigma_client_id')
+SIGMA_CLIENT_SECRET = _snowflake.get_generic_secret_string('sigma_client_secret')
 
 # ------------------------------------------------------------------------------
 # TOKEN MANAGEMENT
@@ -176,6 +166,23 @@ def get_data_model(token_mgr, data_model_id):
     headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
     return _get_with_backoff(url, headers=headers).json()
 
+# ------------------------------------------------------------------------------
+# MAIN HANDLER
+# Snowflake calls this function. All processing logic lives here.
+# ------------------------------------------------------------------------------
+
+def main(session,
+         TARGET_DATABASE: str,
+         TARGET_SCHEMA: str,
+         TARGET_TABLE: str = 'SIGMA_DATASET_DEPENDENCIES',
+         TRUNCATE_BEFORE_INSERT: bool = True):
+
+    # Pause between per-dataset API calls. Increase if Sigma rate-limits you.
+    API_CALL_DELAY_SECONDS = 0.1
+
+    FQ_TABLE_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{TARGET_TABLE}"'
+    FQ_TABLE_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{TARGET_TABLE}"
+
     # 1) Authenticate — validate credentials early so we fail fast on bad config
     token_mgr = SigmaTokenManager()
     token_mgr.get_token()
@@ -212,13 +219,9 @@ def get_data_model(token_mgr, data_model_id):
     # Graph: child dataset -> set of parent dataset IDs (direct upstream only)
     upstream = defaultdict(set)
 
-    # Capture a sample source item for diagnostics
-    sample_source = None
-
     # 3) Fetch sources for each dataset and record dataset->dataset edges
     for i, ds in enumerate(all_datasets, start=1):
-        ds_id   = ds["datasetId"]
-        ds_name = ds.get("name", ds_id)
+        ds_id = ds["datasetId"]
 
         try:
             sources = list_dataset_sources(token_mgr, ds_id)
@@ -227,8 +230,6 @@ def get_data_model(token_mgr, data_model_id):
 
         source_list = sources if isinstance(sources, list) else sources.get("sources", [])
         for src in source_list:
-            if sample_source is None:
-                sample_source = str(src)  # capture first source seen for diagnostics
             if src.get("type") == "dataset":
                 parent_id = src.get("inodeId") or src.get("datasetId") or src.get("id")
                 if parent_id and parent_id in datasets_by_id:
@@ -291,7 +292,6 @@ def get_data_model(token_mgr, data_model_id):
     upstream_parent_count = {ds_id: len(pids) for ds_id, pids in upstream.items()}
 
     # DOWNSTREAM_CHILD_COUNT: how many datasets directly source from each dataset
-    from collections import Counter
     downstream_child_count = Counter(
         pid for parent_ids in upstream.values() for pid in parent_ids
     )
@@ -419,4 +419,3 @@ def get_data_model(token_mgr, data_model_id):
         f"run_id={run_id}"
     )
 $$;
-

@@ -56,28 +56,13 @@ import uuid
 import time
 from datetime import datetime, timezone
 
-def main(session,
-         TARGET_DATABASE: str,
-         TARGET_SCHEMA: str,
-         DEPENDENCIES_TABLE: str = 'SIGMA_DATASET_DEPENDENCIES',
-         SUMMARY_TABLE: str = 'SIGMA_WORKBOOK_MIGRATION_SUMMARY',
-         DETAILS_TABLE: str = 'SIGMA_WORKBOOK_SOURCE_DETAILS',
-         TRUNCATE_BEFORE_INSERT: bool = True):
-
-    # All Sigma API configuration is read from Snowflake Secrets at runtime.
-    # Secrets are created in setup_prerequisites.sql.
-    SIGMA_BASE_URL      = _snowflake.get_generic_secret_string('sigma_base_url')
-    SIGMA_CLIENT_ID     = _snowflake.get_generic_secret_string('sigma_client_id')
-    SIGMA_CLIENT_SECRET = _snowflake.get_generic_secret_string('sigma_client_secret')
-
-    # Pause between per-workbook API calls. Increase if Sigma rate-limits you.
-    API_CALL_DELAY_SECONDS = 0.1
-
-    FQ_SUMMARY_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{SUMMARY_TABLE}"'
-    FQ_DETAILS_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{DETAILS_TABLE}"'
-    FQ_DEPS_SQL         = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{DEPENDENCIES_TABLE}"'
-    FQ_SUMMARY_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{SUMMARY_TABLE}"
-    FQ_DETAILS_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{DETAILS_TABLE}"
+# ------------------------------------------------------------------------------
+# MODULE-LEVEL SECRETS
+# Read once at module load so all helpers below can reference them as globals.
+# ------------------------------------------------------------------------------
+SIGMA_BASE_URL      = _snowflake.get_generic_secret_string('sigma_base_url')
+SIGMA_CLIENT_ID     = _snowflake.get_generic_secret_string('sigma_client_id')
+SIGMA_CLIENT_SECRET = _snowflake.get_generic_secret_string('sigma_client_secret')
 
 # ------------------------------------------------------------------------------
 # TOKEN MANAGEMENT
@@ -165,10 +150,10 @@ def parse_ts(iso_str):
     return datetime.fromisoformat(iso_str.replace("Z", "+00:00")).replace(tzinfo=None)
 
 
-def load_dependency_lookups(session):
+def load_dependency_lookups(session, fq_deps_sql):
     """
     Read the latest run from SIGMA_DATASET_DEPENDENCIES and build two dicts:
-      datasets_by_id  — keyed by DATASET_ID → row dict
+      datasets_by_id    — keyed by DATASET_ID → row dict
       data_models_by_id — keyed by DATA_MODEL_ID → row dict
     These are used to match workbook sources back to the migration exercise.
     """
@@ -188,8 +173,8 @@ def load_dependency_lookups(session):
             DATA_MODEL_PATH,
             UPSTREAM_PARENT_COUNT,
             DOWNSTREAM_CHILD_COUNT
-        FROM {FQ_DEPS_SQL}
-        WHERE RUN_ID = (SELECT MAX(RUN_ID) FROM {FQ_DEPS_SQL})
+        FROM {fq_deps_sql}
+        WHERE RUN_ID = (SELECT MAX(RUN_ID) FROM {fq_deps_sql})
     """).collect()
 
     datasets_by_id = {}
@@ -219,12 +204,34 @@ def load_dependency_lookups(session):
 
     return datasets_by_id, data_models_by_id
 
+# ------------------------------------------------------------------------------
+# MAIN HANDLER
+# Snowflake calls this function. All processing logic lives here.
+# ------------------------------------------------------------------------------
+
+def main(session,
+         TARGET_DATABASE: str,
+         TARGET_SCHEMA: str,
+         DEPENDENCIES_TABLE: str = 'SIGMA_DATASET_DEPENDENCIES',
+         SUMMARY_TABLE: str = 'SIGMA_WORKBOOK_MIGRATION_SUMMARY',
+         DETAILS_TABLE: str = 'SIGMA_WORKBOOK_SOURCE_DETAILS',
+         TRUNCATE_BEFORE_INSERT: bool = True):
+
+    # Pause between per-workbook API calls. Increase if Sigma rate-limits you.
+    API_CALL_DELAY_SECONDS = 0.1
+
+    FQ_SUMMARY_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{SUMMARY_TABLE}"'
+    FQ_DETAILS_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{DETAILS_TABLE}"'
+    FQ_DEPS_SQL         = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{DEPENDENCIES_TABLE}"'
+    FQ_SUMMARY_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{SUMMARY_TABLE}"
+    FQ_DETAILS_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{DETAILS_TABLE}"
+
     # 1) Authenticate
     token_mgr = SigmaTokenManager()
     token_mgr.get_token()
 
     # 2) Load migration-scope lookups from SIGMA_DATASET_DEPENDENCIES
-    datasets_by_id, data_models_by_id = load_dependency_lookups(session)
+    datasets_by_id, data_models_by_id = load_dependency_lookups(session, FQ_DEPS_SQL)
     known_dataset_ids    = set(datasets_by_id.keys())
     known_data_model_ids = set(data_models_by_id.keys())
 
@@ -308,7 +315,6 @@ def load_dependency_lookups(session):
 
     summary_rows = []
     detail_rows  = []
-
     failed = 0
 
     for wb in all_workbooks:
@@ -331,11 +337,11 @@ def load_dependency_lookups(session):
         wb_detail_rows   = []
 
         for src in sources:
-            src_type     = src.get("type", "")
-            inode_id     = src.get("inodeId")
-            dm_id        = src.get("dataModelId")
-            in_scope     = False
-            dep_row      = None
+            src_type = src.get("type", "")
+            inode_id = src.get("inodeId")
+            dm_id    = src.get("dataModelId")
+            in_scope = False
+            dep_row  = None
 
             if src_type == "dataset" and inode_id in known_dataset_ids:
                 in_scope = True
@@ -456,4 +462,3 @@ def load_dependency_lookups(session):
         f"run_id={run_id}"
     )
 $$;
-
