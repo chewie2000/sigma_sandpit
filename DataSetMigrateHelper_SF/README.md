@@ -145,15 +145,25 @@ Two queries:
 
 ### Sigma API credentials
 
-These are OAuth 2.0 client credentials generated from within Sigma. **Admin** scope is required for `skipPermissionCheck` access (org-wide dataset and workbook visibility).
+These are OAuth 2.0 client credentials generated from within Sigma. You will need **Admin** access to your Sigma organisation to generate them.
 
-To generate credentials:
-1. In Sigma, go to **Administration → Developer Access**.
-2. Click **Create New** under Client Credentials.
-3. Give the credential a name, select **Admin** scope, and click **Create**.
-4. Copy the **Client ID** and **Client Secret** immediately — the secret is only shown once.
+**Admin scope is required** for this toolkit. Both stored procedures use `skipPermissionCheck=true` on the datasets and workbooks list endpoints — without Admin credentials, these calls return only content owned by the API user rather than the full org, producing incomplete results.
 
-Full instructions: [Sigma API credentials documentation](https://help.sigmacomputing.com/reference/generate-client-credentials)
+#### Generating credentials
+
+1. In Sigma, open the left navigation and go to **Administration**.
+2. Select **Developer Access** from the Administration menu.
+3. Under **Client Credentials**, click **Create New**.
+4. Enter a descriptive name (e.g. `dataset-migrate-helper`) so it is identifiable later.
+5. Set the **Permission** to **Admin**.
+6. Click **Create**.
+7. Copy both the **Client ID** and **Client Secret** immediately and store them somewhere secure — the secret is displayed only once and cannot be retrieved again. If lost, you must delete the credential and create a new one.
+
+Once copied, paste the values into `setup_prerequisites.sql` in the `CREATE SECRET` statements before running that script.
+
+> **Note:** Client credentials authenticate as a service identity, not as an individual user. Actions taken via the API using these credentials will be attributed to the credential owner in Sigma audit logs. Using a dedicated named credential (rather than a personal one) makes it easier to identify and rotate if needed.
+
+Full instructions: [Generate client credentials](https://help.sigmacomputing.com/reference/generate-client-credentials)
 
 ### Sigma API base URL
 
