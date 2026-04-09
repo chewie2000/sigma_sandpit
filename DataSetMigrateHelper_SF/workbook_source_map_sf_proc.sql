@@ -1,29 +1,23 @@
 -- ==============================================================================
--- STEP 1: Prerequisites (run as ACCOUNTADMIN — only needed once)
--- Re-use the existing network rule and integration from dataset_relations_sf_proc.sql.
--- If not already created, run the block below.
+-- Prerequisites
+-- Run setup_prerequisites.sql as ACCOUNTADMIN before deploying this procedure.
+-- That script creates the network rule, Snowflake Secrets, external access
+-- integration, and all required grants.
 -- ==============================================================================
 
--- CREATE OR REPLACE NETWORK RULE sigma_api_network_rule
---   MODE       = EGRESS
---   TYPE       = HOST_PORT
---   VALUE_LIST = ('api.staging.us.aws.sigmacomputing.io:443');
-
--- CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION sigma_api_access
---   ALLOWED_NETWORK_RULES = (sigma_api_network_rule)
---   ENABLED = TRUE;
-
--- GRANT USAGE ON INTEGRATION sigma_api_access TO ROLE <YOUR_ROLE>;
-
 -- ==============================================================================
--- STEP 2: Create the stored procedure
--- Edit the configuration constants inside the Python block before running.
+-- Create the stored procedure
+-- Edit the non-credential configuration constants inside the Python block
+-- before running (SIGMA_BASE_URL, TARGET_DATABASE, TARGET_SCHEMA).
+-- Credentials are read at runtime from Snowflake Secrets — do not hardcode them.
+--
 -- Creates two tables:
 --   SIGMA_WORKBOOK_MIGRATION_SUMMARY  — one row per workbook with source counts
 --                                       and overall migration status
 --                                       (only workbooks with migration-scope sources)
 --   SIGMA_WORKBOOK_SOURCE_DETAILS     — one row per workbook → source, enriched
 --                                       with migration data from SIGMA_DATASET_DEPENDENCIES
+--
 -- Requires: SIGMA_DATASET_DEPENDENCIES must already be populated by
 --           sigma_dataset_dependencies() before calling this procedure.
 -- ==============================================================================
@@ -34,9 +28,11 @@ LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
 PACKAGES = ('snowflake-snowpark-python', 'requests')
 EXTERNAL_ACCESS_INTEGRATIONS = (sigma_api_access)
+SECRETS = ('sigma_client_id' = sigma_client_id, 'sigma_client_secret' = sigma_client_secret)
 HANDLER = 'main'
 AS
 $$
+import _snowflake
 import requests
 import uuid
 import time
@@ -47,8 +43,11 @@ from datetime import datetime, timezone
 # ------------------------------------------------------------------------------
 
 SIGMA_BASE_URL      = "https://api.staging.us.aws.sigmacomputing.io"
-SIGMA_CLIENT_ID     = "YOUR_SIGMA_CLIENT_ID"
-SIGMA_CLIENT_SECRET = "YOUR_SIGMA_CLIENT_SECRET"
+
+# Credentials are read from Snowflake Secrets at runtime — never hardcoded.
+# Secrets are created in setup_prerequisites.sql.
+SIGMA_CLIENT_ID     = _snowflake.get_generic_secret_string('sigma_client_id')
+SIGMA_CLIENT_SECRET = _snowflake.get_generic_secret_string('sigma_client_secret')
 
 TARGET_DATABASE = "YOUR_DATABASE"
 TARGET_SCHEMA   = "YOUR_SCHEMA"

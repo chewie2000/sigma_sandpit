@@ -10,9 +10,9 @@ Sigma is deprecating Datasets in favour of Data Models. This toolkit uses the Si
 
 | File | Purpose |
 |---|---|
+| `setup_prerequisites.sql` | One-time ACCOUNTADMIN setup — network rule, Snowflake Secrets, external access integration, and grants |
 | `dataset_relations_sf_proc.sql` | Snowflake stored procedure — builds the full dataset dependency graph into `SIGMA_DATASET_DEPENDENCIES` |
 | `workbook_source_map_sf_proc.sql` | Snowflake stored procedure — maps workbook sources against the dependency graph into summary and detail tables |
-| `dataset_relations_sf.py` | Standalone Snowflake Notebook / Snowpark script — earlier, simpler version of the dataset dependency logic |
 | `dataset_chains_pivoted.sql` | Analysis query — flattens ROOT → INTERNAL → LEAF chains into one row per path |
 | `crossover_analysis.sql` | Analysis queries — identifies fork points (one dataset feeds many) and merge points (one dataset pulls from many) |
 
@@ -82,9 +82,9 @@ Each row is a single source resolved against the dependency graph, including `DA
 ## Execution Order
 
 ```
-1. Run prerequisites (ACCOUNTADMIN — once only)
-   └── Create network rule + external access integration
-       (see top of dataset_relations_sf_proc.sql)
+1. Run setup_prerequisites.sql (ACCOUNTADMIN — once only)
+   └── Creates: network rule, Snowflake Secrets, external access integration
+   └── Grants:  USAGE on integration, READ on secrets to your procedure role
 
 2. CALL sigma_dataset_dependencies();
    └── Populates: SIGMA_DATASET_DEPENDENCIES
@@ -113,14 +113,38 @@ Two queries:
 
 ---
 
-## Snowflake Notebook Script
-
-`dataset_relations_sf.py` is an earlier, standalone version of the dataset dependency logic designed for use inside a Snowflake Notebook or run externally with a local Snowpark session. It produces a simpler table schema (no data model columns, no crossover metrics) and is retained as a lightweight alternative.
-
----
-
 ## Prerequisites
 
-- Snowflake role with `CREATE PROCEDURE`, `CREATE TABLE`, and `USAGE ON INTEGRATION` privileges
-- Sigma API client credentials with admin scope (`skipPermissionCheck` access)
-- Snowflake external network access to `api.staging.us.aws.sigmacomputing.io:443` (or production equivalent)
+### Snowflake
+
+- Role with `CREATE PROCEDURE`, `CREATE TABLE`, `USAGE ON INTEGRATION`, and `READ ON SECRET` privileges
+- `ACCOUNTADMIN` access to run `setup_prerequisites.sql` (one-time)
+
+### Sigma API credentials
+
+These are OAuth 2.0 client credentials generated from within Sigma. **Admin** scope is required for `skipPermissionCheck` access (org-wide dataset and workbook visibility).
+
+To generate credentials:
+1. In Sigma, go to **Administration → Developer Access**.
+2. Click **Create New** under Client Credentials.
+3. Give the credential a name, select **Admin** scope, and click **Create**.
+4. Copy the **Client ID** and **Client Secret** immediately — the secret is only shown once.
+
+Full instructions: [Sigma API credentials documentation](https://help.sigmacomputing.com/reference/generate-client-credentials)
+
+### Sigma API base URL
+
+The `SIGMA_BASE_URL` in each procedure depends on the cloud and region your Sigma organisation is hosted on:
+
+| Cloud / Region | Base URL |
+|---|---|
+| AWS US | `https://aws-api.sigmacomputing.com` |
+| AWS EU | `https://api.eu.aws.sigmacomputing.com` |
+| Azure US | `https://api.us.azure.sigmacomputing.com` |
+| GCP US | `https://api.us.gcp.sigmacomputing.com` |
+
+See [Sigma API getting started](https://help.sigmacomputing.com/reference/get-started-sigma-api) for the full list. The same host (without `/v2`) is used as both `SIGMA_BASE_URL` in the procedure and in `setup_prerequisites.sql`.
+
+### Credential storage — Snowflake Secrets (recommended)
+
+Credentials are stored as Snowflake Secrets and read at runtime via `_snowflake.get_generic_secret_string()`. They are never embedded in procedure source code, visible in query history, or exposed in version control. `setup_prerequisites.sql` creates the secrets and grants the necessary permissions.
