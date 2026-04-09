@@ -159,7 +159,17 @@ These are OAuth 2.0 client credentials generated from within Sigma. You will nee
 6. Click **Create**.
 7. Copy both the **Client ID** and **Client Secret** immediately and store them somewhere secure — the secret is displayed only once and cannot be retrieved again. If lost, you must delete the credential and create a new one.
 
-Once copied, paste the values into `setup_prerequisites.sql` in the `CREATE SECRET` statements before running that script.
+Once copied, paste the values into the `CREATE SECRET` statements in `setup_prerequisites.sql`:
+
+```sql
+CREATE SECRET IF NOT EXISTS sigma_client_id
+  TYPE          = GENERIC_STRING
+  SECRET_STRING = '<YOUR_SIGMA_CLIENT_ID>';   -- paste Client ID here
+
+CREATE SECRET IF NOT EXISTS sigma_client_secret
+  TYPE          = GENERIC_STRING
+  SECRET_STRING = '<YOUR_SIGMA_CLIENT_SECRET>';  -- paste Client Secret here
+```
 
 > **Note:** Client credentials authenticate as a service identity, not as an individual user. Actions taken via the API using these credentials will be attributed to the credential owner in Sigma audit logs. Using a dedicated named credential (rather than a personal one) makes it easier to identify and rotate if needed.
 
