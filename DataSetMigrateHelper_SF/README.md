@@ -33,7 +33,7 @@ Replace all `<LIKE_THIS>` placeholders in the script before running — the API 
 
 ### 2. Deploy the stored procedures
 
-Edit the non-credential configuration constants at the top of each procedure's Python block (`SIGMA_BASE_URL`, `TARGET_DATABASE`, `TARGET_SCHEMA`) then run the `CREATE OR REPLACE PROCEDURE` statement in a Snowflake worksheet using the role granted in step 1.
+Run the `CREATE OR REPLACE PROCEDURE` statement from each procedure file in a Snowflake worksheet using the role granted in step 1. No edits are required — all credentials are read from Snowflake Secrets at runtime and all configuration is passed as parameters at call time.
 
 ### 3. Call the procedures in order
 
@@ -112,6 +112,8 @@ Scans all workbooks org-wide, resolves each source against `SIGMA_DATASET_DEPEND
 CALL sigma_workbook_source_map('MY_DATABASE', 'MY_SCHEMA');
 ```
 
+**Performance:** Workbook sources are fetched concurrently using a thread pool. The default is 10 parallel workers (`MAX_WORKERS = 10` at the top of the `main()` function in the procedure). Increase this if the Sigma API can handle more concurrency; reduce it if you see 429 rate-limit errors. Rate-limit backoff is handled automatically.
+
 **Output tables:**
 
 #### `SIGMA_WORKBOOK_MIGRATION_SUMMARY` — one row per workbook (migration-scope only)
@@ -120,10 +122,14 @@ CALL sigma_workbook_source_map('MY_DATABASE', 'MY_SCHEMA');
 |---|---|
 | `WORKBOOK_ID / NAME / URL / PATH` | Workbook identity |
 | `OWNER_NAME / OWNER_EMAIL` | Workbook owner |
+| `WORKBOOK_CREATED_AT / WORKBOOK_UPDATED_AT` | Workbook timestamps |
 | `TOTAL_SOURCES` | Count of migration-scope sources (datasets + data models) |
 | `DATASET_SOURCE_COUNT` | Sources still pointing at legacy datasets |
 | `DATA_MODEL_SOURCE_COUNT` | Sources already pointing at data models |
+| `TABLE_SOURCE_COUNT` | Sources pointing directly at warehouse tables (not migration-scope, counted for completeness) |
 | `MIGRATION_STATUS` | `FULLY MIGRATED`, `PARTIALLY MIGRATED`, or `NOT MIGRATED` |
+
+> **Note:** If you have an existing `SIGMA_WORKBOOK_MIGRATION_SUMMARY` table from a previous deployment, drop it before calling the procedure so it is recreated with the current schema: `DROP TABLE IF EXISTS <DATABASE>.<SCHEMA>.SIGMA_WORKBOOK_MIGRATION_SUMMARY;`
 
 #### `SIGMA_WORKBOOK_SOURCE_DETAILS` — one row per workbook → source
 
