@@ -44,6 +44,39 @@ SIGMA_CLIENT_SECRET = "<YOUR_SIGMA_CLIENT_SECRET>"
 
 For a single-schema setup, set `SCAN_SCHEMA` and `MAP_SCHEMA` to the same value.
 
+#### SIGMA_API_BASE
+
+The base URL depends on the cloud and region your Sigma organisation is hosted on. The `/v2` suffix is required — all API calls are versioned under this path.
+
+| Cloud / Region | Base URL |
+|---|---|
+| AWS US | `https://aws-api.sigmacomputing.com/v2` |
+| AWS EU | `https://api.eu.aws.sigmacomputing.com/v2` |
+| Azure US | `https://api.us.azure.sigmacomputing.com/v2` |
+| GCP US | `https://api.us.gcp.sigmacomputing.com/v2` |
+
+Your organisation's base URL can be found in the [Sigma API documentation](https://help.sigmacomputing.com/reference/get-started-sigma-api) — look for the **Base URL** section which lists all available endpoints by cloud provider and region.
+
+Example configuration:
+```python
+SIGMA_API_BASE = "https://api.eu.aws.sigmacomputing.com/v2"
+```
+
+#### SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET
+
+These are OAuth 2.0 client credentials generated from within Sigma. You will need **Admin** access to your Sigma organisation to generate them.
+
+To generate credentials:
+
+1. In Sigma, go to **Administration → Developer Access**.
+2. Click **Create New** under Client Credentials.
+3. Give the credential a name (e.g. `sigds-workbook-map`), select **Admin** scope for full org visibility, and click **Create**.
+4. Copy the **Client ID** and **Client Secret** immediately — the secret is only shown once.
+
+Full instructions are available in the [Sigma API credentials documentation](https://help.sigmacomputing.com/reference/generate-client-credentials).
+
+> **Note:** Admin scope is recommended so the script can resolve workbook ownership and see all workbooks regardless of folder permissions. A non-admin credential will still work but may return incomplete results for workbooks the credential owner cannot access.
+
 Run the script from a Databricks notebook or job attached to a cluster with access to the Unity Catalog schema containing your `sigds_wal_*` and `sigds_*` tables.
 
 ### Upgrading an existing table (SOURCE_SCHEMA → SCAN_SCHEMA)
