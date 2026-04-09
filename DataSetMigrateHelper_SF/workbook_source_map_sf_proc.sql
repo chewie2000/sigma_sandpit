@@ -52,8 +52,10 @@ AS
 $$
 import _snowflake
 import requests
+import threading
 import uuid
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 # ------------------------------------------------------------------------------
@@ -66,17 +68,20 @@ SIGMA_CLIENT_SECRET = _snowflake.get_generic_secret_string('sigma_client_secret'
 
 # ------------------------------------------------------------------------------
 # TOKEN MANAGEMENT
+# Lock-protected so concurrent threads can safely share one token manager.
 # ------------------------------------------------------------------------------
 
 class SigmaTokenManager:
     def __init__(self):
         self._token = None
         self._expires_at = 0.0
+        self._lock = threading.Lock()
 
     def get_token(self):
-        if time.time() >= self._expires_at - 60:
-            self._fetch()
-        return self._token
+        with self._lock:
+            if time.time() >= self._expires_at - 60:
+                self._fetch()
+            return self._token
 
     def _fetch(self):
         resp = requests.post(
@@ -122,7 +127,7 @@ def list_workbooks(token_mgr):
     Paginated via nextPage / hasMore.
     """
     url = f"{SIGMA_BASE_URL}/v2/workbooks"
-    params = {"skipPermissionCheck": "true", "limit": 50}
+    params = {"skipPermissionCheck": "true", "limit": 500}
     workbooks = []
     while True:
         headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
@@ -155,8 +160,12 @@ def load_dependency_lookups(session, fq_deps_sql):
     Read the latest run from SIGMA_DATASET_DEPENDENCIES and build two dicts:
       datasets_by_id    — keyed by DATASET_ID → row dict
       data_models_by_id — keyed by DATA_MODEL_ID → row dict
-    These are used to match workbook sources back to the migration exercise.
+    MAX(RUN_ID) is pre-fetched as a literal to avoid a correlated subquery.
     """
+    max_run_id = session.sql(
+        f"SELECT MAX(RUN_ID) FROM {fq_deps_sql}"
+    ).collect()[0][0]
+
     rows = session.sql(f"""
         SELECT
             DATASET_ID,
@@ -174,7 +183,7 @@ def load_dependency_lookups(session, fq_deps_sql):
             UPSTREAM_PARENT_COUNT,
             DOWNSTREAM_CHILD_COUNT
         FROM {fq_deps_sql}
-        WHERE RUN_ID = (SELECT MAX(RUN_ID) FROM {fq_deps_sql})
+        WHERE RUN_ID = '{max_run_id}'
     """).collect()
 
     datasets_by_id = {}
@@ -217,8 +226,9 @@ def main(session,
          DETAILS_TABLE: str = 'SIGMA_WORKBOOK_SOURCE_DETAILS',
          TRUNCATE_BEFORE_INSERT: bool = True):
 
-    # Pause between per-workbook API calls. Increase if Sigma rate-limits you.
-    API_CALL_DELAY_SECONDS = 0.1
+    # Number of concurrent threads for workbook source fetching.
+    # Increase if the Sigma API can handle higher concurrency; reduce if you hit 429s.
+    MAX_WORKERS = 10
 
     FQ_SUMMARY_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{SUMMARY_TABLE}"'
     FQ_DETAILS_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{DETAILS_TABLE}"'
@@ -309,27 +319,41 @@ def main(session,
         session.sql(f"TRUNCATE TABLE {FQ_SUMMARY_SQL}").collect()
         session.sql(f"TRUNCATE TABLE {FQ_DETAILS_SQL}").collect()
 
-    # 5) Fetch sources per workbook and build rows
-    run_id  = str(uuid.uuid4())
-    now_ts  = datetime.now(timezone.utc).replace(tzinfo=None)
+    # 5) Fetch sources for all workbooks in parallel
+    run_id = str(uuid.uuid4())
+    now_ts = datetime.now(timezone.utc).replace(tzinfo=None)
 
+    def fetch_sources(wb):
+        """Fetch sources for a single workbook. Runs in a thread pool worker."""
+        wb_id = wb.get("workbookId")
+        try:
+            body    = get_workbook_sources(token_mgr, wb_id)
+            sources = body if isinstance(body, list) else body.get("entries", [])
+            return wb, sources, None
+        except requests.HTTPError as e:
+            return wb, [], e
+
+    # Submit all workbooks concurrently; collect results as they complete
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_sources, wb): wb for wb in all_workbooks}
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    # 6) Build rows from collected results
     summary_rows = []
     detail_rows  = []
     failed = 0
 
-    for wb in all_workbooks:
+    for wb, sources, error in results:
+        if error:
+            failed += 1
+
         wb_id   = wb.get("workbookId")
         wb_name = wb.get("name", wb_id)
         wb_url  = wb.get("url")
         wb_path = wb.get("path")
         owner   = wb.get("owner") or {}
-
-        try:
-            body    = get_workbook_sources(token_mgr, wb_id)
-            sources = body if isinstance(body, list) else body.get("entries", [])
-        except requests.HTTPError:
-            failed += 1
-            sources = []
 
         dataset_count    = 0
         data_model_count = 0
@@ -413,9 +437,7 @@ def main(session,
 
             detail_rows.extend(wb_detail_rows)
 
-        time.sleep(API_CALL_DELAY_SECONDS)
-
-    # 6) Write summary table
+    # 7) Write summary table
     if summary_rows:
         summary_cols = [
             "RUN_ID", "CREATED_AT",
@@ -429,7 +451,7 @@ def main(session,
         session.create_dataframe(summary_rows, schema=summary_cols) \
                .write.mode("append").save_as_table(FQ_SUMMARY_SNOWPARK)
 
-    # 7) Write details table
+    # 8) Write details table
     if detail_rows:
         detail_cols = [
             "RUN_ID", "CREATED_AT",
