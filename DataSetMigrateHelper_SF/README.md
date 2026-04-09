@@ -73,7 +73,7 @@ Crawls all datasets org-wide via the Sigma API and writes one row per dataset-to
 | `TARGET_DATABASE` | Yes | — | Snowflake database where the output table will be written |
 | `TARGET_SCHEMA` | Yes | — | Snowflake schema where the output table will be written |
 | `TARGET_TABLE` | No | `SIGMA_DATASET_DEPENDENCIES` | Output table name |
-| `TRUNCATE_BEFORE_INSERT` | No | `TRUE` | `TRUE` = snapshot mode (replace on each run); `FALSE` = append |
+| `TRUNCATE_BEFORE_INSERT` | No | `TRUE` | `TRUE` = snapshot mode, replace on each run (recommended). `FALSE` = append every run as a new `RUN_ID` — useful for tracking migration progress over time, but the table grows unboundedly. All analysis queries filter to `MAX(RUN_ID)` so results are always correct either way. |
 
 `SIGMA_BASE_URL`, `SIGMA_CLIENT_ID`, and `SIGMA_CLIENT_SECRET` are all read at runtime from Snowflake Secrets — they are never passed as parameters or hardcoded. All three are set once in `setup_prerequisites.sql`.
 
@@ -102,7 +102,7 @@ Scans all workbooks org-wide, resolves each source against `SIGMA_DATASET_DEPEND
 | `DEPENDENCIES_TABLE` | No | `SIGMA_DATASET_DEPENDENCIES` | Source table populated by `sigma_dataset_dependencies()` |
 | `SUMMARY_TABLE` | No | `SIGMA_WORKBOOK_MIGRATION_SUMMARY` | Output summary table name |
 | `DETAILS_TABLE` | No | `SIGMA_WORKBOOK_SOURCE_DETAILS` | Output details table name |
-| `TRUNCATE_BEFORE_INSERT` | No | `TRUE` | `TRUE` = snapshot mode (replace on each run); `FALSE` = append |
+| `TRUNCATE_BEFORE_INSERT` | No | `TRUE` | `TRUE` = snapshot mode, replace on each run (recommended). `FALSE` = append every run as a new `RUN_ID` — useful for tracking migration progress over time, but the table grows unboundedly. All analysis queries filter to `MAX(RUN_ID)` so results are always correct either way. |
 
 `SIGMA_BASE_URL`, `SIGMA_CLIENT_ID`, and `SIGMA_CLIENT_SECRET` are all read at runtime from Snowflake Secrets — they are never passed as parameters or hardcoded. All three are set once in `setup_prerequisites.sql`.
 

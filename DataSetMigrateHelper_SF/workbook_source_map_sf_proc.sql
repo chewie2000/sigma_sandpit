@@ -17,7 +17,10 @@
 --                            (optional, default: SIGMA_DATASET_DEPENDENCIES)
 --   SUMMARY_TABLE          — Output summary table name (optional, default: SIGMA_WORKBOOK_MIGRATION_SUMMARY)
 --   DETAILS_TABLE          — Output details table name (optional, default: SIGMA_WORKBOOK_SOURCE_DETAILS)
---   TRUNCATE_BEFORE_INSERT — TRUE = snapshot mode, replace on each run (optional, default: TRUE)
+--   TRUNCATE_BEFORE_INSERT — TRUE = snapshot mode, replace on each run (recommended, default: TRUE)
+--                            FALSE = append each run as a new RUN_ID; useful for tracking migration
+--                            progress over time but the table grows unboundedly. Analysis queries
+--                            always filter to MAX(RUN_ID) so results are correct either way.
 --
 --   SIGMA_BASE_URL, SIGMA_CLIENT_ID, and SIGMA_CLIENT_SECRET are all read at
 --   runtime from Snowflake Secrets created in setup_prerequisites.sql.
