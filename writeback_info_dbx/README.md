@@ -148,7 +148,21 @@ Column names use consistent prefixes to make the data source immediately obvious
 
 ## Analysis Queries
 
-`helper_queries.sql` and `geninfo_queries.sql` contain the same query set. Replace `<YOUR_CATALOG>` and `<YOUR_SCHEMA>` before running. `helper_queries.sql` is intended for administrators performing cleanup actions; `geninfo_queries.sql` is a read-only equivalent for reporting.
+`helper_queries.sql` is intended for administrators performing cleanup actions. `geninfo_queries.sql` is a read-only equivalent for reporting — it covers the same analytical dimensions as `archival_scoring.sql` (status flags, edit recency, edit volume, storage, legacy WAL, version tags) but as exploratory reporting views rather than a scoring engine. Replace `<YOUR_CATALOG>` and `<YOUR_SCHEMA>` before running.
+
+### geninfo_queries.sql
+
+| Query | What it shows |
+|---|---|
+| 1. Landscape overview | Per-schema summary: total tables, orphaned/deleted/archived counts, total and reclaimable storage (GB) |
+| 2. Storage reclamation opportunity | All tables with a clear archival signal (orphaned, deleted, or archived workbook), ranked by size with the primary reason surfaced |
+| 3. Active workbooks going stale | Active workbooks where writeback activity has dropped off, grouped into inactivity bands (31–90 / 91–180 / 181–365 / >365 days) |
+| 4. Most active writeback tables | Highest-edit-volume input tables — the inverse archival view; useful for identifying business-critical tables before any cleanup nearby |
+| 5. Owner accountability summary | Cleanup burden rolled up by workbook owner: archived, orphaned, stale counts and reclaimable GB per owner |
+| 6. Workbooks with multiple input tables | Workbooks with more than one SIGDS table — higher-risk cleanup targets; includes a count of tables at risk within each workbook |
+| 7. Legacy WAL inventory | All `sigds_wal_<uuid>` tables, split by migration priority: active legacy WALs (still being written) flagged as urgent; inactive as low-priority |
+
+### helper_queries.sql
 
 | Query | What it finds |
 |---|---|
