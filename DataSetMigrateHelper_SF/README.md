@@ -15,6 +15,7 @@ Sigma is deprecating Datasets in favour of Data Models. This toolkit uses the Si
 | `workbook_source_map_sf_proc.sql` | Snowflake stored procedure — maps workbook sources against the dependency graph into summary and detail tables |
 | `dataset_chains_pivoted.sql` | Analysis query — flattens ROOT → INTERNAL → LEAF chains into one row per path |
 | `crossover_analysis.sql` | Analysis queries — identifies fork points (one dataset feeds many) and merge points (one dataset pulls from many) |
+| `migration_overview.sql` | High-level dashboard queries — org-wide progress, terminal datasets, inconsistencies, re-pointing candidates, and migration readiness pipeline |
 
 ---
 
@@ -151,6 +152,19 @@ Two queries:
 
 - **Fork Points** — datasets with `DOWNSTREAM_CHILD_COUNT > 1`. High-priority migration targets: migrating (or failing to migrate) these affects multiple downstream datasets. Includes actionable `MIGRATION_GUIDANCE`.
 - **Merge Points** — datasets with `UPSTREAM_PARENT_COUNT > 1`. These are blocked until all parents are migrated. Includes `MIGRATION_READINESS` status.
+
+### `migration_overview.sql`
+
+Six high-level queries combining all three output tables for an org-wide migration dashboard:
+
+| Query | Purpose |
+|---|---|
+| **1. Dataset migration progress** | Total datasets, counts and % by status (`migrated` / `not-migrated` / `not-required`), breakdown by graph role (ROOT / INTERNAL / LEAF), and terminal dataset counts |
+| **2. Workbook migration summary** | Total workbooks and counts by `MIGRATION_STATUS`, plus aggregate legacy dataset source counts across the org |
+| **3. Terminal datasets** | Datasets with `DOWNSTREAM_CHILD_COUNT = 0` — nothing else depends on them. Classified as: `EASY WIN` (not migrated, no workbook usage), `MIGRATE` (not migrated but workbooks use it), `RE-POINT` (migrated but workbooks still reference the legacy dataset), `DONE`, or `ORPHANED` |
+| **4. Datasets needing immediate action** | Two sub-queries: **(A) Child ahead of parent** — a child dataset's data model exists but the parent is still not-migrated (data integrity risk); **(B) Blocking chains** — not-migrated datasets that are directly blocking other not-migrated datasets |
+| **5. Workbooks needing re-pointing** | Workbooks still sourcing from a legacy dataset that has already been migrated — the workbook source needs updating to the data model |
+| **6. Migration readiness pipeline** | Every not-migrated dataset classified as `READY` (all parents migrated, can go now) or `BLOCKED by N parent(s)`, sorted by downstream impact so you know which READY datasets to prioritise |
 
 ---
 
