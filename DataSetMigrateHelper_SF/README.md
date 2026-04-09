@@ -134,7 +134,20 @@ CALL sigma_workbook_source_map('MY_DATABASE', 'MY_SCHEMA');
 
 #### `SIGMA_WORKBOOK_SOURCE_DETAILS` — one row per workbook → source
 
-Each row is a single source resolved against the dependency graph, including `DATASET_MIGRATION_STATUS`, `MIGRATED_AT`, `DATA_MODEL_ID`, and graph metrics (`UPSTREAM_PARENT_COUNT`, `DOWNSTREAM_CHILD_COUNT`).
+| Column | Description |
+|---|---|
+| `WORKBOOK_ID / NAME / PATH` | Workbook identity |
+| `SOURCE_INODE_ID` | Inode ID of the source as returned by the Sigma API — join key used by analysis queries |
+| `SOURCE_DATA_MODEL_ID` | Data model ID (populated when `SOURCE_TYPE = 'data-model'`) |
+| `SOURCE_TYPE` | `dataset`, `data-model`, or `table` |
+| `IN_MIGRATION_SCOPE` | `TRUE` if this source was matched against the dependency graph |
+| `DATASET_ID / NAME / PATH / URL` | Resolved dataset identity (from `SIGMA_DATASET_DEPENDENCIES`) |
+| `DATASET_MIGRATION_STATUS` | `not-migrated`, `migrated`, or `not-required` |
+| `DATASET_RELATION_TYPE` | `ROOT`, `INTERNAL`, or `LEAF` |
+| `MIGRATED_AT / MIGRATED_BY` | When and who migrated the dataset |
+| `DATA_MODEL_ID / NAME / URL / PATH` | Target data model (NULL if dataset not yet migrated) |
+| `UPSTREAM_PARENT_COUNT` | Number of direct parents in the dependency graph |
+| `DOWNSTREAM_CHILD_COUNT` | Number of direct children in the dependency graph |
 
 ---
 
