@@ -18,6 +18,33 @@ Sigma is deprecating Datasets in favour of Data Models. This toolkit uses the Si
 
 ---
 
+## Setup
+
+### 1. Run `setup_prerequisites.sql` (ACCOUNTADMIN — once only)
+
+Before deploying either stored procedure, run `setup_prerequisites.sql` as `ACCOUNTADMIN`. This creates:
+
+- **Network rule** — allows outbound HTTPS from Snowflake to the Sigma API host
+- **Snowflake Secrets** — stores your `SIGMA_CLIENT_ID` and `SIGMA_CLIENT_SECRET` securely; credentials are read at procedure runtime via `_snowflake.get_generic_secret_string()` and never appear in procedure source or query history
+- **External access integration** — authorises procedures to use the network rule and secrets
+- **Grants** — `USAGE ON INTEGRATION` and `READ ON SECRET` for the role that will run the procedures
+
+Replace all `<LIKE_THIS>` placeholders in the script before running — the API host, credentials, and role name.
+
+### 2. Deploy the stored procedures
+
+Edit the non-credential configuration constants at the top of each procedure's Python block (`SIGMA_BASE_URL`, `TARGET_DATABASE`, `TARGET_SCHEMA`) then run the `CREATE OR REPLACE PROCEDURE` statement in a Snowflake worksheet using the role granted in step 1.
+
+### 3. Call the procedures in order
+
+```sql
+CALL sigma_dataset_dependencies();   -- populates SIGMA_DATASET_DEPENDENCIES
+CALL sigma_workbook_source_map();    -- populates SIGMA_WORKBOOK_MIGRATION_SUMMARY
+                                     --           SIGMA_WORKBOOK_SOURCE_DETAILS
+```
+
+---
+
 ## Stored Procedures
 
 ### 1. `sigma_dataset_dependencies()` — `dataset_relations_sf_proc.sql`
@@ -41,14 +68,15 @@ Crawls all datasets org-wide via the Sigma API and writes one row per dataset-to
 
 **Configuration constants (edit before deploying):**
 
-```sql
-SIGMA_BASE_URL      = 'https://api.staging.us.aws.sigmacomputing.io'
-SIGMA_CLIENT_ID     = 'YOUR_SIGMA_CLIENT_ID'
-SIGMA_CLIENT_SECRET = 'YOUR_SIGMA_CLIENT_SECRET'
-TARGET_DATABASE     = 'YOUR_DATABASE'
-TARGET_SCHEMA       = 'YOUR_SCHEMA'
-TRUNCATE_BEFORE_INSERT = True   -- snapshot mode (recommended)
+```python
+SIGMA_BASE_URL         = "https://api.eu.aws.sigmacomputing.com"  # match your cloud/region
+TARGET_DATABASE        = "YOUR_DATABASE"
+TARGET_SCHEMA          = "YOUR_SCHEMA"
+TRUNCATE_BEFORE_INSERT = True    # snapshot mode (recommended)
+API_CALL_DELAY_SECONDS = 0.1     # increase if Sigma rate-limits you
 ```
+
+Credentials (`SIGMA_CLIENT_ID`, `SIGMA_CLIENT_SECRET`) are **not** set here — they are read at runtime from Snowflake Secrets created in `setup_prerequisites.sql`. Do not hardcode them.
 
 > **Note:** Uses the deprecated `GET /v2/datasets` endpoint intentionally — it is the only endpoint that exposes `migrationStatus`.
 
@@ -59,6 +87,18 @@ TRUNCATE_BEFORE_INSERT = True   -- snapshot mode (recommended)
 Scans all workbooks org-wide, resolves each source against `SIGMA_DATASET_DEPENDENCIES`, and writes migration status per workbook.
 
 **Prerequisite:** Run `sigma_dataset_dependencies()` first — this procedure reads from `SIGMA_DATASET_DEPENDENCIES` to enrich workbook source data.
+
+**Configuration constants (edit before deploying):**
+
+```python
+SIGMA_BASE_URL         = "https://api.eu.aws.sigmacomputing.com"  # match your cloud/region
+TARGET_DATABASE        = "YOUR_DATABASE"
+TARGET_SCHEMA          = "YOUR_SCHEMA"
+TRUNCATE_BEFORE_INSERT = True    # snapshot mode (recommended)
+API_CALL_DELAY_SECONDS = 0.1     # increase if Sigma rate-limits you
+```
+
+Credentials are read at runtime from Snowflake Secrets — do not hardcode them.
 
 **Output tables:**
 
@@ -76,23 +116,6 @@ Scans all workbooks org-wide, resolves each source against `SIGMA_DATASET_DEPEND
 #### `SIGMA_WORKBOOK_SOURCE_DETAILS` — one row per workbook → source
 
 Each row is a single source resolved against the dependency graph, including `DATASET_MIGRATION_STATUS`, `MIGRATED_AT`, `DATA_MODEL_ID`, and graph metrics (`UPSTREAM_PARENT_COUNT`, `DOWNSTREAM_CHILD_COUNT`).
-
----
-
-## Execution Order
-
-```
-1. Run setup_prerequisites.sql (ACCOUNTADMIN — once only)
-   └── Creates: network rule, Snowflake Secrets, external access integration
-   └── Grants:  USAGE on integration, READ on secrets to your procedure role
-
-2. CALL sigma_dataset_dependencies();
-   └── Populates: SIGMA_DATASET_DEPENDENCIES
-
-3. CALL sigma_workbook_source_map();
-   └── Populates: SIGMA_WORKBOOK_MIGRATION_SUMMARY
-                  SIGMA_WORKBOOK_SOURCE_DETAILS
-```
 
 ---
 
