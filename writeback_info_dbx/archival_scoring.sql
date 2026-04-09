@@ -207,7 +207,7 @@ WITH scored AS (
             END                                                     AS DAYS_SINCE_SIGDS_MODIFIED,
             ROUND(COALESCE(SIGDS_TABLE_SIZE_BYTES, 0) / 1048576.0, 2)
                                                                     AS SIGDS_TABLE_SIZE_MB
-        FROM <YOUR_CATALOG>.<YOUR_SCHEMA>.SIGDS_WORKBOOK_MAP
+        FROM SIGDS_WORKBOOK_MAP
     )
 
 )
@@ -362,7 +362,7 @@ WITH rollup AS (
             CASE WHEN SIGDS_TABLE_LAST_MODIFIED IS NULL THEN NULL
                  ELSE DATEDIFF(DAY, SIGDS_TABLE_LAST_MODIFIED, CURRENT_TIMESTAMP())
             END AS DAYS_SINCE_SIGDS_MODIFIED
-        FROM <YOUR_CATALOG>.<YOUR_SCHEMA>.SIGDS_WORKBOOK_MAP
+        FROM SIGDS_WORKBOOK_MAP
     )
 )
 
