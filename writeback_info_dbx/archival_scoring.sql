@@ -11,9 +11,22 @@
 -- Dimension                        Max    Description
 -- -------------------------------  -----  -------------------------------------
 -- 1. Archival / deletion status     30    IS_ORPHANED / IS_DELETED / API_IS_ARCHIVED
+--                                         / workbook absent from Sigma API
 -- 2. WAL edit recency               25    Days since last WAL write
 -- 3. SIGDS table modification       15    Days since last write to the data table
+--                                         NOTE: SIGDS_TABLE_LAST_MODIFIED reflects
+--                                         ALL Delta writes including OPTIMIZE and
+--                                         VACUUM, not just user writeback activity.
+--                                         A recently-modified SIGDS table may not
+--                                         indicate active use — cross-check with
+--                                         WAL edit recency before drawing conclusions.
 -- 4. Edit volume                    10    WAL_MAX_EDIT_NUM (low = likely unused)
+--                                         NOTE: Thresholds are calibrated for
+--                                         high-volume production environments.
+--                                         In sandbox/test environments most tables
+--                                         will score 8 pts (≤10 edits) regardless
+--                                         of actual usage level. Tune ≤10 / ≤50
+--                                         thresholds to your org's typical volumes.
 -- 5. Legacy WAL flag                10    sigds_wal_<uuid> naming = pre-MultiWAL
 -- 6. Storage reclamation value      10    Larger tables = more storage to reclaim
 --
@@ -89,16 +102,25 @@ WITH scored AS (
         -- 1. ARCHIVAL / DELETION STATUS (0–30 pts)
         --    Mutually exclusive — pick the highest applicable state.
         --    IS_ORPHANED is the strongest: the data table is already gone.
+        --    The WORKBOOK_NAME IS NULL / API_IS_ARCHIVED IS NULL branch catches
+        --    workbooks that were deleted from Sigma entirely (not just archived)
+        --    and unsaved exploration sessions — in both cases there is no live
+        --    Sigma content actively using this table.
         -- -----------------------------------------------------------------
         CASE
             WHEN IS_ORPHANED = TRUE
                 THEN 30   -- SIGDS table no longer exists — WAL is a dead record
             WHEN IS_DELETED = TRUE AND IS_ORPHANED = FALSE
-                THEN 25   -- WAL gone but data table still present (unusual state)
+                THEN 25   -- WAL table gone but data table still present
             WHEN API_IS_ARCHIVED = TRUE
              AND IS_ORPHANED = FALSE
              AND IS_DELETED  = FALSE
                 THEN 20   -- Workbook archived in Sigma; tables still exist
+            WHEN WORKBOOK_NAME IS NULL
+             AND API_IS_ARCHIVED IS NULL
+             AND IS_ORPHANED = FALSE
+             AND IS_DELETED  = FALSE
+                THEN 15   -- Workbook absent from Sigma API — deleted or never saved
             ELSE 0
         END                                                         AS SCORE_STATUS,
 
@@ -148,13 +170,16 @@ WITH scored AS (
         --    Old sigds_wal_<uuid> tables predate MultiWAL and are priority
         --    migration targets. Score higher if still actively used (urgent
         --    migration need) vs inactive (likely already abandoned).
+        --    NULL DAYS_SINCE_LAST_EDIT = no known edit history — treat as
+        --    inactive (5 pts), not as actively written (10 pts).
         -- -----------------------------------------------------------------
         CASE
             WHEN IS_LEGACY_WAL = TRUE
-             AND (DAYS_SINCE_LAST_EDIT IS NULL OR DAYS_SINCE_LAST_EDIT < 180)
+             AND DAYS_SINCE_LAST_EDIT IS NOT NULL
+             AND DAYS_SINCE_LAST_EDIT < 180
                 THEN 10   -- Legacy WAL still being actively written — migrate urgently
             WHEN IS_LEGACY_WAL = TRUE
-                THEN 5    -- Legacy WAL, no recent activity — lower urgency
+                THEN 5    -- Legacy WAL, inactive or no edit history — lower urgency
             ELSE 0
         END                                                         AS SCORE_LEGACY_WAL,
 
@@ -306,6 +331,8 @@ WITH rollup AS (
                 WHEN IS_ORPHANED = TRUE THEN 30
                 WHEN IS_DELETED = TRUE AND IS_ORPHANED = FALSE THEN 25
                 WHEN API_IS_ARCHIVED = TRUE AND IS_ORPHANED = FALSE AND IS_DELETED = FALSE THEN 20
+                WHEN WORKBOOK_NAME IS NULL AND API_IS_ARCHIVED IS NULL
+                 AND IS_ORPHANED = FALSE AND IS_DELETED = FALSE THEN 15
                 ELSE 0
             END +
             -- WAL recency
@@ -333,7 +360,8 @@ WITH rollup AS (
             END +
             -- Legacy WAL
             CASE
-                WHEN IS_LEGACY_WAL = TRUE AND (DAYS_SINCE_LAST_EDIT IS NULL OR DAYS_SINCE_LAST_EDIT < 180) THEN 10
+                WHEN IS_LEGACY_WAL = TRUE AND DAYS_SINCE_LAST_EDIT IS NOT NULL
+                 AND DAYS_SINCE_LAST_EDIT < 180 THEN 10
                 WHEN IS_LEGACY_WAL = TRUE THEN 5
                 ELSE 0
             END +
@@ -356,6 +384,7 @@ WITH rollup AS (
             IS_TAGGED_VERSION,
             WAL_MAX_EDIT_NUM,
             SIGDS_TABLE_SIZE_BYTES,
+            WORKBOOK_NAME,
             CASE WHEN WAL_LAST_EDIT_AT IS NULL THEN NULL
                  ELSE DATEDIFF(DAY, WAL_LAST_EDIT_AT, CURRENT_TIMESTAMP())
             END AS DAYS_SINCE_LAST_EDIT,

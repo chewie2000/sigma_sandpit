@@ -169,7 +169,7 @@ Scores every record in `SIGDS_WORKBOOK_MAP` across eight weighted signals to pro
 
 | Dimension | Max | Logic |
 |---|---|---|
-| Archival / deletion status | 30 | `IS_ORPHANED`=TRUE → 30 / `IS_DELETED`=TRUE → 25 / `API_IS_ARCHIVED`=TRUE → 20 |
+| Archival / deletion status | 30 | `IS_ORPHANED`=TRUE → 30 / `IS_DELETED`=TRUE → 25 / `API_IS_ARCHIVED`=TRUE → 20 / workbook absent from API (deleted or never saved) → 15 |
 | WAL edit recency | 25 | >365 days (or NULL) → 25 / >180 → 18 / >90 → 10 / >30 → 4 |
 | SIGDS table modification | 15 | >365 days (or NULL) → 15 / >180 → 10 / >90 → 5 |
 | Edit volume (`WAL_MAX_EDIT_NUM`) | 10 | 0/NULL → 10 / ≤10 → 8 / ≤50 → 5 / ≤200 → 2 |
