@@ -7,12 +7,31 @@
 
 -- ==============================================================================
 -- Create the stored procedure
--- Edit the non-credential configuration constants inside the Python block
--- before running (SIGMA_BASE_URL, TARGET_DATABASE, TARGET_SCHEMA).
 -- Credentials are read at runtime from Snowflake Secrets — do not hardcode them.
+-- All other configuration is passed as procedure parameters at call time.
+--
+-- Parameters:
+--   SIGMA_BASE_URL         — Sigma API base URL for your cloud/region (required)
+--   TARGET_DATABASE        — Snowflake database where the output table will be written (required)
+--   TARGET_SCHEMA          — Snowflake schema where the output table will be written (required)
+--   TARGET_TABLE           — Output table name (optional, default: SIGMA_DATASET_DEPENDENCIES)
+--   TRUNCATE_BEFORE_INSERT — TRUE = snapshot mode, replace on each run (optional, default: TRUE)
+--
+-- Example call:
+--   CALL sigma_dataset_dependencies(
+--       'https://api.eu.aws.sigmacomputing.com',
+--       'MY_DATABASE',
+--       'MY_SCHEMA'
+--   );
 -- ==============================================================================
 
-CREATE OR REPLACE PROCEDURE sigma_dataset_dependencies()
+CREATE OR REPLACE PROCEDURE sigma_dataset_dependencies(
+    SIGMA_BASE_URL         STRING,
+    TARGET_DATABASE        STRING,
+    TARGET_SCHEMA          STRING,
+    TARGET_TABLE           STRING DEFAULT 'SIGMA_DATASET_DEPENDENCIES',
+    TRUNCATE_BEFORE_INSERT BOOLEAN DEFAULT TRUE
+)
 RETURNS STRING
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -29,30 +48,23 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
-# ------------------------------------------------------------------------------
-# CONFIGURATION — EDIT THESE VALUES
-# ------------------------------------------------------------------------------
+def main(session,
+         SIGMA_BASE_URL: str,
+         TARGET_DATABASE: str,
+         TARGET_SCHEMA: str,
+         TARGET_TABLE: str = 'SIGMA_DATASET_DEPENDENCIES',
+         TRUNCATE_BEFORE_INSERT: bool = True):
 
-SIGMA_BASE_URL      = "https://api.staging.us.aws.sigmacomputing.io"
+    # Credentials are read from Snowflake Secrets at runtime — never hardcoded.
+    # Secrets are created in setup_prerequisites.sql.
+    SIGMA_CLIENT_ID     = _snowflake.get_generic_secret_string('sigma_client_id')
+    SIGMA_CLIENT_SECRET = _snowflake.get_generic_secret_string('sigma_client_secret')
 
-# Credentials are read from Snowflake Secrets at runtime — never hardcoded.
-# Secrets are created in setup_prerequisites.sql.
-SIGMA_CLIENT_ID     = _snowflake.get_generic_secret_string('sigma_client_id')
-SIGMA_CLIENT_SECRET = _snowflake.get_generic_secret_string('sigma_client_secret')
+    # Pause between per-dataset API calls. Increase if Sigma rate-limits you.
+    API_CALL_DELAY_SECONDS = 0.1
 
-TARGET_DATABASE = "YOUR_DATABASE"
-TARGET_SCHEMA   = "YOUR_SCHEMA"
-TARGET_TABLE    = "SIGMA_DATASET_DEPENDENCIES"
-
-# True  = truncate and replace on each run (snapshot mode — recommended)
-# False = append; filter by RUN_ID or CREATED_AT for the latest run
-TRUNCATE_BEFORE_INSERT = True
-
-# Pause between per-dataset API calls. Increase if Sigma rate-limits you.
-API_CALL_DELAY_SECONDS = 0.1
-
-FQ_TABLE_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{TARGET_TABLE}"'
-FQ_TABLE_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{TARGET_TABLE}"
+    FQ_TABLE_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{TARGET_TABLE}"'
+    FQ_TABLE_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{TARGET_TABLE}"
 
 # ------------------------------------------------------------------------------
 # TOKEN MANAGEMENT
@@ -163,11 +175,6 @@ def get_data_model(token_mgr, data_model_id):
     headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
     return _get_with_backoff(url, headers=headers).json()
 
-# ------------------------------------------------------------------------------
-# MAIN HANDLER
-# ------------------------------------------------------------------------------
-
-def main(session):
     # 1) Authenticate — validate credentials early so we fail fast on bad config
     token_mgr = SigmaTokenManager()
     token_mgr.get_token()

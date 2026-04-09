@@ -38,9 +38,17 @@ Edit the non-credential configuration constants at the top of each procedure's P
 ### 3. Call the procedures in order
 
 ```sql
-CALL sigma_dataset_dependencies();   -- populates SIGMA_DATASET_DEPENDENCIES
-CALL sigma_workbook_source_map();    -- populates SIGMA_WORKBOOK_MIGRATION_SUMMARY
-                                     --           SIGMA_WORKBOOK_SOURCE_DETAILS
+CALL sigma_dataset_dependencies(
+    'https://api.eu.aws.sigmacomputing.com',  -- your Sigma API base URL
+    'MY_DATABASE',
+    'MY_SCHEMA'
+);
+
+CALL sigma_workbook_source_map(
+    'https://api.eu.aws.sigmacomputing.com',  -- your Sigma API base URL
+    'MY_DATABASE',
+    'MY_SCHEMA'
+);
 ```
 
 ---
@@ -66,17 +74,27 @@ Crawls all datasets org-wide via the Sigma API and writes one row per dataset-to
 | `UPSTREAM_PARENT_COUNT` | Number of direct parents (>1 = merge point) |
 | `DOWNSTREAM_CHILD_COUNT` | Number of direct children (>1 = fork point) |
 
-**Configuration constants (edit before deploying):**
+**Parameters — pass at call time, no editing of the procedure required:**
 
-```python
-SIGMA_BASE_URL         = "https://api.eu.aws.sigmacomputing.com"  # match your cloud/region
-TARGET_DATABASE        = "YOUR_DATABASE"
-TARGET_SCHEMA          = "YOUR_SCHEMA"
-TRUNCATE_BEFORE_INSERT = True    # snapshot mode (recommended)
-API_CALL_DELAY_SECONDS = 0.1     # increase if Sigma rate-limits you
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `SIGMA_BASE_URL` | Yes | — | Sigma API base URL for your cloud/region (see Prerequisites) |
+| `TARGET_DATABASE` | Yes | — | Snowflake database where the output table will be written |
+| `TARGET_SCHEMA` | Yes | — | Snowflake schema where the output table will be written |
+| `TARGET_TABLE` | No | `SIGMA_DATASET_DEPENDENCIES` | Output table name |
+| `TRUNCATE_BEFORE_INSERT` | No | `TRUE` | `TRUE` = snapshot mode (replace on each run); `FALSE` = append |
+
+**Example call:**
+
+```sql
+CALL sigma_dataset_dependencies(
+    'https://api.eu.aws.sigmacomputing.com',
+    'MY_DATABASE',
+    'MY_SCHEMA'
+);
 ```
 
-Credentials (`SIGMA_CLIENT_ID`, `SIGMA_CLIENT_SECRET`) are **not** set here — they are read at runtime from Snowflake Secrets created in `setup_prerequisites.sql`. Do not hardcode them.
+Credentials are read at runtime from Snowflake Secrets — they are never passed as parameters or hardcoded.
 
 > **Note:** Uses the deprecated `GET /v2/datasets` endpoint intentionally — it is the only endpoint that exposes `migrationStatus`.
 
@@ -88,17 +106,29 @@ Scans all workbooks org-wide, resolves each source against `SIGMA_DATASET_DEPEND
 
 **Prerequisite:** Run `sigma_dataset_dependencies()` first — this procedure reads from `SIGMA_DATASET_DEPENDENCIES` to enrich workbook source data.
 
-**Configuration constants (edit before deploying):**
+**Parameters — pass at call time, no editing of the procedure required:**
 
-```python
-SIGMA_BASE_URL         = "https://api.eu.aws.sigmacomputing.com"  # match your cloud/region
-TARGET_DATABASE        = "YOUR_DATABASE"
-TARGET_SCHEMA          = "YOUR_SCHEMA"
-TRUNCATE_BEFORE_INSERT = True    # snapshot mode (recommended)
-API_CALL_DELAY_SECONDS = 0.1     # increase if Sigma rate-limits you
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `SIGMA_BASE_URL` | Yes | — | Sigma API base URL for your cloud/region (see Prerequisites) |
+| `TARGET_DATABASE` | Yes | — | Snowflake database where output tables will be written |
+| `TARGET_SCHEMA` | Yes | — | Snowflake schema where output tables will be written |
+| `DEPENDENCIES_TABLE` | No | `SIGMA_DATASET_DEPENDENCIES` | Source table populated by `sigma_dataset_dependencies()` |
+| `SUMMARY_TABLE` | No | `SIGMA_WORKBOOK_MIGRATION_SUMMARY` | Output summary table name |
+| `DETAILS_TABLE` | No | `SIGMA_WORKBOOK_SOURCE_DETAILS` | Output details table name |
+| `TRUNCATE_BEFORE_INSERT` | No | `TRUE` | `TRUE` = snapshot mode (replace on each run); `FALSE` = append |
+
+**Example call:**
+
+```sql
+CALL sigma_workbook_source_map(
+    'https://api.eu.aws.sigmacomputing.com',
+    'MY_DATABASE',
+    'MY_SCHEMA'
+);
 ```
 
-Credentials are read at runtime from Snowflake Secrets — do not hardcode them.
+Credentials are read at runtime from Snowflake Secrets — they are never passed as parameters or hardcoded.
 
 **Output tables:**
 

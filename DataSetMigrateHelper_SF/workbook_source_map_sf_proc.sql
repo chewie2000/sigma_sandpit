@@ -7,22 +7,39 @@
 
 -- ==============================================================================
 -- Create the stored procedure
--- Edit the non-credential configuration constants inside the Python block
--- before running (SIGMA_BASE_URL, TARGET_DATABASE, TARGET_SCHEMA).
 -- Credentials are read at runtime from Snowflake Secrets — do not hardcode them.
+-- All other configuration is passed as procedure parameters at call time.
 --
--- Creates two tables:
---   SIGMA_WORKBOOK_MIGRATION_SUMMARY  — one row per workbook with source counts
---                                       and overall migration status
---                                       (only workbooks with migration-scope sources)
---   SIGMA_WORKBOOK_SOURCE_DETAILS     — one row per workbook → source, enriched
---                                       with migration data from SIGMA_DATASET_DEPENDENCIES
+-- Parameters:
+--   SIGMA_BASE_URL         — Sigma API base URL for your cloud/region (required)
+--   TARGET_DATABASE        — Snowflake database where output tables will be written (required)
+--   TARGET_SCHEMA          — Snowflake schema where output tables will be written (required)
+--   DEPENDENCIES_TABLE     — Source table populated by sigma_dataset_dependencies()
+--                            (optional, default: SIGMA_DATASET_DEPENDENCIES)
+--   SUMMARY_TABLE          — Output summary table name (optional, default: SIGMA_WORKBOOK_MIGRATION_SUMMARY)
+--   DETAILS_TABLE          — Output details table name (optional, default: SIGMA_WORKBOOK_SOURCE_DETAILS)
+--   TRUNCATE_BEFORE_INSERT — TRUE = snapshot mode, replace on each run (optional, default: TRUE)
 --
--- Requires: SIGMA_DATASET_DEPENDENCIES must already be populated by
---           sigma_dataset_dependencies() before calling this procedure.
+-- Requires: SIGMA_DATASET_DEPENDENCIES (or DEPENDENCIES_TABLE) must already be
+--           populated by sigma_dataset_dependencies() before calling this procedure.
+--
+-- Example call:
+--   CALL sigma_workbook_source_map(
+--       'https://api.eu.aws.sigmacomputing.com',
+--       'MY_DATABASE',
+--       'MY_SCHEMA'
+--   );
 -- ==============================================================================
 
-CREATE OR REPLACE PROCEDURE sigma_workbook_source_map()
+CREATE OR REPLACE PROCEDURE sigma_workbook_source_map(
+    SIGMA_BASE_URL         STRING,
+    TARGET_DATABASE        STRING,
+    TARGET_SCHEMA          STRING,
+    DEPENDENCIES_TABLE     STRING DEFAULT 'SIGMA_DATASET_DEPENDENCIES',
+    SUMMARY_TABLE          STRING DEFAULT 'SIGMA_WORKBOOK_MIGRATION_SUMMARY',
+    DETAILS_TABLE          STRING DEFAULT 'SIGMA_WORKBOOK_SOURCE_DETAILS',
+    TRUNCATE_BEFORE_INSERT BOOLEAN DEFAULT TRUE
+)
 RETURNS STRING
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -38,36 +55,28 @@ import uuid
 import time
 from datetime import datetime, timezone
 
-# ------------------------------------------------------------------------------
-# CONFIGURATION — EDIT THESE VALUES
-# ------------------------------------------------------------------------------
+def main(session,
+         SIGMA_BASE_URL: str,
+         TARGET_DATABASE: str,
+         TARGET_SCHEMA: str,
+         DEPENDENCIES_TABLE: str = 'SIGMA_DATASET_DEPENDENCIES',
+         SUMMARY_TABLE: str = 'SIGMA_WORKBOOK_MIGRATION_SUMMARY',
+         DETAILS_TABLE: str = 'SIGMA_WORKBOOK_SOURCE_DETAILS',
+         TRUNCATE_BEFORE_INSERT: bool = True):
 
-SIGMA_BASE_URL      = "https://api.staging.us.aws.sigmacomputing.io"
+    # Credentials are read from Snowflake Secrets at runtime — never hardcoded.
+    # Secrets are created in setup_prerequisites.sql.
+    SIGMA_CLIENT_ID     = _snowflake.get_generic_secret_string('sigma_client_id')
+    SIGMA_CLIENT_SECRET = _snowflake.get_generic_secret_string('sigma_client_secret')
 
-# Credentials are read from Snowflake Secrets at runtime — never hardcoded.
-# Secrets are created in setup_prerequisites.sql.
-SIGMA_CLIENT_ID     = _snowflake.get_generic_secret_string('sigma_client_id')
-SIGMA_CLIENT_SECRET = _snowflake.get_generic_secret_string('sigma_client_secret')
+    # Pause between per-workbook API calls. Increase if Sigma rate-limits you.
+    API_CALL_DELAY_SECONDS = 0.1
 
-TARGET_DATABASE = "YOUR_DATABASE"
-TARGET_SCHEMA   = "YOUR_SCHEMA"
-
-SUMMARY_TABLE      = "SIGMA_WORKBOOK_MIGRATION_SUMMARY"
-DETAILS_TABLE      = "SIGMA_WORKBOOK_SOURCE_DETAILS"
-DEPENDENCIES_TABLE = "SIGMA_DATASET_DEPENDENCIES"
-
-# True  = truncate and replace on each run (snapshot mode — recommended)
-# False = append; filter by RUN_ID or CREATED_AT for the latest run
-TRUNCATE_BEFORE_INSERT = True
-
-# Pause between per-workbook API calls. Increase if Sigma rate-limits you.
-API_CALL_DELAY_SECONDS = 0.1
-
-FQ_SUMMARY_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{SUMMARY_TABLE}"'
-FQ_DETAILS_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{DETAILS_TABLE}"'
-FQ_DEPS_SQL         = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{DEPENDENCIES_TABLE}"'
-FQ_SUMMARY_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{SUMMARY_TABLE}"
-FQ_DETAILS_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{DETAILS_TABLE}"
+    FQ_SUMMARY_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{SUMMARY_TABLE}"'
+    FQ_DETAILS_SQL      = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{DETAILS_TABLE}"'
+    FQ_DEPS_SQL         = f'"{TARGET_DATABASE}"."{TARGET_SCHEMA}"."{DEPENDENCIES_TABLE}"'
+    FQ_SUMMARY_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{SUMMARY_TABLE}"
+    FQ_DETAILS_SNOWPARK = f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{DETAILS_TABLE}"
 
 # ------------------------------------------------------------------------------
 # TOKEN MANAGEMENT
@@ -209,11 +218,6 @@ def load_dependency_lookups(session):
 
     return datasets_by_id, data_models_by_id
 
-# ------------------------------------------------------------------------------
-# MAIN HANDLER
-# ------------------------------------------------------------------------------
-
-def main(session):
     # 1) Authenticate
     token_mgr = SigmaTokenManager()
     token_mgr.get_token()
