@@ -190,7 +190,7 @@ Six high-level queries combining all three output tables for an org-wide migrati
 
 ### Sigma API credentials
 
-These are OAuth 2.0 client credentials generated from within Sigma. You will need **Admin** access to your Sigma organisation to generate them.
+You will need **Admin** access to your Sigma organisation to generate API credentials.
 
 **Admin scope is required** for this toolkit. Both stored procedures use `skipPermissionCheck=true` on the datasets and workbooks list endpoints — without Admin credentials, these calls return only content owned by the API user rather than the full org, producing incomplete results.
 
