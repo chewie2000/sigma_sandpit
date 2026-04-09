@@ -11,7 +11,7 @@
 -- Queries in this file:
 --   1. Dataset migration progress          — org-wide counts by status and graph role
 --   2. Workbook migration summary          — workbook counts by migration status
---   3. Terminal datasets (no dependants)   — datasets nothing else depends on
+--   3. Terminal datasets (no dependants)   — datasets no dataset or workbook depends on
 --   4. Datasets needing immediate action   — migration inconsistencies and blockers
 --   5. Workbooks needing re-pointing       — still pointing at migrated datasets
 --   6. Migration readiness pipeline        — what is unblocked and ready to migrate now
@@ -106,13 +106,12 @@ WHERE RUN_ID = (SELECT RUN_ID FROM latest_run);
 
 
 -- ==============================================================================
--- QUERY 3: TERMINAL DATASETS — NOTHING DOWNSTREAM DEPENDS ON THEM
--- Datasets with DOWNSTREAM_CHILD_COUNT = 0 (no other dataset sources from them).
--- Categorised by migration status and whether any workbook still references them.
+-- QUERY 3: TERMINAL DATASETS — NOTHING DEPENDS ON THEM (DATASETS OR WORKBOOKS)
+-- Datasets with DOWNSTREAM_CHILD_COUNT = 0 AND no workbook references.
 -- Use this to find:
---   a) Easy wins: not-migrated but isolated — no downstream chain impact
---   b) Candidates for retirement: migrated terminal datasets with no workbook usage
---   c) Orphaned: not-required terminal datasets no workbook touches at all
+--   a) Easy wins: not-migrated but truly isolated — safe to migrate or retire
+--   b) Candidates for retirement: migrated datasets with no remaining dependants
+--   c) Orphaned: not-required datasets nothing uses at all
 -- ==============================================================================
 
 WITH dep_run AS (
@@ -137,23 +136,18 @@ datasets AS (
         DOWNSTREAM_CHILD_COUNT
     FROM SIGMA_DATASET_DEPENDENCIES
     WHERE RUN_ID = (SELECT RUN_ID FROM dep_run)
-      AND DOWNSTREAM_CHILD_COUNT = 0       -- nothing else depends on this dataset
+      AND DOWNSTREAM_CHILD_COUNT = 0       -- no dataset dependants
 ),
 
--- Workbooks that reference each terminal dataset
+-- Workbooks that reference each dataset
 workbook_refs AS (
     SELECT
-        d.SOURCE_INODE_ID                    AS DATASET_ID,
-        COUNT(DISTINCT d.WORKBOOK_ID)        AS WORKBOOK_COUNT,
-        LISTAGG(DISTINCT w.WORKBOOK_NAME, ', ')
-            WITHIN GROUP (ORDER BY w.WORKBOOK_NAME)  AS WORKBOOK_NAMES
-    FROM SIGMA_WORKBOOK_SOURCE_DETAILS d
-    JOIN SIGMA_WORKBOOK_MIGRATION_SUMMARY w
-      ON w.WORKBOOK_ID = d.WORKBOOK_ID
-     AND w.RUN_ID      = (SELECT RUN_ID FROM det_run)
-    WHERE d.RUN_ID   = (SELECT RUN_ID FROM det_run)
-      AND d.SOURCE_TYPE = 'dataset'
-    GROUP BY d.SOURCE_INODE_ID
+        SOURCE_INODE_ID                      AS DATASET_ID,
+        COUNT(DISTINCT WORKBOOK_ID)          AS WORKBOOK_COUNT
+    FROM SIGMA_WORKBOOK_SOURCE_DETAILS
+    WHERE RUN_ID      = (SELECT RUN_ID FROM det_run)
+      AND SOURCE_TYPE = 'dataset'
+    GROUP BY SOURCE_INODE_ID
 )
 
 SELECT
@@ -168,39 +162,26 @@ SELECT
     ds.DATA_MODEL_URL,
     ds.MIGRATED_AT,
 
-    -- Workbook usage
-    COALESCE(wr.WORKBOOK_COUNT, 0)           AS WORKBOOKS_REFERENCING,
-    wr.WORKBOOK_NAMES,
-
     -- Classification
     CASE
         WHEN ds.DATASET_MIGRATION_STATUS = 'migrated'
-         AND COALESCE(wr.WORKBOOK_COUNT, 0) = 0
-            THEN 'DONE — migrated, no workbooks referencing legacy dataset'
-        WHEN ds.DATASET_MIGRATION_STATUS = 'migrated'
-         AND wr.WORKBOOK_COUNT > 0
-            THEN 'RE-POINT — migrated but ' || wr.WORKBOOK_COUNT::STRING || ' workbook(s) still use the legacy dataset'
+            THEN 'DONE — migrated, no dependants'
         WHEN ds.DATASET_MIGRATION_STATUS = 'not-migrated'
-         AND COALESCE(wr.WORKBOOK_COUNT, 0) = 0
-            THEN 'EASY WIN — not migrated, no workbook usage, no downstream dependencies'
-        WHEN ds.DATASET_MIGRATION_STATUS = 'not-migrated'
-         AND wr.WORKBOOK_COUNT > 0
-            THEN 'MIGRATE — not migrated, used by ' || wr.WORKBOOK_COUNT::STRING || ' workbook(s)'
+            THEN 'EASY WIN — not migrated, no dependants'
         WHEN ds.DATASET_MIGRATION_STATUS = 'not-required'
-         AND COALESCE(wr.WORKBOOK_COUNT, 0) = 0
-            THEN 'ORPHANED — not-required and no workbook usage'
+            THEN 'ORPHANED — not-required, no dependants'
         ELSE 'REVIEW'
     END                                      AS TERMINAL_STATUS
 
 FROM datasets ds
 LEFT JOIN workbook_refs wr ON wr.DATASET_ID = ds.DATASET_ID
+WHERE COALESCE(wr.WORKBOOK_COUNT, 0) = 0   -- no workbook dependants either
 ORDER BY
     CASE ds.DATASET_MIGRATION_STATUS
         WHEN 'not-migrated' THEN 0
         WHEN 'migrated'     THEN 1
         ELSE 2
     END,
-    COALESCE(wr.WORKBOOK_COUNT, 0) DESC,
     ds.DATASET_NAME;
 
 
