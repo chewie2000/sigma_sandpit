@@ -13,8 +13,7 @@ When Sigma writebacks are enabled, Sigma creates a WAL table (`sigds_wal_*`) and
 | `create_sigds_workbook_map.sql` | DDL — creates the `SIGDS_WORKBOOK_MAP` table in Unity Catalog (run once) |
 | `populate_sigds_workbook_map.py` | Main script — incrementally populates `SIGDS_WORKBOOK_MAP` from WAL tables and the Sigma API |
 | `archival_scoring.sql` | Weighted confidence scoring matrix — scores every record across multiple signals to surface archival candidates |
-| `helper_queries.sql` | Housekeeping queries — identifies stale, orphaned, archived, and legacy records for cleanup |
-| `geninfo_queries.sql` | General information queries — same query set as helper_queries, for read-only reporting |
+| `geninfo_queries.sql` | Reporting queries — landscape overview, storage reclamation, owner accountability, multi-table workbooks, legacy WAL inventory |
 
 ---
 
@@ -85,7 +84,7 @@ SCAN_SCHEMA = "dev_writes"    # change this each run
 MAP_SCHEMA  = "prod_writes"   # always points to the shared map table
 ```
 
-Both runs write to the same `SIGDS_WORKBOOK_MAP` table. All analysis queries (`archival_scoring.sql`, `helper_queries.sql`, `geninfo_queries.sql`) include `SCAN_SCHEMA` in their output so you can filter or group by schema. Sigma API enrichment (workbook names, owner details) is shared across schemas — a `WORKBOOK_ID` seen in any previous run is not re-fetched.
+Both runs write to the same `SIGDS_WORKBOOK_MAP` table. All analysis queries (`archival_scoring.sql`, `geninfo_queries.sql`) include `SCAN_SCHEMA` in their output so you can filter or group by schema. Sigma API enrichment (workbook names, owner details) is shared across schemas — a `WORKBOOK_ID` seen in any previous run is not re-fetched.
 
 ---
 
@@ -148,9 +147,7 @@ Column names use consistent prefixes to make the data source immediately obvious
 
 ## Analysis Queries
 
-`helper_queries.sql` is intended for administrators performing cleanup actions. `geninfo_queries.sql` is a read-only equivalent for reporting — it covers the same analytical dimensions as `archival_scoring.sql` (status flags, edit recency, edit volume, storage, legacy WAL, version tags) but as exploratory reporting views rather than a scoring engine. Replace `<YOUR_CATALOG>` and `<YOUR_SCHEMA>` before running.
-
-### geninfo_queries.sql
+`geninfo_queries.sql` covers the same analytical dimensions as `archival_scoring.sql` (status flags, edit recency, edit volume, storage, legacy WAL, version tags) but as exploratory reporting views rather than a scoring engine. Replace `<YOUR_CATALOG>` and `<YOUR_SCHEMA>` before running.
 
 | Query | What it shows |
 |---|---|
@@ -161,16 +158,6 @@ Column names use consistent prefixes to make the data source immediately obvious
 | 5. Owner accountability summary | Cleanup burden rolled up by workbook owner: archived, orphaned, stale counts and reclaimable GB per owner |
 | 6. Workbooks with multiple input tables | Workbooks with more than one SIGDS table — higher-risk cleanup targets; includes a count of tables at risk within each workbook |
 | 7. Legacy WAL inventory | All `sigds_wal_<uuid>` tables, split by migration priority: active legacy WALs (still being written) flagged as urgent; inactive as low-priority |
-
-### helper_queries.sql
-
-| Query | What it finds |
-|---|---|
-| 1. Archived workbooks | SIGDS tables still present, workbook archived, no edits in 90+ days — safe DROP candidates |
-| 2. Active workbooks (stale) | SIGDS tables still present, workbook active, no edits in 180+ days — review with owners |
-| 3. Orphaned WAL records | SIGDS table dropped but WAL table still exists — WAL DROP candidates |
-| 4. Stale legacy WAL tables | Old UUID-named WAL tables with no edits in 180+ days |
-| 5. Status flag summary | Rollup of record counts and total storage by status flag combination |
 
 ---
 
@@ -224,7 +211,7 @@ This applies equally to the WAL table — Sigma holds the WAL table name in its 
 
 ### Recommended process
 
-1. **Identify candidates** using the helper queries (archived, orphaned, or stale records).
+1. **Identify candidates** using `geninfo_queries.sql` or `archival_scoring.sql` (archived, orphaned, or stale records).
 2. **Move** the SIGDS and WAL tables to a quarantine schema (e.g. `<SCHEMA>_quarantine`) using `ALTER TABLE ... RENAME TO`. Do not drop them yet.
 3. **Monitor** for a safe period (recommended: 30 days minimum) to confirm no workbook errors are raised and no users report missing data.
 4. **Drop** the tables from the quarantine schema once the safe period has passed.
