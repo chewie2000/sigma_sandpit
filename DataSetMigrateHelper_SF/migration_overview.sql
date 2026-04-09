@@ -143,7 +143,7 @@ datasets AS (
 -- Workbooks that reference each terminal dataset
 workbook_refs AS (
     SELECT
-        d.INODEID                            AS DATASET_ID,
+        d.SOURCE_INODE_ID                    AS DATASET_ID,
         COUNT(DISTINCT d.WORKBOOK_ID)        AS WORKBOOK_COUNT,
         LISTAGG(DISTINCT w.WORKBOOK_NAME, ', ')
             WITHIN GROUP (ORDER BY w.WORKBOOK_NAME)  AS WORKBOOK_NAMES
@@ -153,7 +153,7 @@ workbook_refs AS (
      AND w.RUN_ID      = (SELECT RUN_ID FROM det_run)
     WHERE d.RUN_ID   = (SELECT RUN_ID FROM det_run)
       AND d.SOURCE_TYPE = 'dataset'
-    GROUP BY d.INODEID
+    GROUP BY d.SOURCE_INODE_ID
 )
 
 SELECT
@@ -333,7 +333,7 @@ SELECT
     w.MIGRATION_STATUS,
 
     -- The legacy dataset the workbook is still pointing at
-    d.INODEID                                AS DATASET_ID,
+    d.SOURCE_INODE_ID                        AS DATASET_ID,
     d.DATASET_NAME,
     d.DATASET_URL,
 
