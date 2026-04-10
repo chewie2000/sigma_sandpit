@@ -19,6 +19,68 @@ Sigma is deprecating Datasets in favour of Data Models. This toolkit uses the Si
 
 ---
 
+## Prerequisites
+
+### Snowflake
+
+- Role with `CREATE PROCEDURE`, `CREATE TABLE`, `USAGE ON INTEGRATION`, and `READ ON SECRET` privileges
+- `ACCOUNTADMIN` access to run `setup_prerequisites.sql` (one-time)
+
+### Sigma API credentials
+
+You will need **Admin** access to your Sigma organisation to generate API credentials.
+
+**Admin scope is required** for this toolkit. Both stored procedures use `skipPermissionCheck=true` on the datasets and workbooks list endpoints — without Admin credentials, these calls return only content owned by the API user rather than the full org, producing incomplete results.
+
+#### Generating credentials
+
+1. In Sigma, open the left navigation and go to **Administration**.
+2. Select **Developer Access** from the Administration menu.
+3. Under **Client Credentials**, click **Create New**.
+4. Enter a descriptive name (e.g. `dataset-migrate-helper`) so it is identifiable later.
+5. Set the **Permission** to **Admin**.
+6. Click **Create**.
+7. Copy both the **Client ID** and **Client Secret** immediately and store them somewhere secure — the secret is displayed only once and cannot be retrieved again. If lost, you must delete the credential and create a new one.
+
+Once copied, fill in all three secrets in `setup_prerequisites.sql`:
+
+```sql
+CREATE SECRET IF NOT EXISTS sigma_base_url
+  TYPE          = GENERIC_STRING
+  SECRET_STRING = 'https://api.eu.aws.sigmacomputing.com';  -- your cloud/region URL
+
+CREATE SECRET IF NOT EXISTS sigma_client_id
+  TYPE          = GENERIC_STRING
+  SECRET_STRING = '<YOUR_SIGMA_CLIENT_ID>';      -- paste Client ID here
+
+CREATE SECRET IF NOT EXISTS sigma_client_secret
+  TYPE          = GENERIC_STRING
+  SECRET_STRING = '<YOUR_SIGMA_CLIENT_SECRET>';  -- paste Client Secret here
+```
+
+> **Note:** Client credentials authenticate as a service identity, not as an individual user. Actions taken via the API using these credentials will be attributed to the credential owner in Sigma audit logs. Using a dedicated named credential (rather than a personal one) makes it easier to identify and rotate if needed.
+
+Full instructions: [Generate client credentials](https://help.sigmacomputing.com/reference/generate-client-credentials)
+
+### Sigma API base URL
+
+The `SIGMA_BASE_URL` in each procedure depends on the cloud and region your Sigma organisation is hosted on:
+
+| Cloud / Region | Base URL |
+|---|---|
+| AWS US | `https://aws-api.sigmacomputing.com` |
+| AWS EU | `https://api.eu.aws.sigmacomputing.com` |
+| Azure US | `https://api.us.azure.sigmacomputing.com` |
+| GCP US | `https://api.us.gcp.sigmacomputing.com` |
+
+See [Sigma API getting started](https://help.sigmacomputing.com/reference/get-started-sigma-api) for the full list. The base URL is stored as the `sigma_base_url` secret in `setup_prerequisites.sql` — the same host used in the network rule, so it only needs to be set in one place.
+
+### Credential storage — Snowflake Secrets (recommended)
+
+Credentials are stored as Snowflake Secrets and read at runtime via `_snowflake.get_generic_secret_string()`. They are never embedded in procedure source code, visible in query history, or exposed in version control. `setup_prerequisites.sql` creates the secrets and grants the necessary permissions.
+
+---
+
 ## Setup
 
 ### 1. Run `setup_prerequisites.sql` (ACCOUNTADMIN — once only)
@@ -174,69 +236,7 @@ Six high-level queries combining all three output tables for an org-wide migrati
 |---|---|
 | **1. Dataset migration progress** | Total datasets, counts and % by status (`migrated` / `not-migrated` / `not-required`), breakdown by graph role (ROOT / INTERNAL / LEAF), and terminal dataset counts |
 | **2. Workbook migration summary** | Total workbooks and counts by `MIGRATION_STATUS`, plus aggregate legacy dataset source counts across the org |
-| **3. Terminal datasets** | Datasets with `DOWNSTREAM_CHILD_COUNT = 0` — nothing else depends on them. Classified as: `EASY WIN` (not migrated, no workbook usage), `MIGRATE` (not migrated but workbooks use it), `RE-POINT` (migrated but workbooks still reference the legacy dataset), `DONE`, or `ORPHANED` |
+| **3. Terminal datasets** | Datasets with no downstream dataset dependants AND no workbook references. Classified as: `EASY WIN` (not migrated, truly isolated), `DONE` (migrated, nothing left to do), or `ORPHANED` (not-required, unused) |
 | **4. Datasets needing immediate action** | Two sub-queries: **(A) Child ahead of parent** — a child dataset's data model exists but the parent is still not-migrated (data integrity risk); **(B) Blocking chains** — not-migrated datasets that are directly blocking other not-migrated datasets |
 | **5. Workbooks needing re-pointing** | Workbooks still sourcing from a legacy dataset that has already been migrated — the workbook source needs updating to the data model |
 | **6. Migration readiness pipeline** | Every not-migrated dataset classified as `READY` (all parents migrated, can go now) or `BLOCKED by N parent(s)`, sorted by downstream impact so you know which READY datasets to prioritise |
-
----
-
-## Prerequisites
-
-### Snowflake
-
-- Role with `CREATE PROCEDURE`, `CREATE TABLE`, `USAGE ON INTEGRATION`, and `READ ON SECRET` privileges
-- `ACCOUNTADMIN` access to run `setup_prerequisites.sql` (one-time)
-
-### Sigma API credentials
-
-You will need **Admin** access to your Sigma organisation to generate API credentials.
-
-**Admin scope is required** for this toolkit. Both stored procedures use `skipPermissionCheck=true` on the datasets and workbooks list endpoints — without Admin credentials, these calls return only content owned by the API user rather than the full org, producing incomplete results.
-
-#### Generating credentials
-
-1. In Sigma, open the left navigation and go to **Administration**.
-2. Select **Developer Access** from the Administration menu.
-3. Under **Client Credentials**, click **Create New**.
-4. Enter a descriptive name (e.g. `dataset-migrate-helper`) so it is identifiable later.
-5. Set the **Permission** to **Admin**.
-6. Click **Create**.
-7. Copy both the **Client ID** and **Client Secret** immediately and store them somewhere secure — the secret is displayed only once and cannot be retrieved again. If lost, you must delete the credential and create a new one.
-
-Once copied, fill in all three secrets in `setup_prerequisites.sql`:
-
-```sql
-CREATE SECRET IF NOT EXISTS sigma_base_url
-  TYPE          = GENERIC_STRING
-  SECRET_STRING = 'https://api.eu.aws.sigmacomputing.com';  -- your cloud/region URL
-
-CREATE SECRET IF NOT EXISTS sigma_client_id
-  TYPE          = GENERIC_STRING
-  SECRET_STRING = '<YOUR_SIGMA_CLIENT_ID>';      -- paste Client ID here
-
-CREATE SECRET IF NOT EXISTS sigma_client_secret
-  TYPE          = GENERIC_STRING
-  SECRET_STRING = '<YOUR_SIGMA_CLIENT_SECRET>';  -- paste Client Secret here
-```
-
-> **Note:** Client credentials authenticate as a service identity, not as an individual user. Actions taken via the API using these credentials will be attributed to the credential owner in Sigma audit logs. Using a dedicated named credential (rather than a personal one) makes it easier to identify and rotate if needed.
-
-Full instructions: [Generate client credentials](https://help.sigmacomputing.com/reference/generate-client-credentials)
-
-### Sigma API base URL
-
-The `SIGMA_BASE_URL` in each procedure depends on the cloud and region your Sigma organisation is hosted on:
-
-| Cloud / Region | Base URL |
-|---|---|
-| AWS US | `https://aws-api.sigmacomputing.com` |
-| AWS EU | `https://api.eu.aws.sigmacomputing.com` |
-| Azure US | `https://api.us.azure.sigmacomputing.com` |
-| GCP US | `https://api.us.gcp.sigmacomputing.com` |
-
-See [Sigma API getting started](https://help.sigmacomputing.com/reference/get-started-sigma-api) for the full list. The base URL is stored as the `sigma_base_url` secret in `setup_prerequisites.sql` — the same host used in the network rule, so it only needs to be set in one place.
-
-### Credential storage — Snowflake Secrets (recommended)
-
-Credentials are stored as Snowflake Secrets and read at runtime via `_snowflake.get_generic_secret_string()`. They are never embedded in procedure source code, visible in query history, or exposed in version control. `setup_prerequisites.sql` creates the secrets and grants the necessary permissions.
