@@ -59,3 +59,7 @@ Thumbs.db
 target/
 dbt_packages/
 logs/
+
+# Claude Code — local personal settings and worktree state
+.claude/settings.local.json
+.claude/worktrees/

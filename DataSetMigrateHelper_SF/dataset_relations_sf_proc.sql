@@ -166,6 +166,30 @@ def get_data_model(token_mgr, data_model_id):
     headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
     return _get_with_backoff(url, headers=headers).json()
 
+
+def list_connections(token_mgr):
+    """List all connections via GET /v2/connections."""
+    url = f"{SIGMA_BASE_URL}/v2/connections"
+    params = {"limit": 500}
+    connections = []
+    while True:
+        headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
+        body = _get_with_backoff(url, headers=headers, params=params).json()
+        connections.extend(body.get("entries", []))
+        next_token = body.get("nextPageToken") or body.get("nextPage")
+        if not next_token:
+            break
+        params["page"] = next_token
+    return connections
+
+
+def get_connection_path(token_mgr, inode_id):
+    """Get connection path for a table via GET /v2/connections/paths/{inodeId}.
+    Returns {connectionId, path: [db, schema, table]}. Errors if inodeId is not a table."""
+    url = f"{SIGMA_BASE_URL}/v2/connections/paths/{inode_id}"
+    headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
+    return _get_with_backoff(url, headers=headers).json()
+
 # ------------------------------------------------------------------------------
 # MAIN HANDLER
 # Snowflake calls this function. All processing logic lives here.
@@ -186,6 +210,10 @@ def main(session,
     # 1) Authenticate — validate credentials early so we fail fast on bad config
     token_mgr = SigmaTokenManager()
     token_mgr.get_token()
+
+    # Pre-fetch all connections so we can resolve connectionId -> name/type later
+    all_connections = list_connections(token_mgr)
+    connections_by_id = {c["connectionId"]: c for c in all_connections}
 
     # 2) List all datasets and data models
     all_data_models = list_data_models(token_mgr)
@@ -218,6 +246,8 @@ def main(session,
 
     # Graph: child dataset -> set of parent dataset IDs (direct upstream only)
     upstream = defaultdict(set)
+    # First table-type inodeId seen per dataset (used to resolve connection info)
+    dataset_table_inodes = {}
 
     # 3) Fetch sources for each dataset and record dataset->dataset edges
     for i, ds in enumerate(all_datasets, start=1):
@@ -234,8 +264,32 @@ def main(session,
                 parent_id = src.get("inodeId") or src.get("datasetId") or src.get("id")
                 if parent_id and parent_id in datasets_by_id:
                     upstream[ds_id].add(parent_id)
+            elif src.get("type") == "table" and ds_id not in dataset_table_inodes:
+                inode_id = src.get("inodeId")
+                if inode_id:
+                    dataset_table_inodes[ds_id] = inode_id
 
         time.sleep(API_CALL_DELAY_SECONDS)
+
+    # Resolve unique table inodeIds to connectionIds, then look up name/type
+    unique_inodes = set(dataset_table_inodes.values())
+    inode_to_connection_id = {}
+    for inode_id in unique_inodes:
+        try:
+            cp = get_connection_path(token_mgr, inode_id)
+            conn_id = cp.get("connectionId")
+            if conn_id:
+                inode_to_connection_id[inode_id] = conn_id
+        except requests.HTTPError:
+            pass
+        time.sleep(API_CALL_DELAY_SECONDS)
+
+    dataset_connection = {}
+    for ds_id, inode_id in dataset_table_inodes.items():
+        conn_id = inode_to_connection_id.get(inode_id)
+        if conn_id:
+            conn = connections_by_id.get(conn_id, {})
+            dataset_connection[ds_id] = (conn_id, conn.get("name"), conn.get("type"))
 
     # 4) Ensure target table exists
     session.sql(f"""
@@ -277,9 +331,22 @@ def main(session,
             -- UPSTREAM_PARENT_COUNT > 1  = MERGE point (depends on multiple parents)
             -- DOWNSTREAM_CHILD_COUNT > 1 = FORK point  (feeds multiple downstream datasets)
             UPSTREAM_PARENT_COUNT    NUMBER,
-            DOWNSTREAM_CHILD_COUNT   NUMBER
+            DOWNSTREAM_CHILD_COUNT   NUMBER,
+
+            -- Connection the dataset sources from (NULL for datasets that have no table sources)
+            CONNECTION_ID            STRING,
+            CONNECTION_NAME          STRING,
+            CONNECTION_TYPE          STRING
         )
     """).collect()
+
+    # Add new columns to existing tables (no-op if already present)
+    for col, dtype in [
+        ("CONNECTION_ID",   "STRING"),
+        ("CONNECTION_NAME", "STRING"),
+        ("CONNECTION_TYPE", "STRING"),
+    ]:
+        session.sql(f"ALTER TABLE {FQ_TABLE_SQL} ADD COLUMN IF NOT EXISTS {col} {dtype}").collect()
 
     if TRUNCATE_BEFORE_INSERT:
         session.sql(f"TRUNCATE TABLE {FQ_TABLE_SQL}").collect()
@@ -348,6 +415,7 @@ def main(session,
         )
 
     def make_row(run_id, now_ts, role, ds_id, ds_meta, parent_id, parent_meta):
+        conn_id, conn_name, conn_type = dataset_connection.get(ds_id, (None, None, None))
         return (
             # Run metadata
             run_id,
@@ -373,6 +441,10 @@ def main(session,
             # Crossover analysis
             upstream_parent_count.get(ds_id, 0),
             downstream_child_count.get(ds_id, 0),
+            # Connection
+            conn_id,
+            conn_name,
+            conn_type,
         )
 
     # Datasets with at least one upstream parent (INTERNAL or LEAF)
@@ -403,6 +475,7 @@ def main(session,
             "DATA_MODEL_CREATED_AT", "DATA_MODEL_UPDATED_AT",
             "PARENT_ID", "PARENT_NAME", "PARENT_MIGRATION_STATUS",
             "UPSTREAM_PARENT_COUNT", "DOWNSTREAM_CHILD_COUNT",
+            "CONNECTION_ID", "CONNECTION_NAME", "CONNECTION_TYPE",
         ]
         df = session.create_dataframe(rows, schema=schema_cols)
         df.write.mode("append").save_as_table(FQ_TABLE_SNOWPARK)
@@ -410,6 +483,8 @@ def main(session,
     return (
         f"datasets_found={len(all_datasets)} | "
         f"data_models_found={len(all_data_models)} | "
+        f"connections_found={len(all_connections)} | "
+        f"connections_resolved={len(dataset_connection)} | "
         f"root={len(root_rows)} | "
         f"internal={len(internal_rows)} | "
         f"leaf={len(leaf_rows)} | "

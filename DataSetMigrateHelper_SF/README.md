@@ -13,9 +13,14 @@ Sigma is deprecating Datasets in favour of Data Models. This toolkit uses the Si
 | `setup_prerequisites.sql` | One-time ACCOUNTADMIN setup — network rule, Snowflake Secrets, external access integration, and grants |
 | `dataset_relations_sf_proc.sql` | Snowflake stored procedure — builds the full dataset dependency graph into `SIGMA_DATASET_DEPENDENCIES` |
 | `workbook_source_map_sf_proc.sql` | Snowflake stored procedure — maps workbook sources against the dependency graph into summary and detail tables |
+| `artifact_grants_sf_proc.sql` | Snowflake stored procedure — fetches Sigma permission grants for every dataset, data model, and workbook into `SIGMA_ARTIFACT_GRANTS` |
 | `dataset_chains_pivoted.sql` | Analysis query — flattens ROOT → INTERNAL → LEAF chains into one row per path |
 | `crossover_analysis.sql` | Analysis queries — identifies fork points (one dataset feeds many) and merge points (one dataset pulls from many) |
 | `migration_overview.sql` | High-level dashboard queries — org-wide progress, terminal datasets, inconsistencies, re-pointing candidates, and migration readiness pipeline |
+| `views/V_NODES_DATA.sql` | Sigma-ready view — one row per node (dataset, workbook, data model) for graph visualisation |
+| `views/V_EDGES_DATA.sql` | Sigma-ready view — one row per edge (dependency relationship) for graph visualisation |
+| `views/V_CHAIN_SUMMARY.sql` | Sigma-ready view — one row per ROOT→LEAF chain path with migration status; use as a dropdown source in Sigma to drive graph filtering |
+| `views/V_CHAIN_MEMBERS.sql` | Sigma-ready view — one row per (chain path, node ID); join table between the chain picker and V_NODES_DATA to filter the graph by selected chain |
 
 ---
 
@@ -104,7 +109,11 @@ Run the `CREATE OR REPLACE PROCEDURE` statement from each procedure file in a Sn
 CALL sigma_dataset_dependencies('MY_DATABASE', 'MY_SCHEMA');
 
 CALL sigma_workbook_source_map('MY_DATABASE', 'MY_SCHEMA');
+
+CALL sigma_artifact_grants('MY_DATABASE', 'MY_SCHEMA');
 ```
+
+`sigma_artifact_grants()` must be called after the first two — it reads artifact IDs from their output tables.
 
 ---
 
@@ -128,6 +137,7 @@ Crawls all datasets org-wide via the Sigma API and writes one row per dataset-to
 | `PARENT_ID / NAME / PARENT_MIGRATION_STATUS` | Direct upstream dataset (NULL for ROOT rows) |
 | `UPSTREAM_PARENT_COUNT` | Number of direct parents (>1 = merge point) |
 | `DOWNSTREAM_CHILD_COUNT` | Number of direct children (>1 = fork point) |
+| `CONNECTION_ID / NAME / TYPE` | Warehouse connection the dataset sources from (NULL for datasets with no direct table sources) |
 
 **Parameters — pass at call time, no editing of the procedure required:**
 
@@ -213,6 +223,43 @@ CALL sigma_workbook_source_map('MY_DATABASE', 'MY_SCHEMA');
 
 ---
 
+### 3. `sigma_artifact_grants()` — `artifact_grants_sf_proc.sql`
+
+Fetches Sigma permission grants for every dataset, data model, and workbook in the latest run of the upstream tables. Artifact IDs are read directly from `SIGMA_DATASET_DEPENDENCIES` and `SIGMA_WORKBOOK_MIGRATION_SUMMARY` — no additional API list calls needed. Grants are fetched concurrently (`MAX_WORKERS = 10`) using `GET /v2/grants?inodeId=<ID>&directGrantsOnly=true`. Team and member display names are hydrated from a single pre-fetch of `/v2/teams` and `/v2/members`.
+
+**Parameters:**
+
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `TARGET_DATABASE` | Yes | — | Snowflake database where the output table will be written |
+| `TARGET_SCHEMA` | Yes | — | Snowflake schema where the output table will be written |
+| `DEPENDENCIES_TABLE` | No | `SIGMA_DATASET_DEPENDENCIES` | Source table from `sigma_dataset_dependencies()` |
+| `WORKBOOK_SUMMARY_TABLE` | No | `SIGMA_WORKBOOK_MIGRATION_SUMMARY` | Source table from `sigma_workbook_source_map()` |
+| `GRANTS_TABLE` | No | `SIGMA_ARTIFACT_GRANTS` | Output table name |
+| `TRUNCATE_BEFORE_INSERT` | No | `TRUE` | Snapshot mode (replace) vs append with new `RUN_ID` |
+
+**Example call:**
+
+```sql
+CALL sigma_artifact_grants('MY_DATABASE', 'MY_SCHEMA');
+```
+
+#### `SIGMA_ARTIFACT_GRANTS` — one row per artifact → grantee
+
+| Column | Description |
+|---|---|
+| `RUN_ID` | UUID for this execution — use to filter to the latest run |
+| `ARTIFACT_TYPE` | `dataset`, `datamodel`, or `workbook` |
+| `ARTIFACT_ID / NAME / PATH / URL` | Identity of the artifact |
+| `GRANTEE_TYPE` | `team` or `member` |
+| `GRANTEE_ID` | Team ID or member ID from Sigma |
+| `GRANTEE_NAME` | Resolved display name (team name, or member first + last name) |
+| `PERMISSION_LEVEL` | Permission level as returned by the Sigma API (e.g. `view`, `edit`, `explore`) |
+
+> **Note on `directGrantsOnly`:** The proc fetches only grants assigned directly to each artifact, not permissions inherited from parent folders. This reflects the explicit access control decisions made on each artifact and avoids inflating results with inherited folder-level access.
+
+---
+
 ## Analysis Queries
 
 ### `dataset_chains_pivoted.sql`
@@ -227,6 +274,24 @@ Two queries:
 
 - **Fork Points** — datasets with `DOWNSTREAM_CHILD_COUNT > 1`. High-priority migration targets: migrating (or failing to migrate) these affects multiple downstream datasets. Includes actionable `MIGRATION_GUIDANCE`.
 - **Merge Points** — datasets with `UPSTREAM_PARENT_COUNT > 1`. These are blocked until all parents are migrated. Includes `MIGRATION_READINESS` status.
+
+### `views/V_NODES_DATA.sql`
+
+Sigma-ready view combining datasets, workbooks, and data models into a single node list for graph visualisation. Dataset nodes include `UPSTREAM_PARENT_COUNT`, `DOWNSTREAM_CHILD_COUNT`, `IS_MERGE_POINT`, and `IS_FORK_POINT` for filter controls. Non-dataset node types have NULL for those columns.
+
+### `views/V_EDGES_DATA.sql`
+
+Sigma-ready view of all dependency edges — one row per dataset-to-dataset or dataset-to-workbook relationship.
+
+### `views/V_CHAIN_SUMMARY.sql`
+
+One row per unique ROOT→LEAF chain path. Columns: `ROOT_ID`, `ROOT_NAME`, `CHAIN_PATH` (e.g. `"A → B → C"`), `CHAIN_DEPTH`, `CHAIN_MIGRATION_STATUS` (`FULLY MIGRATED` / `PARTIALLY MIGRATED` / `NOT MIGRATED`). Use as a dropdown/list source in a Sigma workbook to let users pick a chain and drive graph filtering.
+
+### `views/V_CHAIN_MEMBERS.sql`
+
+Join table: one row per (chain path, node ID). Columns: `CHAIN_ROOT_ID`, `CHAIN_ROOT_NAME`, `CHAIN_PATH`, `CHAIN_MIGRATION_STATUS`, `NODE_ID`. A node shared by multiple chains appears once per chain. Use this view to connect a chain picker (sourced from `V_CHAIN_SUMMARY`) to the graph node source (`V_NODES_DATA`) — filter `V_CHAIN_MEMBERS` by the selected `CHAIN_PATH`, then join on `NODE_ID = node_id` to restrict the graph to only the nodes on that chain.
+
+---
 
 ### `migration_overview.sql`
 

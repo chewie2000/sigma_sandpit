@@ -11,7 +11,11 @@ SELECT DISTINCT
     RELATION_TYPE                             AS node_subtype,
     DATASET_MIGRATION_STATUS                  AS status,
     GREATEST(DOWNSTREAM_CHILD_COUNT + 10, 10) AS symbol_size,
-    DATASET_URL                               AS url
+    DATASET_URL                               AS url,
+    UPSTREAM_PARENT_COUNT,
+    DOWNSTREAM_CHILD_COUNT,
+    (UPSTREAM_PARENT_COUNT  > 1)              AS is_merge_point,
+    (DOWNSTREAM_CHILD_COUNT > 1)              AS is_fork_point
 FROM SIGMA_DATASET_DEPENDENCIES
 WHERE RUN_ID = (SELECT RUN_ID FROM latest_deps)
 
@@ -25,7 +29,11 @@ SELECT DISTINCT
     MIGRATION_STATUS AS node_subtype,
     MIGRATION_STATUS AS status,
     10               AS symbol_size,
-    WORKBOOK_URL     AS url
+    WORKBOOK_URL     AS url,
+    NULL             AS upstream_parent_count,
+    NULL             AS downstream_child_count,
+    NULL             AS is_merge_point,
+    NULL             AS is_fork_point
 FROM SIGMA_WORKBOOK_MIGRATION_SUMMARY
 WHERE RUN_ID = (SELECT RUN_ID FROM latest_wb)
 
@@ -40,7 +48,11 @@ SELECT DISTINCT
     'MIGRATED'                                                         AS node_subtype,
     'MIGRATED'                                                         AS status,
     GREATEST(COUNT(*) OVER (PARTITION BY DATA_MODEL_ID) + 10, 15)     AS symbol_size,
-    DATA_MODEL_URL                                                     AS url
+    DATA_MODEL_URL                                                     AS url,
+    NULL                                                               AS upstream_parent_count,
+    NULL                                                               AS downstream_child_count,
+    NULL                                                               AS is_merge_point,
+    NULL                                                               AS is_fork_point
 FROM SIGMA_DATASET_DEPENDENCIES
 WHERE RUN_ID  = (SELECT RUN_ID FROM latest_deps)
   AND DATA_MODEL_ID IS NOT NULL;

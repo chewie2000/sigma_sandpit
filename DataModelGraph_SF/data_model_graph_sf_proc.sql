@@ -173,6 +173,30 @@ def get_data_model_sources(token_mgr, dm_id):
         return body
     return body.get("entries", body.get("sources", []))
 
+
+def list_connections(token_mgr):
+    """List all connections via GET /v2/connections."""
+    url    = f"{SIGMA_BASE_URL}/v2/connections"
+    params = {"limit": 500}
+    connections = []
+    while True:
+        headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
+        body    = _get_with_backoff(url, headers=headers, params=params).json()
+        connections.extend(body.get("entries", []))
+        next_token = body.get("nextPageToken") or body.get("nextPage")
+        if not next_token:
+            break
+        params["page"] = next_token
+    return connections
+
+
+def get_connection_path(token_mgr, inode_id):
+    """Get connection path for a table via GET /v2/connections/paths/{inodeId}.
+    Returns {connectionId, path: [db, schema, table]}. Errors if inodeId is not a table."""
+    url     = f"{SIGMA_BASE_URL}/v2/connections/paths/{inode_id}"
+    headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
+    return _get_with_backoff(url, headers=headers).json()
+
 # ------------------------------------------------------------------------------
 # HELPERS
 # ------------------------------------------------------------------------------
@@ -204,14 +228,19 @@ def main(session,
     token_mgr = SigmaTokenManager()
     token_mgr.get_token()
 
+    # Pre-fetch all connections so we can resolve connectionId -> name/type later
+    all_connections   = list_connections(token_mgr)
+    connections_by_id = {c["connectionId"]: c for c in all_connections}
+
     # 2) List all data models
     all_data_models    = list_data_models(token_mgr)
     data_models_by_id  = {dm["dataModelId"]: dm for dm in all_data_models}
 
     # 3) Fetch sources for each data model concurrently
     #    upstream[dm_id] = set of parent data model IDs (data-model-type sources only)
-    upstream     = defaultdict(set)
-    fetch_errors = 0
+    upstream        = defaultdict(set)
+    dm_table_inodes = {}  # dm_id -> first table-type inodeId (for connection resolution)
+    fetch_errors    = 0
 
     def fetch_sources(dm):
         dm_id = dm["dataModelId"]
@@ -234,6 +263,10 @@ def main(session,
                 parent_id = src.get("dataModelId") or src.get("id")
                 if src_type == "data-model" and parent_id:
                     upstream[dm_id].add(parent_id)
+                elif src_type == "table" and dm_id not in dm_table_inodes:
+                    inode_id = src.get("inodeId")
+                    if inode_id:
+                        dm_table_inodes[dm_id] = inode_id
 
     # 4) Some parent data models may not appear in the list response (e.g. owned
     #    by a different user). Fetch them individually so the graph is complete.
@@ -246,6 +279,25 @@ def main(session,
         except Exception:
             # Insert a stub so every referenced ID has an entry in the lookup
             data_models_by_id[dm_id] = {"dataModelId": dm_id}
+
+    # 4b) Resolve table inodeIds to connection info (sequential to respect rate limits)
+    unique_inodes        = set(dm_table_inodes.values())
+    inode_to_conn_id     = {}
+    for inode_id in unique_inodes:
+        try:
+            cp      = get_connection_path(token_mgr, inode_id)
+            conn_id = cp.get("connectionId")
+            if conn_id:
+                inode_to_conn_id[inode_id] = conn_id
+        except Exception:
+            pass
+
+    dm_connection = {}
+    for dm_id, inode_id in dm_table_inodes.items():
+        conn_id = inode_to_conn_id.get(inode_id)
+        if conn_id:
+            conn = connections_by_id.get(conn_id, {})
+            dm_connection[dm_id] = (conn_id, conn.get("name"), conn.get("type"))
 
     # 5) Compute graph topology
     all_parents_set  = {pid for pids in upstream.values() for pid in pids}
@@ -304,9 +356,22 @@ def main(session,
             -- Direct upstream parent (NULL for ROOT rows)
             PARENT_DATA_MODEL_ID      STRING,
             PARENT_DATA_MODEL_NAME    STRING,
-            PARENT_DATA_MODEL_PATH    STRING
+            PARENT_DATA_MODEL_PATH    STRING,
+
+            -- Connection the data model sources from (NULL for data models with no table sources)
+            CONNECTION_ID             STRING,
+            CONNECTION_NAME           STRING,
+            CONNECTION_TYPE           STRING
         )
     """).collect()
+
+    # Add new columns to existing tables (no-op if already present)
+    for col, dtype in [
+        ("CONNECTION_ID",   "STRING"),
+        ("CONNECTION_NAME", "STRING"),
+        ("CONNECTION_TYPE", "STRING"),
+    ]:
+        session.sql(f"ALTER TABLE {FQ_TABLE_SQL} ADD COLUMN IF NOT EXISTS {col} {dtype}").collect()
 
     if TRUNCATE_BEFORE_INSERT:
         session.sql(f"TRUNCATE TABLE {FQ_TABLE_SQL}").collect()
@@ -323,9 +388,11 @@ def main(session,
         "DATA_MODEL_CREATED_AT", "DATA_MODEL_UPDATED_AT",
         "UPSTREAM_PARENT_COUNT", "DOWNSTREAM_CHILD_COUNT",
         "PARENT_DATA_MODEL_ID", "PARENT_DATA_MODEL_NAME", "PARENT_DATA_MODEL_PATH",
+        "CONNECTION_ID", "CONNECTION_NAME", "CONNECTION_TYPE",
     ]
 
     def make_row(dm_id, dm_meta, parent_id, parent_meta):
+        conn_id, conn_name, conn_type = dm_connection.get(dm_id, (None, None, None))
         return (
             run_id,
             now_ts,
@@ -341,6 +408,9 @@ def main(session,
             parent_id,
             parent_meta.get("name") if parent_meta else None,
             parent_meta.get("path") if parent_meta else None,
+            conn_id,
+            conn_name,
+            conn_type,
         )
 
     # INTERNAL and LEAF: one row per upstream parent edge
@@ -366,6 +436,8 @@ def main(session,
 
     return (
         f"data_models_found={len(all_data_models)} | "
+        f"connections_found={len(all_connections)} | "
+        f"connections_resolved={len(dm_connection)} | "
         f"root={len(root_rows)} | "
         f"internal={len(internal_rows)} | "
         f"leaf={len(leaf_rows)} | "
