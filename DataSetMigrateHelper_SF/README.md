@@ -255,8 +255,9 @@ CALL sigma_artifact_grants('MY_DATABASE', 'MY_SCHEMA');
 | `GRANTEE_ID` | Team ID or member ID from Sigma |
 | `GRANTEE_NAME` | Resolved display name (team name, or member first + last name) |
 | `PERMISSION_LEVEL` | Permission level as returned by the Sigma API (e.g. `view`, `edit`, `explore`) |
+| `IS_DIRECT_GRANT` | `TRUE` if the grant is set directly on this artifact; `FALSE` if inherited from a parent folder or workspace |
 
-> **Note on grant scope:** The proc fetches all effective grants per artifact, including permissions inherited from parent folders. This gives a complete picture of who can access each artifact rather than just the subset with explicit direct grants.
+> **Note on grant scope:** The proc makes two API calls per artifact — one for all effective grants (including inherited) and one for direct-only grants. All grants are written to the table; `IS_DIRECT_GRANT` distinguishes grants set explicitly on the artifact from those inherited from a parent folder or workspace.
 
 ---
 

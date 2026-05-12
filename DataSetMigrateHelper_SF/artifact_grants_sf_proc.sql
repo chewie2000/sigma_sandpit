@@ -153,14 +153,17 @@ def list_members(token_mgr):
     return members
 
 
-def get_grants(token_mgr, inode_id):
+def get_grants(token_mgr, inode_id, direct_only=False):
     """
-    Fetch all direct grants for a single artifact via GET /v2/grants.
-    Returns all effective grants including those inherited from parent folders.
+    Fetch grants for a single artifact via GET /v2/grants.
+    direct_only=True returns only grants assigned directly to the artifact;
+    direct_only=False (default) returns all effective grants including inherited.
     Paginated with limit=1000 (API maximum).
     """
     url    = f"{SIGMA_BASE_URL}/v2/grants"
     params = {"inodeId": inode_id, "limit": 1000}
+    if direct_only:
+        params["directGrantsOnly"] = "true"
     grants = []
     while True:
         headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
@@ -272,9 +275,15 @@ def main(session,
             GRANTEE_NAME     STRING,
 
             -- What level of access they have
-            PERMISSION_LEVEL STRING
+            PERMISSION_LEVEL STRING,
+
+            -- TRUE = grant is set directly on this artifact;
+            -- FALSE = grant is inherited from a parent folder/workspace
+            IS_DIRECT_GRANT  BOOLEAN
         )
     """).collect()
+
+    session.sql(f"ALTER TABLE {FQ_GRANTS_SQL} ADD COLUMN IF NOT EXISTS IS_DIRECT_GRANT BOOLEAN").collect()
 
     if TRUNCATE_BEFORE_INSERT:
         session.sql(f"TRUNCATE TABLE {FQ_GRANTS_SQL}").collect()
@@ -284,12 +293,23 @@ def main(session,
     now_ts = datetime.now(timezone.utc).replace(tzinfo=None)
 
     def fetch_grants(artifact_type, artifact_id, artifact_name, artifact_path, artifact_url):
-        """Fetch grants for a single artifact. Runs in a thread pool worker."""
+        """
+        Fetch all grants and direct-only grants for a single artifact.
+        Two API calls per artifact: one for all effective grants, one for direct-only.
+        The direct-only set is used to populate IS_DIRECT_GRANT on each row.
+        Runs in a thread pool worker.
+        """
         try:
-            grants = get_grants(token_mgr, artifact_id)
-            return artifact_type, artifact_id, artifact_name, artifact_path, artifact_url, grants, None
+            all_grants    = get_grants(token_mgr, artifact_id, direct_only=False)
+            direct_grants = get_grants(token_mgr, artifact_id, direct_only=True)
+            direct_ids = {
+                g.get("teamId") or g.get("memberId") or g.get("userId")
+                for g in direct_grants
+                if g.get("teamId") or g.get("memberId") or g.get("userId")
+            }
+            return artifact_type, artifact_id, artifact_name, artifact_path, artifact_url, all_grants, direct_ids, None
         except requests.HTTPError as e:
-            return artifact_type, artifact_id, artifact_name, artifact_path, artifact_url, [], e
+            return artifact_type, artifact_id, artifact_name, artifact_path, artifact_url, [], set(), e
 
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -305,7 +325,7 @@ def main(session,
     failed = 0
     artifacts_with_grants = 0
 
-    for artifact_type, artifact_id, artifact_name, artifact_path, artifact_url, grants, error in results:
+    for artifact_type, artifact_id, artifact_name, artifact_path, artifact_url, grants, direct_ids, error in results:
         if error:
             failed += 1
             continue
@@ -352,6 +372,7 @@ def main(session,
                 grantee_id,
                 grantee_name,
                 permission_level,
+                grantee_id in direct_ids,   # IS_DIRECT_GRANT
             ))
 
     # 7) Write to Snowflake
@@ -361,6 +382,7 @@ def main(session,
             "ARTIFACT_TYPE", "ARTIFACT_ID", "ARTIFACT_NAME", "ARTIFACT_PATH", "ARTIFACT_URL",
             "GRANTEE_TYPE", "GRANTEE_ID", "GRANTEE_NAME",
             "PERMISSION_LEVEL",
+            "IS_DIRECT_GRANT",
         ]
         session.create_dataframe(rows, schema=schema_cols) \
                .write.mode("append").save_as_table(FQ_GRANTS_SNOWPARK)
@@ -370,6 +392,7 @@ def main(session,
     workbook_grants  = sum(1 for r in rows if r[2] == "workbook")
     team_grants      = sum(1 for r in rows if r[7] == "team")
     member_grants    = sum(1 for r in rows if r[7] == "member")
+    direct_grants    = sum(1 for r in rows if r[11])
 
     return (
         f"artifacts_queried={len(artifacts)} | "
@@ -384,6 +407,7 @@ def main(session,
         f"workbook_grants={workbook_grants} | "
         f"team_grants={team_grants} | "
         f"member_grants={member_grants} | "
+        f"direct_grants={direct_grants} | "
         f"total_rows_inserted={len(rows)} | "
         f"failed_calls={failed} | "
         f"run_id={run_id}"
