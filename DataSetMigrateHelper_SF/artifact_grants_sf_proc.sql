@@ -156,12 +156,11 @@ def list_members(token_mgr):
 def get_grants(token_mgr, inode_id):
     """
     Fetch all direct grants for a single artifact via GET /v2/grants.
-    directGrantsOnly=true returns grants assigned directly to this artifact
-    rather than inherited from parent folders.
+    Returns all effective grants including those inherited from parent folders.
     Paginated with limit=1000 (API maximum).
     """
     url    = f"{SIGMA_BASE_URL}/v2/grants"
-    params = {"inodeId": inode_id, "directGrantsOnly": "true", "limit": 1000}
+    params = {"inodeId": inode_id, "limit": 1000}
     grants = []
     while True:
         headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}

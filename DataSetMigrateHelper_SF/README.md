@@ -256,7 +256,7 @@ CALL sigma_artifact_grants('MY_DATABASE', 'MY_SCHEMA');
 | `GRANTEE_NAME` | Resolved display name (team name, or member first + last name) |
 | `PERMISSION_LEVEL` | Permission level as returned by the Sigma API (e.g. `view`, `edit`, `explore`) |
 
-> **Note on `directGrantsOnly`:** The proc fetches only grants assigned directly to each artifact, not permissions inherited from parent folders. This reflects the explicit access control decisions made on each artifact and avoids inflating results with inherited folder-level access.
+> **Note on grant scope:** The proc fetches all effective grants per artifact, including permissions inherited from parent folders. This gives a complete picture of who can access each artifact rather than just the subset with explicit direct grants.
 
 ---
 
