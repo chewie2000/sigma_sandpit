@@ -139,6 +139,22 @@ def list_workbooks(token_mgr):
     return workbooks
 
 
+def list_members(token_mgr):
+    """List all members org-wide via GET /v2/members."""
+    url     = f"{SIGMA_BASE_URL}/v2/members"
+    params  = {"limit": 500}
+    members = []
+    while True:
+        headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
+        body = _get_with_backoff(url, headers=headers, params=params).json()
+        members.extend(body.get("entries", []))
+        next_page = body.get("nextPage") or body.get("nextPageToken")
+        if not next_page:
+            break
+        params["page"] = next_page
+    return members
+
+
 def get_workbook_sources(token_mgr, workbook_id):
     """Get all sources for a single workbook via GET /v2/workbooks/{id}/sources."""
     url = f"{SIGMA_BASE_URL}/v2/workbooks/{workbook_id}/sources"

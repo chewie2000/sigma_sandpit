@@ -190,6 +190,22 @@ def get_connection_path(token_mgr, inode_id):
     headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
     return _get_with_backoff(url, headers=headers).json()
 
+
+def list_members(token_mgr):
+    """List all members org-wide via GET /v2/members."""
+    url     = f"{SIGMA_BASE_URL}/v2/members"
+    params  = {"limit": 500}
+    members = []
+    while True:
+        headers = {"Authorization": f"Bearer {token_mgr.get_token()}"}
+        body = _get_with_backoff(url, headers=headers, params=params).json()
+        members.extend(body.get("entries", []))
+        next_page = body.get("nextPage") or body.get("nextPageToken")
+        if not next_page:
+            break
+        params["page"] = next_page
+    return members
+
 # ------------------------------------------------------------------------------
 # MAIN HANDLER
 # Snowflake calls this function. All processing logic lives here.
@@ -210,6 +226,23 @@ def main(session,
     # 1) Authenticate — validate credentials early so we fail fast on bad config
     token_mgr = SigmaTokenManager()
     token_mgr.get_token()
+
+    # Pre-fetch all members for UID -> display name resolution
+    all_members = list_members(token_mgr)
+    members_by_id = {}
+    for m in all_members:
+        uid = (m.get("memberId") or "").strip().lower()
+        if uid:
+            first = m.get("firstName", "")
+            last  = m.get("lastName",  "")
+            full  = f"{first} {last}".strip()
+            members_by_id[uid] = full or m.get("email") or m.get("name")
+
+    def resolve_name(uid):
+        """Resolve a Sigma member UID to a display name, or return None."""
+        if not uid:
+            return None
+        return members_by_id.get(uid.strip().lower())
 
     # Pre-fetch all connections so we can resolve connectionId -> name/type later
     all_connections = list_connections(token_mgr)
@@ -336,15 +369,23 @@ def main(session,
             -- Connection the dataset sources from (NULL for datasets that have no table sources)
             CONNECTION_ID            STRING,
             CONNECTION_NAME          STRING,
-            CONNECTION_TYPE          STRING
+            CONNECTION_TYPE          STRING,
+
+            -- Resolved display names for UID-only person fields
+            DATASET_CREATED_BY_NAME  STRING,
+            DATASET_OWNER_NAME       STRING,
+            MIGRATED_BY_NAME         STRING
         )
     """).collect()
 
     # Add new columns to existing tables (no-op if already present)
     for col, dtype in [
-        ("CONNECTION_ID",   "STRING"),
-        ("CONNECTION_NAME", "STRING"),
-        ("CONNECTION_TYPE", "STRING"),
+        ("CONNECTION_ID",            "STRING"),
+        ("CONNECTION_NAME",          "STRING"),
+        ("CONNECTION_TYPE",          "STRING"),
+        ("DATASET_CREATED_BY_NAME",  "STRING"),
+        ("DATASET_OWNER_NAME",       "STRING"),
+        ("MIGRATED_BY_NAME",         "STRING"),
     ]:
         session.sql(f"ALTER TABLE {FQ_TABLE_SQL} ADD COLUMN IF NOT EXISTS {col} {dtype}").collect()
 
@@ -396,10 +437,7 @@ def main(session,
     def migration_fields(ds_meta):
         """Return (MIGRATED_AT, MIGRATED_BY) from migrationToDataModel."""
         mig = ds_meta.get("migrationToDataModel") or {}
-        return (
-            parse_ts(mig.get("migratedAt")),
-            mig.get("migratedBy"),
-        )
+        return parse_ts(mig.get("migratedAt")), mig.get("migratedBy")
 
     def data_model_fields(ds_meta):
         """Return 6 data model attribute columns, looked up from data_models_by_id."""
@@ -416,6 +454,9 @@ def main(session,
 
     def make_row(run_id, now_ts, role, ds_id, ds_meta, parent_id, parent_meta):
         conn_id, conn_name, conn_type = dataset_connection.get(ds_id, (None, None, None))
+        created_by = ds_meta.get("createdBy")
+        owner_uid  = ds_meta.get("owner")
+        migrated_at, migrated_by = migration_fields(ds_meta)
         return (
             # Run metadata
             run_id,
@@ -427,11 +468,12 @@ def main(session,
             ds_meta.get("name", ds_id),
             ds_meta.get("path"),
             ds_meta.get("url"),
-            ds_meta.get("createdBy"),
-            ds_meta.get("owner"),
+            created_by,
+            owner_uid,
             ds_meta.get("migrationStatus"),
             # Migration event
-            *migration_fields(ds_meta),
+            migrated_at,
+            migrated_by,
             # Data model attributes
             *data_model_fields(ds_meta),
             # Parent dataset
@@ -445,6 +487,10 @@ def main(session,
             conn_id,
             conn_name,
             conn_type,
+            # Resolved display names (must be last — Snowpark positional mapping)
+            resolve_name(created_by),
+            resolve_name(owner_uid),
+            resolve_name(migrated_by),
         )
 
     # Datasets with at least one upstream parent (INTERNAL or LEAF)
@@ -476,6 +522,7 @@ def main(session,
             "PARENT_ID", "PARENT_NAME", "PARENT_MIGRATION_STATUS",
             "UPSTREAM_PARENT_COUNT", "DOWNSTREAM_CHILD_COUNT",
             "CONNECTION_ID", "CONNECTION_NAME", "CONNECTION_TYPE",
+            "DATASET_CREATED_BY_NAME", "DATASET_OWNER_NAME", "MIGRATED_BY_NAME",
         ]
         df = session.create_dataframe(rows, schema=schema_cols)
         df.write.mode("append").save_as_table(FQ_TABLE_SNOWPARK)
@@ -485,6 +532,7 @@ def main(session,
         f"data_models_found={len(all_data_models)} | "
         f"connections_found={len(all_connections)} | "
         f"connections_resolved={len(dataset_connection)} | "
+        f"members_resolved={len(members_by_id)} | "
         f"root={len(root_rows)} | "
         f"internal={len(internal_rows)} | "
         f"leaf={len(leaf_rows)} | "
