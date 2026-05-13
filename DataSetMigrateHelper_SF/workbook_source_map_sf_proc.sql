@@ -256,6 +256,22 @@ def main(session,
     token_mgr = SigmaTokenManager()
     token_mgr.get_token()
 
+    # Pre-fetch all members for MIGRATED_BY UID -> display name resolution
+    all_members = list_members(token_mgr)
+    members_by_id = {}
+    for m in all_members:
+        uid = (m.get("memberId") or "").strip().lower()
+        if uid:
+            first = m.get("firstName", "")
+            last  = m.get("lastName",  "")
+            full  = f"{first} {last}".strip()
+            members_by_id[uid] = full or m.get("email") or m.get("name")
+
+    def resolve_name(uid):
+        if not uid:
+            return None
+        return members_by_id.get(uid.strip().lower())
+
     # 2) Load migration-scope lookups from SIGMA_DATASET_DEPENDENCIES
     datasets_by_id, data_models_by_id = load_dependency_lookups(session, FQ_DEPS_SQL)
     known_dataset_ids    = set(datasets_by_id.keys())
@@ -327,9 +343,14 @@ def main(session,
             DATA_MODEL_URL           STRING,
             DATA_MODEL_PATH          STRING,
             UPSTREAM_PARENT_COUNT    NUMBER,
-            DOWNSTREAM_CHILD_COUNT   NUMBER
+            DOWNSTREAM_CHILD_COUNT   NUMBER,
+
+            -- Resolved display name for MIGRATED_BY UID
+            MIGRATED_BY_NAME         STRING
         )
     """).collect()
+
+    session.sql(f"ALTER TABLE {FQ_DETAILS_SQL} ADD COLUMN IF NOT EXISTS MIGRATED_BY_NAME STRING").collect()
 
     if TRUNCATE_BEFORE_INSERT:
         session.sql(f"TRUNCATE TABLE {FQ_SUMMARY_SQL}").collect()
@@ -421,6 +442,8 @@ def main(session,
                     dep_row.get("DATA_MODEL_PATH"),
                     dep_row.get("UPSTREAM_PARENT_COUNT"),
                     dep_row.get("DOWNSTREAM_CHILD_COUNT"),
+                    # Resolved display name (must be last — Snowpark positional mapping)
+                    resolve_name(dep_row.get("MIGRATED_BY")),
                 ))
 
         # Only include workbooks that have at least one migration-scope source
@@ -479,6 +502,7 @@ def main(session,
             "MIGRATED_AT", "MIGRATED_BY",
             "DATA_MODEL_ID", "DATA_MODEL_NAME", "DATA_MODEL_URL", "DATA_MODEL_PATH",
             "UPSTREAM_PARENT_COUNT", "DOWNSTREAM_CHILD_COUNT",
+            "MIGRATED_BY_NAME",
         ]
         session.create_dataframe(detail_rows, schema=detail_cols) \
                .write.mode("append").save_as_table(FQ_DETAILS_SNOWPARK)
@@ -496,6 +520,7 @@ def main(session,
         f"source_relationships={len(detail_rows)} | "
         f"datasets_loaded={len(datasets_by_id)} | "
         f"data_models_loaded={len(data_models_by_id)} | "
+        f"members_resolved={len(members_by_id)} | "
         f"failed_source_calls={failed} | "
         f"run_id={run_id}"
     )
