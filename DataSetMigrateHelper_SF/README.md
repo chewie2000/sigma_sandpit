@@ -11,9 +11,9 @@ Sigma is deprecating Datasets in favour of Data Models. This toolkit uses the Si
 | File | Purpose |
 |---|---|
 | `setup_prerequisites.sql` | One-time ACCOUNTADMIN setup — network rule, Snowflake Secrets, external access integration, and grants |
-| `dataset_relations_sf_proc.sql` | Snowflake stored procedure — builds the full dataset dependency graph into `SIGMA_DATASET_DEPENDENCIES` |
-| `workbook_source_map_sf_proc.sql` | Snowflake stored procedure — maps workbook sources against the dependency graph into summary and detail tables |
-| `artifact_grants_sf_proc.sql` | Snowflake stored procedure — fetches Sigma permission grants for every dataset, data model, and workbook into `SIGMA_ARTIFACT_GRANTS` |
+| `procs/sigma_dataset_dependencies.sql` | Snowflake stored procedure — builds the full dataset dependency graph into `SIGMA_DATASET_DEPENDENCIES` |
+| `procs/sigma_workbook_source_map.sql` | Snowflake stored procedure — maps workbook sources against the dependency graph into summary and detail tables |
+| `procs/sigma_artifact_grants.sql` | Snowflake stored procedure — fetches Sigma permission grants for every dataset, data model, and workbook into `SIGMA_ARTIFACT_GRANTS` |
 | `dataset_chains_pivoted.sql` | Analysis query — flattens ROOT → INTERNAL → LEAF chains into one row per path |
 | `crossover_analysis.sql` | Analysis queries — identifies fork points (one dataset feeds many) and merge points (one dataset pulls from many) |
 | `migration_overview.sql` | High-level dashboard queries — org-wide progress, terminal datasets, inconsistencies, re-pointing candidates, and migration readiness pipeline |
@@ -119,7 +119,7 @@ CALL sigma_artifact_grants('MY_DATABASE', 'MY_SCHEMA');
 
 ## Stored Procedures
 
-### 1. `sigma_dataset_dependencies()` — `dataset_relations_sf_proc.sql`
+### 1. `sigma_dataset_dependencies()` — `procs/sigma_dataset_dependencies.sql`
 
 Crawls all datasets org-wide via the Sigma API and writes one row per dataset-to-parent relationship into `SIGMA_DATASET_DEPENDENCIES`.
 
@@ -160,7 +160,7 @@ CALL sigma_dataset_dependencies('MY_DATABASE', 'MY_SCHEMA');
 
 ---
 
-### 2. `sigma_workbook_source_map()` — `workbook_source_map_sf_proc.sql`
+### 2. `sigma_workbook_source_map()` — `procs/sigma_workbook_source_map.sql`
 
 Scans all workbooks org-wide, resolves each source against `SIGMA_DATASET_DEPENDENCIES`, and writes migration status per workbook.
 
@@ -223,7 +223,7 @@ CALL sigma_workbook_source_map('MY_DATABASE', 'MY_SCHEMA');
 
 ---
 
-### 3. `sigma_artifact_grants()` — `artifact_grants_sf_proc.sql`
+### 3. `sigma_artifact_grants()` — `procs/sigma_artifact_grants.sql`
 
 Fetches Sigma permission grants for every dataset, data model, and workbook in the latest run of the upstream tables. Artifact IDs are read directly from `SIGMA_DATASET_DEPENDENCIES` and `SIGMA_WORKBOOK_MIGRATION_SUMMARY` — no additional API list calls needed. Grants are fetched concurrently (`MAX_WORKERS = 10`) using `GET /v2/grants?inodeId=<ID>&directGrantsOnly=true`. Team and member display names are hydrated from a single pre-fetch of `/v2/teams` and `/v2/members`.
 
