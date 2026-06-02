@@ -1,0 +1,19 @@
+{
+  "name": "Product Family Performance (fixture)",
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "Main",
+      "elements": [
+        {
+          "id": "table-ppa",
+          "name": "Product Family Performance",
+          "source": {
+            "kind": "sql",
+            "statement": "-- ============================================================\n-- Product Family Performance Analysis\n-- Security:  Row-level by store_region user attribute\n-- Control:   {{product-family-filter}} (Multi-select List, optional)\n-- Output:    Designed for a Bar or Line chart in Sigma\n-- ============================================================\n\nWITH base AS (\n    SELECT\n        DATE_TRUNC('month', DATE)                          AS order_month,\n        PRODUCT_FAMILY,\n        PRODUCT_TYPE,\n        STORE_REGION,\n        STORE_STATE,\n        SUM(PRICE * QUANTITY)                              AS total_revenue,\n        SUM(COST  * QUANTITY)                              AS total_cost,\n        SUM((PRICE - COST) * QUANTITY)                     AS total_profit,\n        COUNT(DISTINCT ORDER_NUMBER)                       AS order_count,\n        SUM(QUANTITY)                                      AS units_sold\n    FROM\n        EXAMPLES.PLUGS_ELECTRONICS.PLUGS_ELECTRONICS_HANDS_ON_LAB_DATA\n    WHERE\n        -- ── User Attribute: Region-level row security ──────────────\n        STORE_REGION = {{system::CurrentUserAttributeText::Store_Region}}\n\n        -- ── Optional: Single-select product family filter ─────────\n        AND CASE\n                WHEN {{product-family-filter}} = '' THEN TRUE\n                ELSE PRODUCT_FAMILY = {{product-family-filter}}\n            END\n\n        -- ── Guard: exclude zero/negative price rows ──────────────\n        AND PRICE > 0\n        AND COST  > 0\n\n    GROUP BY 1, 2, 3, 4, 5\n),\n\nranked AS (\n    SELECT\n        *,\n        ROUND(\n            (total_profit / NULLIF(total_revenue, 0)) * 100, 2\n        )                                                   AS profit_margin_pct,\n\n        ROUND(\n            total_revenue / NULLIF(\n                SUM(total_revenue) OVER (PARTITION BY order_month), 0\n            ) * 100, 2\n        )                                                   AS revenue_share_pct,\n\n        total_revenue - LAG(total_revenue) OVER (\n            PARTITION BY PRODUCT_FAMILY\n            ORDER BY order_month\n        )                                                   AS mom_revenue_delta,\n\n        RANK() OVER (\n            PARTITION BY order_month\n            ORDER BY total_revenue DESC\n        )                                                   AS revenue_rank\n    FROM base\n)\n\nSELECT\n    order_month,\n    PRODUCT_FAMILY,\n    PRODUCT_TYPE,\n    STORE_REGION,\n    STORE_STATE,\n    total_revenue,\n    total_cost,\n    total_profit,\n    profit_margin_pct,\n    revenue_share_pct,\n    mom_revenue_delta,\n    revenue_rank,\n    order_count,\n    units_sold\nFROM ranked\nORDER BY order_month, total_revenue DESC"
+          }
+        }
+      ]
+    }
+  ]
+}
