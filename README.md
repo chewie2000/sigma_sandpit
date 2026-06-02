@@ -1,6 +1,6 @@
 # Sigma Sandpit
 
-> **IN DEVELOPMENT — Do not use.** This repository is currently under active development. Content may be incomplete, incorrect, or subject to breaking changes without notice.
+> **Proof of concept.** This is a personal sandpit — the projects here are reference implementations shared to demonstrate approaches and give others something to extrapolate from, not finished, supported, or authoritative tools. Take the ideas, adapt the patterns, build your own.
 
 > **Disclaimer:** This repository contains personal scripts and tools written independently by the author. Although the author is employed by Sigma Computing, this work is not created, endorsed, tested, or supported by Sigma Computing in any capacity. These scripts are provided as-is, with no warranty or guarantee of fitness for any purpose. Use at your own risk. For official Sigma Computing documentation, support, and tooling, refer to [Sigma's official documentation](https://help.sigmacomputing.com).
 
