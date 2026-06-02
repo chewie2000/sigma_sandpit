@@ -6,6 +6,12 @@ memory across sessions.
 
 ---
 
+## Important
+The .beads database is in the current working directory. Never cd elsewhere 
+before running bd commands — just run bd directly.
+
+---
+
 ## Session Start (always do this first)
 
 At the beginning of every session, before doing anything else:
@@ -42,6 +48,7 @@ Use these labels consistently:
 | `sql`                      | `sql`                  |
 | `writeback_info_sf`        | `writeback-sf`         |
 | `writeback_info_dbx`       | `writeback-dbx`        |
+| `sigma_skills`             | `sigma-skills`         |
 | Cross-cutting / general    | `sigma-sandpit`        |
 
 To filter by workstream:
@@ -91,13 +98,14 @@ Before ending any session:
 
 1. Close any completed tasks with a meaningful summary
 2. Create issues for anything discovered but not yet done
-3. Force sync to persist state:
+3. Force-persist state to the git-tracked JSONL:
 
 ```bash
-bd sync
+bd export -o .beads/issues.jsonl
 ```
 
-Never end a session without running `bd sync`.
+Never end a session without persisting (`bd export -o .beads/issues.jsonl`).
+Note: this bd version has no `bd sync` command — `bd export` is the persist step.
 
 ---
 
@@ -118,8 +126,8 @@ bd list --label <label>           # Filter by workstream
 bd show bd-xxxx                   # Full detail on a specific issue
 bd create "desc" -p 1 -t task     # Create an issue
 bd update bd-xxxx --status in_progress  # Claim a task
-bd close bd-xxxx "what was done"  # Close a completed task
+bd close bd-xxxx -r "what was done"     # Close a completed task
 bd dep add bd-a bd-b              # bd-a is blocked by bd-b
-bd sync                           # Force persist to git
+bd export -o .beads/issues.jsonl  # Force persist to git-tracked JSONL
 bd list --status closed           # Review completed work
 ```
