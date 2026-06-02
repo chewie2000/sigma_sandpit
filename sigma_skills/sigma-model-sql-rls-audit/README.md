@@ -1,8 +1,8 @@
 # sigma-model-sql-rls-audit
 
-> **IN DEVELOPMENT — Do not use.** This skill is currently under active development. Content may be incomplete, incorrect, or subject to breaking changes without notice.
+> **Proof of concept.** This skill is a reference implementation shared to demonstrate an approach and give others something to extrapolate from — not a finished, supported, or authoritative tool. Take the ideas, adapt the patterns, build your own. Its output is illustrative; don't treat it as a definitive security verdict.
 
-> **Disclaimer:** This repository contains personal scripts and tools written independently by the author. Although the author is employed by Sigma Computing, this work is not created, endorsed, tested, or supported by Sigma Computing in any capacity. These scripts are provided as-is, with no warranty or guarantee of fitness for any purpose. Use at your own risk. For official Sigma Computing documentation, support, and tooling, refer to [Sigma's official documentation](https://help.sigmacomputing.com).
+> **Disclaimer:** This skill (and the repository it lives in) contains personal scripts and tools written independently by the author. Although the author is employed by Sigma Computing, this work is not created, endorsed, tested, or supported by Sigma Computing in any capacity. These scripts are provided as-is, with no warranty or guarantee of fitness for any purpose. Use at your own risk. For official Sigma Computing documentation, support, and tooling, refer to [Sigma's official documentation](https://help.sigmacomputing.com).
 
 A Claude Code skill that audits **Sigma data models** for the strength of
 **row-level security (RLS) implemented in Custom SQL** — specifically, how well
