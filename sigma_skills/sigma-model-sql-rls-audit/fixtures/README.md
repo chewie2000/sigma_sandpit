@@ -73,3 +73,33 @@ A model secured the **documented recommended way** — and it has **no Custom SQ
   `True`) and report **"secured via native RLS"** instead of `N/A`.
 
 Use this fixture to confirm the N/A path today, and as the acceptance test for 3wm.
+
+## `exempt-and-lowrisk.json`
+
+Exercises the **disposition** logic — every block in one model, one per disposition:
+
+- **`Orders (scoped)`** — real UA in the `WHERE` → **scored**, grade **A**.
+- **`Products (public dimension)`** — annotated `-- @sigma-rls: none — public product
+  dimension, no row security required` → **exempt** (`none`).
+- **`Region Sales (secured upstream)`** — annotated `-- @sigma-rls: external — …
+  V_REGION_SALES … RLS upstream` → **exempt** (`external`).
+- **`Region Codes (constants)`** — `SELECT 'NA' … UNION ALL …` with no `FROM` →
+  **low-risk** (no row-bearing source), no annotation needed.
+
+### Expected outcome
+
+**Model grade A** — `1 scored, 2 exempt, 1 low-risk`, **0 findings**. The report must:
+
+- grade only the scored `Orders` block,
+- list both exempt blocks with their verbatim reasons in the "Exempted" section,
+- list the constants block as low-risk,
+- **not** fire UA-PRESENT on any of the three non-scored blocks.
+
+### Variations to check
+
+- **`--strict`:** the two `@sigma-rls` blocks are scored anyway → both have no UA →
+  two **CRITICAL UA-PRESENT** findings → model drops to **F**. Confirms the override
+  surfaces what the annotations suppress.
+- **Malformed annotation:** delete the reason (`-- @sigma-rls: none`) on `Products` →
+  it is *not* exempted; fires **`low` UA-EXEMPT-MALFORMED** and is scored (CRITICAL
+  UA-PRESENT, since it has no UA). Confirms blank opt-outs don't work.

@@ -1,0 +1,43 @@
+{
+  "name": "Mixed dispositions (exempt + low-risk + scored) — fixture",
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "Main",
+      "elements": [
+        {
+          "id": "table-orders",
+          "name": "Orders (scoped)",
+          "source": {
+            "kind": "sql",
+            "statement": "SELECT\n    ORDER_NUMBER,\n    STORE_REGION,\n    PRODUCT_FAMILY,\n    PRICE,\n    QUANTITY\nFROM\n    EXAMPLES.PLUGS_ELECTRONICS.PLUGS_ELECTRONICS_HANDS_ON_LAB_DATA\nWHERE\n    STORE_REGION = {{system::CurrentUserAttributeText::Store_Region}}"
+          }
+        },
+        {
+          "id": "table-products",
+          "name": "Products (public dimension)",
+          "source": {
+            "kind": "sql",
+            "statement": "-- @sigma-rls: none — public product dimension, no row security required\nSELECT\n    PRODUCT_FAMILY,\n    PRODUCT_TYPE\nFROM\n    EXAMPLES.PLUGS_ELECTRONICS.PRODUCTS"
+          }
+        },
+        {
+          "id": "table-regionsales",
+          "name": "Region Sales (secured upstream)",
+          "source": {
+            "kind": "sql",
+            "statement": "-- @sigma-rls: external — sourced from secured view V_REGION_SALES which applies RLS upstream\nSELECT\n    STORE_REGION,\n    SUM(REVENUE) AS total_revenue\nFROM\n    EXAMPLES.PLUGS_ELECTRONICS.V_REGION_SALES\nGROUP BY 1"
+          }
+        },
+        {
+          "id": "table-regioncodes",
+          "name": "Region Codes (constants)",
+          "source": {
+            "kind": "sql",
+            "statement": "SELECT 'NA' AS region\nUNION ALL SELECT 'EMEA'\nUNION ALL SELECT 'APAC'"
+          }
+        }
+      ]
+    }
+  ]
+}

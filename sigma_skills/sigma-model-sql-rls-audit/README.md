@@ -32,6 +32,7 @@ graded report with the exact offending SQL cited.
 | **UA-TYPE** | an attribute is quoted incorrectly for the column it compares against |
 | **UA-SYSTEM-MISQUOTE** | a `system::CurrentUserAttribute*` / `#identifier` helper is wrapped in `'...'` |
 | **UA-EMPTY** | (informational) no guard for an unset attribute — Sigma fails closed by default |
+| **UA-EXEMPT** | (not a finding) the block is annotated as needing no RLS — excluded from the grade, listed transparently |
 
 The only **user-attribute** forms recognized in Custom SQL are the two Sigma
 documents:
@@ -44,9 +45,32 @@ deliberately ignored.
 
 ## Grading
 
-Each Custom SQL block is graded A–F by its worst finding (one critical → F). The
-model grade is the floor of its blocks. A model with **no** Custom SQL is `N/A`
-(never silently treated as a pass).
+Each **scored** Custom SQL block is graded A–F by its worst finding (one critical → F).
+The model grade is the floor of its scored blocks. A model with **no** Custom SQL —
+or one where every block is exempt/low-risk — is `N/A` (never silently treated as a
+pass; the reason is stated and any exemptions are listed).
+
+## Not every block needs RLS
+
+Reference/dimension tables, public lookups, and sources secured upstream legitimately
+have no user attribute. Mark such a block with an annotation in its SQL so the auditor
+doesn't flag it:
+
+```sql
+-- @sigma-rls: none — public product dimension, no row security required
+SELECT product_id, product_name, category FROM EXAMPLES.PLUGS_ELECTRONICS.PRODUCTS
+```
+
+- Disposition is `none` (data isn't row-sensitive) or `external` (row security enforced
+  upstream — a secured view, native RLS on the consuming model, etc.).
+- **A reason is required** — an annotation with no reason is ignored (flagged
+  `UA-EXEMPT-MALFORMED`), so you can't silence the auditor with a blank opt-out.
+- Exempt blocks are **excluded from the grade but always listed** in the report with
+  their reason. Run with **`--strict`** to re-audit as if the annotations weren't there
+  and see exactly what they're suppressing.
+
+The skill also auto-detects clearly **low-risk** blocks (no `FROM`, `SELECT` of
+constants, `VALUES`) and excludes them without needing an annotation.
 
 ## Requirements
 
@@ -79,6 +103,7 @@ Just ask Claude Code in natural language. Trigger phrases include:
 - `--severity <info|low|medium|high|critical>` — minimum severity to report
   (default `low`).
 - `--ua <name>` — only count a specific attribute as "present".
+- `--strict` — re-audit ignoring `-- @sigma-rls:` exemption annotations (score them anyway), to review what's being suppressed.
 - `--verbose` — full markdown report (grade table, grouped findings, remediation)
   instead of the default terse summary.
 

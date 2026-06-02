@@ -51,6 +51,7 @@ The skill accepts any of these — pick the one that matches what the user gave 
 - `--fix` — Read-only audit by default. With `--fix`, after presenting the report, propose concrete spec edits for High/Critical findings (e.g. adding a `WHERE` predicate that references the user attribute, or quoting the interpolation). **Always show the diff and ask for confirmation before writing back via the `sigma-data-models` PUT workflow.** Never apply fixes silently.
 - `--severity <min>` — Only include findings at or above this severity in the report (`info`, `low`, `medium`, `high`, `critical`). Default: `low`.
 - `--ua <name>` — If the org has a known canonical attribute (e.g. `region`, `tenant_id`), restrict "presence" checks to expect *that* attribute. Without this flag, any `{{...}}` user-attribute interpolation counts as present.
+- `--strict` — Re-audit **ignoring `-- @sigma-rls:` exemption annotations**, so every annotated block is scored normally and its suppressed findings are shown. Use this to review what the exemptions are hiding. (Low-risk heuristics still apply.)
 - `--verbose` — Emit the full markdown report (model-grade table, grouped findings with remediation inline, unscored appendix, next-steps stanza). Default is the terse plain-text reply. See `reference/report-format.md`.
 
 ## Auth (only when fetching from Sigma)
@@ -81,7 +82,11 @@ For each spec, traverse `pages[].elements[]` and collect every Custom SQL surfac
 
 If a spec has zero Custom SQL surfaces, mark the spec as **N/A — no custom SQL** and move on. Do not score it.
 
-### 3. Run the audit checks against each extracted SQL block
+### 2a. Assign each block a disposition (before scoring)
+
+Not every Custom SQL block needs RLS. Per the **disposition pre-check** in `reference/checks.md`, classify each block as `exempt` (carries a valid `-- @sigma-rls: none|external — <reason>` annotation), `low-risk` (heuristic: reads no row-bearing source), or `scored` (default). Only `scored` blocks run the catalog and get a grade; `exempt` / `low-risk` blocks are excluded from the grade but **always listed** in the report. With `--strict`, ignore `exempt` annotations and score those blocks anyway.
+
+### 3. Run the audit checks against each `scored` SQL block
 
 Load `reference/checks.md` and `reference/patterns.md` and apply every check. Each check produces zero or more findings of the form:
 
@@ -137,6 +142,7 @@ Load each on demand — don't read everything up-front.
 ## Behavioral rules
 
 - Be explicit when a finding is heuristic. Some bypass patterns are false-positive-prone (e.g. `IS NULL` is sometimes legitimate). Mark `confidence: "heuristic"` on findings that aren't structural certainties.
-- Never claim a model is "safe" if it simply has no Custom SQL — that's `N/A`, not a pass. Say so.
+- Never claim a model is "safe" if it simply has no Custom SQL — that's `N/A`, not a pass. Say so. The same applies when every block is `exempt`/`low-risk`: report `N/A — all blocks exempt/low-risk`, not a pass.
+- **Exemptions are claims, not proof.** A `-- @sigma-rls:` annotation is just a comment anyone can add. Never hide an exempted block — list every one with its stated reason in the "Exempted" section so a reviewer can challenge it, and remind the user that `--strict` re-audits as if the annotations weren't there. An exemption with no reason is not honored (UA-EXEMPT-MALFORMED).
 - An unset user attribute does **not** silently widen access. Sigma substitutes the attribute's default value if one is set, otherwise raises a hard `Invalid SQL Parameter` error (fail-closed). Treat a missing empty-guard as `UA-EMPTY` **Low / informational** — not a grade-lowering finding — and escalate only when paired with a permissive fallback (already covered by UA-BYPASS-FALLBACK). The exact token substituted for an *assigned-but-empty* attribute is undocumented; say so rather than asserting it.
 - Cite the exact substring of the statement as `evidence` in every finding. Don't paraphrase the SQL.

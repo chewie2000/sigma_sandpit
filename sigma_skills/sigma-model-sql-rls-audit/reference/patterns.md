@@ -22,6 +22,29 @@ These look similar but are **not** user-attribute references. Counting them is a
 - **Bare `CurrentUserAttributeText('region')`** with no `{{#formula …}}` wrapper — not valid in raw Custom SQL on its own. Only the `#formula`-wrapped form above counts.
 - **`{{#identifier [control]}}`** — emits an unquoted identifier (schema/table/column) driven by a control; not a row-restricting UA reference. (It is still handled by the UA-TYPE carve-outs and UA-SYSTEM-MISQUOTE below for quoting concerns.)
 
+## Exemption annotation (UA-EXEMPT)
+
+A block opts out of RLS scoring with an explicit annotation in a SQL comment (line or block). Match against the **original** statement (annotations live in comments, so don't use the comment-stripped copy):
+
+| Form | Regex (case-insensitive) | Captures |
+|---|---|---|
+| Line comment | `--\s*@sigma-rls:\s*(none\|external)\b[ \t]*[—:-]?[ \t]*(.*?)\s*$` (multiline) | group 1 = disposition, group 2 = reason |
+| Block comment | `/\*\s*@sigma-rls:\s*(none\|external)\b[ \t]*[—:-]?[ \t]*(.*?)\s*\*/` | group 1 = disposition, group 2 = reason |
+
+- **Disposition tokens:** `none` (data is not row-sensitive) or `external` (row security enforced upstream — secured view, native RLS on the consuming model, etc.). Any other token after `@sigma-rls:` → do not exempt; treat as malformed.
+- **Reason required.** If group 2 (trimmed) is empty, the block is **not** exempt → fire `low` **UA-EXEMPT-MALFORMED** and score normally. The `—`/`:`/`-` separator is optional but a non-empty reason after it is not.
+- A statement with a valid annotation gets disposition `exempt` (unless `--strict`, which ignores annotations).
+
+## Low-risk heuristics (disposition = low-risk)
+
+`heuristic` confidence. A block reads no row-bearing source when **any** of these hold (evaluate against the comment-stripped statement):
+
+- **No `FROM`/`JOIN`:** no `\bFROM\b` and no `\bJOIN\b` anywhere → e.g. `SELECT 1 AS flag`, `SELECT CURRENT_DATE()`.
+- **Constants-only SELECT:** the top-level `SELECT` list is literals/expressions over no columns and there is no `FROM`.
+- **`VALUES` source:** the statement's source is a `\bVALUES\s*\(` table constructor, not a warehouse table.
+
+These get disposition `low-risk` (not scored, listed as such). **Do not** treat aggregate-only-over-a-real-table as low-risk here — that stays a `scored` block and is handled by UA-PRESENT's aggregate downgrade (Low), because aggregates over a sensitive table can still leak.
+
 ## Stripping comments
 
 Before any predicate-position check (UA-IN-PREDICATE, UA-BYPASS-COMMENTED), produce a `stripped` copy of the statement that removes:

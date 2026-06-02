@@ -16,7 +16,7 @@ A short plain-text reply. No tables, no heading hierarchy, no code fences except
 ### Shape
 
 ```
-<model label> — grade <X>  (<N> custom SQL block(s), <M> finding(s))
+<model label> — grade <X>  (<S> scored, <E> exempt, <L> low-risk; <M> finding(s))
 
   Page "<page name>" → <element name> (<surface>)
     <SEVERITY>  <CHECK-ID>  <one-line message> — `<evidence>`
@@ -24,12 +24,18 @@ A short plain-text reply. No tables, no heading hierarchy, no code fences except
 
   Page "<page name>" → <element name> (<surface>) — grade A, no findings
 
+  exempt: Page "<page name>" → <element name> (<surface>) — @sigma-rls:<none|external> — "<reason>"
+  low-risk: Page "<page name>" → <element name> (<surface>) — no row-bearing source [heuristic]
+
 <next model …>
 
 <label> — N/A (no custom SQL)
+<label> — N/A (all blocks exempt/low-risk)
 
-— audited <N> spec(s), <M> custom SQL block(s), <K> finding(s)
+— audited <N> spec(s), <S> scored / <E> exempt / <L> low-risk block(s), <K> finding(s)
 ```
+
+Omit the `exempt`/`low-risk` count from the headline and the listing lines when that count is zero. Always print them when non-zero — even on an otherwise clean model — so exemptions stay visible.
 
 ### Conventions
 
@@ -41,13 +47,14 @@ A short plain-text reply. No tables, no heading hierarchy, no code fences except
 - **Sort findings** within each element: critical → low, then by check id.
 - **Clean elements:** print `Page "X" → Element (surface) — grade A, no findings`. If a model has many clean ones, collapse to a single `(<N> other blocks clean)` line at the end of that model.
 - **Confidence:** append ` [heuristic]` for heuristic findings. Omit for structural.
+- **Exempt / low-risk blocks:** one line each, under their model, prefixed `exempt:` or `low-risk:`. For `exempt`, always quote the stated reason verbatim. Never silently drop them — visibility is the anti-abuse mechanism. If `--strict` is active, exempt blocks are scored instead and a header note says `(--strict: exemption annotations ignored)`.
 - **Remediation is NOT printed inline.** Looking up a fix is on-demand — if the user asks "how do I fix UA-BYPASS-OR-TRUE", consult `checks.md` then.
 - **No bold, no markdown headings, no markdown tables, no fenced code blocks.** Inline backticks only.
 
 ### Example
 
 ```
-sales_model (abc123) — grade F  (2 blocks, 3 findings)
+sales_model (abc123) — grade F  (2 scored, 1 exempt; 3 findings)
 
   Page "Main" → Orders (custom-sql-source)
     CRITICAL  UA-PRESENT              no user-attribute reference in the statement — `SELECT order_id, customer_id, revenue FROM orders`
@@ -56,9 +63,11 @@ sales_model (abc123) — grade F  (2 blocks, 3 findings)
   Page "Main" → Customers (custom-sql-source)
     MEDIUM    UA-EMPTY                no empty-attribute guard on {{tenant_id}} — `WHERE tenant_id = {{tenant_id}}` [heuristic]
 
+  exempt: Page "Main" → Products (custom-sql-source) — @sigma-rls:none — "public product dimension, no row security required"
+
 reporting_model (def456) — N/A (no custom SQL)
 
-— audited 2 specs, 2 custom SQL blocks, 3 findings
+— audited 2 specs, 2 scored / 1 exempt / 0 low-risk blocks, 3 findings
 ```
 
 ### --fix in terse mode
@@ -90,19 +99,30 @@ A full markdown report. Use this when the user wants something printable, review
 
 ## Model grades
 
-| Model | Grade | Custom SQL blocks | Findings (C/H/M/L) |
+| Model | Grade | Blocks (scored / exempt / low-risk) | Findings (C/H/M/L) |
 |---|---|---|---|
-| <model 1 label> | **F** | 3 | 2 / 1 / 0 / 0 |
-| <model 2 label> | **B** | 1 | 0 / 0 / 0 / 1 |
-| <model 3 label> | **N/A** | 0 | — |
+| <model 1 label> | **F** | 2 / 1 / 0 | 2 / 1 / 0 / 0 |
+| <model 2 label> | **B** | 1 / 0 / 0 | 0 / 0 / 0 / 1 |
+| <model 3 label> | **N/A** | 0 / 2 / 0 | — |
 
 ## Findings
 
 <grouped sections, one ### per model with findings>
 
+## Exempted & low-risk blocks
+
+List **every** non-scored block so exemptions stay reviewable. Quote the stated reason verbatim.
+
+- **<model label>** → Page "<page>" → <element> (<surface>) — **exempt** `@sigma-rls:none` — "<reason>"
+- **<model label>** → Page "<page>" → <element> (<surface>) — **exempt** `@sigma-rls:external` — "<reason>"
+- **<model label>** → Page "<page>" → <element> (<surface>) — **low-risk** (no row-bearing source) — _heuristic_
+
+> Exemptions are author claims, not verified facts. Re-run with `--strict` to audit as if the annotations weren't there.
+
 ## Unscored / N/A
 
 - <model name> — no Custom SQL blocks in this spec.
+- <model name> — all blocks exempt/low-risk (see above); not scored.
 
 ## Next steps
 
