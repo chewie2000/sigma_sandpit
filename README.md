@@ -13,7 +13,8 @@ sigma_sandpit/
 ├── DataSetMigrateHelper_SF/   # Snowflake — dataset dependency graph and workbook migration analysis
 ├── DataModelGraph_SF/         # Snowflake — data model dependency graph
 ├── writeback_info_sf/         # Snowflake — writeback (input table) inventory and cleanup toolkit
-└── writeback_info_dbx/        # Databricks — writeback (input table) inventory and cleanup toolkit
+├── writeback_info_dbx/        # Databricks — writeback (input table) inventory and cleanup toolkit
+└── sigma_skills/              # Claude Code skills for Sigma work (proof-of-concept reference implementations)
 ```
 
 ## Projects
@@ -29,6 +30,9 @@ Snowflake port of the writeback_info_dbx toolkit. Inventories and monitors Sigma
 
 ### [writeback_info_dbx](writeback_info_dbx/README.md)
 Databricks toolkit for inventorying and monitoring Sigma writeback (input table) activity. Maps every active WAL table to its Sigma workbook or data model, enriches records with Delta metadata and Sigma API ownership data, and populates `SIGDS_WORKBOOK_MAP` for reporting and cleanup planning.
+
+### [sigma_skills](sigma_skills/)
+Reusable [Claude Code](https://claude.com/claude-code) skills for Sigma Computing work, shared as proof-of-concept reference implementations to extrapolate from. Currently includes [sigma-model-sql-rls-audit](sigma_skills/sigma-model-sql-rls-audit/README.md) — audits the strength of row-level security implemented in Sigma data-model Custom SQL by checking how well each block is scoped by a user attribute.
 
 ## Platforms
 
