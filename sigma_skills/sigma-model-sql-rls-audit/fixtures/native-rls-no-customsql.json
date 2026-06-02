@@ -1,0 +1,32 @@
+{
+  "name": "Store Sales (native RLS, no custom SQL) — fixture",
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "Main",
+      "elements": [
+        {
+          "id": "table-sales",
+          "name": "Store Sales",
+          "source": {
+            "kind": "warehouse-table",
+            "path": ["EXAMPLES", "PLUGS_ELECTRONICS", "PLUGS_ELECTRONICS_HANDS_ON_LAB_DATA"]
+          },
+          "columns": [
+            { "id": "col-region", "name": "Store Region" },
+            { "id": "col-state", "name": "Store State" },
+            { "id": "col-revenue", "name": "Revenue" },
+            {
+              "id": "col-rls-allowed",
+              "name": "RLS Allowed",
+              "formula": "CurrentUserAttributeText(\"Store Region\") = [Store Region]"
+            }
+          ],
+          "filters": [
+            { "columnId": "col-rls-allowed", "operator": "isTrue" }
+          ]
+        }
+      ]
+    }
+  ]
+}

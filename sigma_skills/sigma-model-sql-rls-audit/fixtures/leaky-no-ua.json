@@ -1,0 +1,27 @@
+{
+  "name": "Store Orders (leaky) — fixture",
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "Main",
+      "elements": [
+        {
+          "id": "table-orders",
+          "name": "Orders (unscoped)",
+          "source": {
+            "kind": "sql",
+            "statement": "SELECT\n    ORDER_NUMBER,\n    STORE_REGION,\n    STORE_STATE,\n    PRODUCT_FAMILY,\n    PRICE,\n    COST,\n    QUANTITY\nFROM\n    EXAMPLES.PLUGS_ELECTRONICS.PLUGS_ELECTRONICS_HANDS_ON_LAB_DATA\nWHERE\n    PRICE > 0"
+          }
+        },
+        {
+          "id": "table-customers",
+          "name": "Customers (bypassed)",
+          "source": {
+            "kind": "sql",
+            "statement": "SELECT\n    CUSTOMER_ID,\n    CUSTOMER_NAME,\n    EMAIL,\n    STORE_REGION\nFROM\n    EXAMPLES.PLUGS_ELECTRONICS.CUSTOMERS\nWHERE\n    STORE_REGION = {{system::CurrentUserAttributeText::Store_Region}}\n    OR 1=1"
+          }
+        }
+      ]
+    }
+  ]
+}
