@@ -1,0 +1,174 @@
+{
+  "name": "Plugs Electronics Sales (sample)",
+  "warehouse": "snowflake",
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "Model",
+      "elements": [
+        {
+          "id": "tbl-orders-raw",
+          "name": "Orders (raw warehouse table)",
+          "kind": "table",
+          "source": {
+            "kind": "warehouse-table",
+            "table": "EXAMPLES.PLUGS_ELECTRONICS.PLUGS_ELECTRONICS_HANDS_ON_LAB_DATA"
+          },
+          "columns": [
+            {"id": "c-order", "name": "Order Number"},
+            {"id": "c-region", "name": "Store Region"},
+            {"id": "c-family", "name": "Product Family"},
+            {"id": "c-price", "name": "Price"},
+            {"id": "c-qty", "name": "Quantity"},
+            {"id": "c-date", "name": "Date"}
+          ]
+        },
+        {
+          "id": "tbl-products",
+          "name": "Products (dimension)",
+          "kind": "table",
+          "source": {
+            "kind": "warehouse-table",
+            "table": "EXAMPLES.PLUGS_ELECTRONICS.PRODUCTS"
+          },
+          "columns": [
+            {"id": "p-family", "name": "Product Family"},
+            {"id": "p-type", "name": "Product Type"}
+          ]
+        },
+        {
+          "id": "tbl-regions",
+          "name": "Regions (dimension)",
+          "kind": "table",
+          "source": {
+            "kind": "warehouse-table",
+            "table": "EXAMPLES.PLUGS_ELECTRONICS.REGIONS"
+          },
+          "columns": [
+            {"id": "r-region", "name": "Store Region"},
+            {"id": "r-mgr", "name": "Regional Manager"}
+          ]
+        },
+        {
+          "id": "sql-revenue-window",
+          "name": "Revenue Ranking (custom SQL)",
+          "kind": "table",
+          "source": {
+            "kind": "sql",
+            "statement": "SELECT\n  DATE_TRUNC('month', DATE) AS order_month,\n  PRODUCT_FAMILY,\n  SUM(PRICE * QUANTITY) AS total_revenue,\n  RANK() OVER (PARTITION BY DATE_TRUNC('month', DATE) ORDER BY SUM(PRICE * QUANTITY) DESC) AS revenue_rank,\n  total_revenue - LAG(SUM(PRICE * QUANTITY)) OVER (PARTITION BY PRODUCT_FAMILY ORDER BY DATE_TRUNC('month', DATE)) AS mom_delta\nFROM EXAMPLES.PLUGS_ELECTRONICS.PLUGS_ELECTRONICS_HANDS_ON_LAB_DATA\nGROUP BY 1, 2"
+          },
+          "parentId": "tbl-orders-raw",
+          "columns": []
+        },
+        {
+          "id": "join-orders-enriched",
+          "name": "Orders Enriched (3-source join)",
+          "kind": "table",
+          "source": {
+            "kind": "join",
+            "sources": ["tbl-orders-raw", "tbl-products", "tbl-regions"]
+          },
+          "columns": [
+            {"id": "j-rev", "name": "Revenue", "formula": "Sum([Price] * [Quantity])"}
+          ]
+        },
+        {
+          "id": "agg-monthly",
+          "name": "Monthly Revenue by Family (non-leaf grouping)",
+          "kind": "table",
+          "parentId": "join-orders-enriched",
+          "grouping": ["Order Month", "Product Family"],
+          "columns": [
+            {"id": "m-rev", "name": "Total Revenue", "formula": "Sum([Revenue])"}
+          ]
+        },
+        {
+          "id": "agg-leaf",
+          "name": "Order Line Detail (leaf grain)",
+          "kind": "table",
+          "parentId": "join-orders-enriched",
+          "grouping": ["All source columns"],
+          "columns": [
+            {"id": "l-rev", "name": "Line Revenue", "formula": "Sum([Revenue])"}
+          ]
+        },
+        {
+          "id": "lookup-mgr",
+          "name": "Region Manager Lookup",
+          "kind": "table",
+          "parentId": "tbl-orders-raw",
+          "columns": [
+            {"id": "lk-mgr", "name": "Manager", "formula": "Lookup([tbl-regions/Regional Manager], [Store Region], [tbl-regions/Store Region])"}
+          ]
+        },
+        {
+          "id": "sql-sigma-element",
+          "name": "Reuses Another Element (custom SQL)",
+          "kind": "table",
+          "source": {
+            "kind": "sql",
+            "statement": "SELECT * FROM sigma_element('agg-monthly') WHERE total_revenue > 1000"
+          },
+          "columns": []
+        },
+        {
+          "id": "sql-user-scoped",
+          "name": "My Region Orders (per-user)",
+          "kind": "table",
+          "source": {
+            "kind": "sql",
+            "statement": "SELECT * FROM EXAMPLES.PLUGS_ELECTRONICS.PLUGS_ELECTRONICS_HANDS_ON_LAB_DATA WHERE STORE_REGION = {{system::CurrentUserAttributeText::Store_Region}}"
+          },
+          "columns": []
+        },
+        {
+          "id": "sql-now",
+          "name": "Today's Orders (dynamic time)",
+          "kind": "table",
+          "source": {
+            "kind": "sql",
+            "statement": "SELECT * FROM EXAMPLES.PLUGS_ELECTRONICS.PLUGS_ELECTRONICS_HANDS_ON_LAB_DATA WHERE DATE = CURRENT_DATE"
+          },
+          "columns": []
+        },
+        {
+          "id": "tbl-relative-filter",
+          "name": "Last 7 Days (relative date filter)",
+          "kind": "table",
+          "parentId": "tbl-orders-raw",
+          "filters": [
+            {"column": "Date", "kind": "relativeDate", "relativeDate": {"lastNDays": 7}}
+          ],
+          "columns": []
+        },
+        {
+          "id": "tbl-input",
+          "name": "Manual Targets (input table)",
+          "kind": "table",
+          "source": {
+            "kind": "input-table"
+          },
+          "columns": [
+            {"id": "it-family", "name": "Product Family"},
+            {"id": "it-target", "name": "Revenue Target"}
+          ]
+        },
+        {
+          "id": "viz-controlled",
+          "name": "Revenue by Region (control target)",
+          "kind": "table",
+          "parentId": "join-orders-enriched",
+          "columns": [
+            {"id": "v-rev", "name": "Revenue", "formula": "Sum([Revenue])"}
+          ]
+        },
+        {
+          "id": "ctrl-region",
+          "name": "Region Filter",
+          "kind": "filter-control",
+          "targetId": "viz-controlled"
+        }
+      ]
+    }
+  ]
+}
