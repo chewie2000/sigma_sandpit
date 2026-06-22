@@ -194,3 +194,27 @@ SELECT
 FROM SCD2_WORKBOOKS
 WHERE SCD_VALID_TO IS NOT NULL          -- only versions that were superseded
 ORDER BY SCD_VALID_TO DESC;
+
+-- ------------------------------------------------------------------------------
+-- V_TENANCY_TOPOLOGY -- per-org multi-tenant posture for migration planning.
+-- ORG_ROLE: parent (can enumerate tenants and has them), standalone (reachable,
+-- none), or unknown (tenant enumeration denied -- e.g. 403, not entitled/parent).
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW V_TENANCY_TOPOLOGY AS
+SELECT
+    o.ORG_ID,
+    o.ORG_ROLE,
+    o.TENANT_COUNT,
+    o.DEPLOYMENT_POLICY_COUNT,
+    o.SOURCE_SWAP_POLICY_COUNT,
+    (o.TENANTS_ACCESS_ERROR IS NOT NULL)            AS TENANT_ENUM_DENIED,
+    o.TENANTS_ACCESS_ERROR,
+    CASE
+        WHEN o.ORG_ROLE = 'parent'
+            THEN 'Parent/host org with ' || o.TENANT_COUNT || ' tenant(s); assess deployment + source-swap policy coverage'
+        WHEN o.ORG_ROLE = 'standalone'
+            THEN 'Standalone org, no tenants/policies -- candidate to become a parent or be deployed as a tenant'
+        ELSE 'Tenant enumeration denied -- org is not a parent or lacks the multi-tenant entitlement; confirm intended role'
+    END                                             AS TOPOLOGY_NOTE,
+    o.SNAPSHOT_TS
+FROM STG_ORGANIZATION o;

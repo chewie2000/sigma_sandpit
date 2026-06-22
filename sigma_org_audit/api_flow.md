@@ -25,6 +25,19 @@ required for `skipPermissionCheck=true` (org-wide visibility).
 |---|---|---|
 | GET | `/v2/whoami` | Returns `{userId, organizationId}`. Called once at the start of every extract to resolve the **`ORG_ID`** stamped on every landed row (multi-org tagging). Not stored as its own OBJECT_TYPE. |
 
+## Tenancy + deployment topology (multi-tenant migration)
+
+Captured per extract; each is Beta/entitled, so a 403 is recorded in the result
+`errors` (and the org role becomes `unknown`), never fatal.
+
+| OBJECT_TYPE | Method | Path | Notes |
+|---|---|---|---|
+| `tenant` | GET | `/v2/tenants` | Tenant (child) orgs of a parent/host org. 403 if not a parent / not entitled. |
+| `deployment_policy` | GET | `/v2/deploymentPolicies` | Beta. Governs deploying content to tenants. |
+| `deployment_policy_detail` | GET | `/v2/deploymentPolicies/{id}/tenants` + `/files` | Per-policy target tenants + documents. |
+| `source_swap_policy` | GET | `/v2/sourceSwapPolicies` | Beta. Per-tenant source remapping. |
+| `organization` | (derived) | — | Synthetic row: `{organizationId, role, tenantCount, tenantsAccessError, deploymentPolicyCount, sourceSwapPolicyCount}`. Role = parent / standalone / unknown. |
+
 ## `sigma_org_extract` — API object types
 
 Each row in `RAW_SIGMA_OBJECTS` is `(SNAPSHOT_ID, SNAPSHOT_TS, ORG_ID,

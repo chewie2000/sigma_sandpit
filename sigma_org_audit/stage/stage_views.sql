@@ -269,3 +269,61 @@ LEFT JOIN STG_CONNECTIONS c ON c.ORG_ID = t.ORG_ID AND c.CONNECTION_ID = t.PAYLO
 LEFT JOIN STG_WORKBOOKS  wb ON wb.WORKBOOK_ID  = w.WORKBOOK_ID
 LEFT JOIN STG_MEMBERS    m  ON m.ORG_ID = wb.ORG_ID AND LOWER(m.EMAIL) = LOWER(w.WAL_LAST_EDIT_BY)
 WHERE t.rn = 1;
+
+-- ------------------------------------------------------------------------------
+-- TENANCY + DEPLOYMENT TOPOLOGY (multi-tenant migration)
+-- STG_ORGANIZATION carries the per-org role summary stamped by sigma_org_extract
+-- (role, tenant/policy counts, and any tenants-access error such as a 403 when
+-- the org cannot enumerate tenants). Tenant/policy payload shapes are passed
+-- through raw until a populated org is available to model their fields.
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW STG_ORGANIZATION AS
+WITH latest AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY ORG_ID, OBJECT_ID ORDER BY SNAPSHOT_TS DESC) AS rn
+    FROM RAW_SIGMA_OBJECTS WHERE OBJECT_TYPE = 'organization'
+)
+SELECT
+    ORG_ID,
+    PAYLOAD:role::STRING                    AS ORG_ROLE,
+    PAYLOAD:tenantCount::NUMBER             AS TENANT_COUNT,
+    PAYLOAD:tenantsAccessError::STRING      AS TENANTS_ACCESS_ERROR,
+    PAYLOAD:deploymentPolicyCount::NUMBER   AS DEPLOYMENT_POLICY_COUNT,
+    PAYLOAD:sourceSwapPolicyCount::NUMBER   AS SOURCE_SWAP_POLICY_COUNT,
+    SNAPSHOT_TS, SNAPSHOT_ID
+FROM latest WHERE rn = 1;
+
+CREATE OR REPLACE VIEW STG_TENANTS AS
+WITH latest AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY ORG_ID, OBJECT_ID ORDER BY SNAPSHOT_TS DESC) AS rn
+    FROM RAW_SIGMA_OBJECTS WHERE OBJECT_TYPE = 'tenant'
+)
+SELECT
+    ORG_ID                                  AS PARENT_ORG_ID,
+    OBJECT_ID                               AS TENANT_ORG_ID,
+    COALESCE(PAYLOAD:name::STRING, PAYLOAD:organizationName::STRING) AS NAME,
+    SNAPSHOT_TS, SNAPSHOT_ID, PAYLOAD
+FROM latest WHERE rn = 1;
+
+CREATE OR REPLACE VIEW STG_DEPLOYMENT_POLICIES AS
+WITH latest AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY ORG_ID, OBJECT_ID ORDER BY SNAPSHOT_TS DESC) AS rn
+    FROM RAW_SIGMA_OBJECTS WHERE OBJECT_TYPE = 'deployment_policy'
+)
+SELECT
+    ORG_ID,
+    OBJECT_ID                               AS DEPLOYMENT_POLICY_ID,
+    PAYLOAD:name::STRING                    AS NAME,
+    SNAPSHOT_TS, SNAPSHOT_ID, PAYLOAD
+FROM latest WHERE rn = 1;
+
+CREATE OR REPLACE VIEW STG_SOURCE_SWAP_POLICIES AS
+WITH latest AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY ORG_ID, OBJECT_ID ORDER BY SNAPSHOT_TS DESC) AS rn
+    FROM RAW_SIGMA_OBJECTS WHERE OBJECT_TYPE = 'source_swap_policy'
+)
+SELECT
+    ORG_ID,
+    OBJECT_ID                               AS SOURCE_SWAP_POLICY_ID,
+    PAYLOAD:name::STRING                    AS NAME,
+    SNAPSHOT_TS, SNAPSHOT_ID, PAYLOAD
+FROM latest WHERE rn = 1;

@@ -192,6 +192,9 @@ class RawCollector:
         "connection_detail": ("connectionId", "id"),
         "member":          ("memberId", "id"),
         "team":            ("teamId", "id"),
+        "tenant":          ("tenantOrganizationId", "organizationId", "id"),
+        "deployment_policy": ("deploymentPolicyId", "id"),
+        "source_swap_policy": ("policyId", "sourceSwapPolicyId", "id"),
     }
 
     def __init__(self):
@@ -372,6 +375,63 @@ def main(session, target_database, target_schema, target_table,
                     collector.add("grant", payload, object_id=inode_id)
                     grant_ok += 1
         counts["grant"] = grant_ok
+
+    # --- 5b) Tenancy + deployment topology -------------------------------------
+    # Multi-tenant migration objects. These are Beta / entitled features: a 403
+    # (org is not a parent / lacks the entitlement) is RECORDED, never fatal.
+    def _safe_list(path, params=None):
+        try:
+            return list_paginated(token_mgr, path, params), None
+        except requests.HTTPError as e:
+            return [], str(e)
+
+    tenants, tenants_err          = _safe_list("/v2/tenants")
+    deployment_policies, dep_err  = _safe_list("/v2/deploymentPolicies")
+    source_swap_policies, sws_err = _safe_list("/v2/sourceSwapPolicies")
+
+    collector.add_many("tenant", tenants)
+    collector.add_many("deployment_policy", deployment_policies)
+    collector.add_many("source_swap_policy", source_swap_policies)
+
+    # Per-deployment-policy detail: the tenants + files each policy targets.
+    for dp in deployment_policies:
+        dp_id = RawCollector._extract_id("deployment_policy", dp)
+        if not dp_id:
+            continue
+        dp_tenants, _ = _safe_list(f"/v2/deploymentPolicies/{dp_id}/tenants")
+        dp_files, _   = _safe_list(f"/v2/deploymentPolicies/{dp_id}/files")
+        collector.add("deployment_policy_detail",
+                      {"deploymentPolicyId": dp_id, "tenants": dp_tenants, "files": dp_files},
+                      object_id=dp_id)
+
+    # Org role: parent if tenants are enumerable and present; standalone if the
+    # endpoint is reachable but empty; unknown if access is denied (403).
+    if tenants_err:
+        org_role = "unknown"
+    elif tenants:
+        org_role = "parent"
+    else:
+        org_role = "standalone"
+
+    collector.add("organization", {
+        "organizationId":        org_id,
+        "role":                  org_role,
+        "tenantCount":           len(tenants),
+        "tenantsAccessError":    tenants_err,
+        "deploymentPolicyCount": len(deployment_policies),
+        "sourceSwapPolicyCount": len(source_swap_policies),
+    }, object_id=org_id)
+
+    counts.update({
+        "tenant":             len(tenants),
+        "deployment_policy":  len(deployment_policies),
+        "source_swap_policy": len(source_swap_policies),
+        "org_role":           org_role,
+    })
+    for label, err in {"tenants": tenants_err, "deploymentPolicies": dep_err,
+                       "sourceSwapPolicies": sws_err}.items():
+        if err:
+            errors[label] = err
 
     # --- 6) Land everything as raw VARIANT snapshots ---------------------------
     session.sql(f"""
