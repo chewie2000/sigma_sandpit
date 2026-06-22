@@ -214,7 +214,7 @@ SELECT
             THEN 'Parent/host org with ' || o.TENANT_COUNT || ' tenant(s); assess deployment + source-swap policy coverage'
         WHEN o.ORG_ROLE = 'standalone'
             THEN 'Standalone org, no tenants/policies -- candidate to become a parent or be deployed as a tenant'
-        ELSE 'Tenant enumeration denied -- org is not a parent or lacks the multi-tenant entitlement; confirm intended role'
+        ELSE 'Role indeterminate from the API -- tenant enumeration denied (403). This org may be a CHILD tenant, or a non-parent / unentitled org; /v2/tenants cannot distinguish these. Confirm the role out-of-band (see 9c8.12).'
     END                                             AS TOPOLOGY_NOTE,
     o.SNAPSHOT_TS
 FROM STG_ORGANIZATION o;
