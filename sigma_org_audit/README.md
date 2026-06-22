@@ -54,6 +54,9 @@ data via the **`sigma-cli` sub-skill**.
    (`skipPermissionCheck`).
 2. **Deploy the procedures:** run `procs/sigma_org_extract.sql` and
    `procs/sigma_writeback_scan.sql`, then `marts/scd2_history.sql`.
+   > Note: when a procedure's **parameter count changes** between versions,
+   > `CREATE OR REPLACE` cannot replace it (Snowflake rejects the ambiguous
+   > overload). `DROP PROCEDURE <name>(<old arg types>);` first, then re-create.
 3. **Extract:**
    ```sql
    CALL sigma_org_extract('MY_DB', 'MY_SCHEMA');     -- API objects

@@ -285,8 +285,11 @@ WITH latest AS (
 SELECT
     ORG_ID,
     PAYLOAD:role::STRING                    AS ORG_ROLE,
+    PAYLOAD:roleSource::STRING              AS ROLE_SOURCE,        -- api | operator
+    PAYLOAD:parentOrganizationId::STRING    AS PARENT_ORGANIZATION_ID,
     PAYLOAD:tenantCount::NUMBER             AS TENANT_COUNT,
-    PAYLOAD:tenantsAccessError::STRING      AS TENANTS_ACCESS_ERROR,
+    PAYLOAD:tenantsListError::STRING        AS TENANTS_LIST_ERROR,
+    PAYLOAD:tenantSelfError::STRING         AS TENANT_SELF_ERROR,
     PAYLOAD:deploymentPolicyCount::NUMBER   AS DEPLOYMENT_POLICY_COUNT,
     PAYLOAD:sourceSwapPolicyCount::NUMBER   AS SOURCE_SWAP_POLICY_COUNT,
     SNAPSHOT_TS, SNAPSHOT_ID

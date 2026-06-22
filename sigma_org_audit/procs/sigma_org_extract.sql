@@ -61,7 +61,8 @@ CREATE OR REPLACE PROCEDURE sigma_org_extract(
     MAX_WORKERS     NUMBER  DEFAULT 10,
     BASE_URL_OVERRIDE     STRING DEFAULT NULL,
     CLIENT_ID_OVERRIDE    STRING DEFAULT NULL,
-    CLIENT_SECRET_OVERRIDE STRING DEFAULT NULL
+    CLIENT_SECRET_OVERRIDE STRING DEFAULT NULL,
+    ORG_ROLE_OVERRIDE     STRING DEFAULT NULL
 )
 RETURNS STRING
 LANGUAGE PYTHON
@@ -228,7 +229,8 @@ class RawCollector:
 
 def main(session, target_database, target_schema, target_table,
          include_grants, max_workers,
-         base_url_override, client_id_override, client_secret_override):
+         base_url_override, client_id_override, client_secret_override,
+         org_role_override):
 
     # Credential resolution: optional per-call overrides win over the Secrets,
     # letting one deployment audit any org without rotating Secrets. The token
@@ -385,6 +387,12 @@ def main(session, target_database, target_schema, target_table,
         except requests.HTTPError as e:
             return [], str(e)
 
+    def _safe_get(path):
+        try:
+            return get_json(token_mgr, path), None
+        except requests.HTTPError as e:
+            return None, str(e)
+
     tenants, tenants_err          = _safe_list("/v2/tenants")
     deployment_policies, dep_err  = _safe_list("/v2/deploymentPolicies")
     source_swap_policies, sws_err = _safe_list("/v2/sourceSwapPolicies")
@@ -404,20 +412,40 @@ def main(session, target_database, target_schema, target_table,
                       {"deploymentPolicyId": dp_id, "tenants": dp_tenants, "files": dp_files},
                       object_id=dp_id)
 
-    # Org role: parent if tenants are enumerable and present; standalone if the
-    # endpoint is reachable but empty; unknown if access is denied (403).
-    if tenants_err:
-        org_role = "unknown"
+    # Self lookup: GET /v2/tenants/{ownOrgId} returns parentOrganizationId when
+    # this org IS a child tenant -- the only API way to confirm "child" from
+    # inside. Requires tenant-scoped access; a child's own (child-scoped) creds
+    # are typically denied (403), in which case the API cannot self-identify.
+    self_detail, self_err = _safe_get(f"/v2/tenants/{org_id}")
+    parent_org_id = (self_detail or {}).get("parentOrganizationId")
+    if self_detail is not None:
+        collector.add("tenant_self", self_detail, object_id=org_id)
+
+    # Org role classification (per the tenants-API signals):
+    #   operator override (when the API is blind) wins and is tagged accordingly;
+    #   non-empty /v2/tenants        -> parent
+    #   parentOrganizationId present -> child
+    #   /v2/tenants reachable+empty  -> standalone (parent-capable, no children)
+    #   otherwise (tenant API 403)   -> indeterminate (could be child or unentitled)
+    if org_role_override:
+        org_role, role_source = org_role_override, "operator"
     elif tenants:
-        org_role = "parent"
+        org_role, role_source = "parent", "api"
+    elif parent_org_id:
+        org_role, role_source = "child", "api"
+    elif tenants_err is None:
+        org_role, role_source = "standalone", "api"
     else:
-        org_role = "standalone"
+        org_role, role_source = "indeterminate", "api"
 
     collector.add("organization", {
         "organizationId":        org_id,
         "role":                  org_role,
+        "roleSource":            role_source,
+        "parentOrganizationId":  parent_org_id,
         "tenantCount":           len(tenants),
-        "tenantsAccessError":    tenants_err,
+        "tenantsListError":      tenants_err,
+        "tenantSelfError":       self_err,
         "deploymentPolicyCount": len(deployment_policies),
         "sourceSwapPolicyCount": len(source_swap_policies),
     }, object_id=org_id)
@@ -427,6 +455,7 @@ def main(session, target_database, target_schema, target_table,
         "deployment_policy":  len(deployment_policies),
         "source_swap_policy": len(source_swap_policies),
         "org_role":           org_role,
+        "role_source":        role_source,
     })
     for label, err in {"tenants": tenants_err, "deploymentPolicies": dep_err,
                        "sourceSwapPolicies": sws_err}.items():

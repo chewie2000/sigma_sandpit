@@ -32,11 +32,20 @@ Captured per extract; each is Beta/entitled, so a 403 is recorded in the result
 
 | OBJECT_TYPE | Method | Path | Notes |
 |---|---|---|---|
-| `tenant` | GET | `/v2/tenants` | Tenant (child) orgs of a parent/host org. 403 if not a parent / not entitled. |
+| `tenant` | GET | `/v2/tenants` | Tenant (child) orgs of a parent/host org. Non-empty => caller is a PARENT. 403 if caller lacks tenant-scope (e.g. a child's own creds). |
+| `tenant_self` | GET | `/v2/tenants/{ownOrgId}` | Self-lookup: a populated `parentOrganizationId` confirms the caller is a CHILD. Needs tenant-scoped access; a child's own creds are typically 403. |
 | `deployment_policy` | GET | `/v2/deploymentPolicies` | Beta. Governs deploying content to tenants. |
 | `deployment_policy_detail` | GET | `/v2/deploymentPolicies/{id}/tenants` + `/files` | Per-policy target tenants + documents. |
 | `source_swap_policy` | GET | `/v2/sourceSwapPolicies` | Beta. Per-tenant source remapping. |
-| `organization` | (derived) | — | Synthetic row: `{organizationId, role, tenantCount, tenantsAccessError, deploymentPolicyCount, sourceSwapPolicyCount}`. Role = parent / standalone / unknown. |
+| `organization` | (derived) | — | Synthetic row: `{organizationId, role, roleSource, parentOrganizationId, tenantCount, tenantsListError, tenantSelfError, deploymentPolicyCount, sourceSwapPolicyCount}`. |
+
+**Role classification:** non-empty `/v2/tenants` => `parent`; `parentOrganizationId`
+from the self-lookup => `child`; reachable-but-empty list => `standalone`;
+both calls denied (403) => `indeterminate`. Because a child org's own credentials
+are usually denied on the tenants API, a child **cannot** self-identify from
+inside — pass the `ORG_ROLE_OVERRIDE` parameter (e.g. `'child'`) to record the
+role authoritatively when known out-of-band; it is tagged `roleSource = operator`
+vs `api`.
 
 ## `sigma_org_extract` — API object types
 

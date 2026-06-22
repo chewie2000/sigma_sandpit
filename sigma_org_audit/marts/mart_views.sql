@@ -204,17 +204,24 @@ CREATE OR REPLACE VIEW V_TENANCY_TOPOLOGY AS
 SELECT
     o.ORG_ID,
     o.ORG_ROLE,
+    o.ROLE_SOURCE,                                  -- api (confirmed) | operator (asserted)
+    o.PARENT_ORGANIZATION_ID,
     o.TENANT_COUNT,
     o.DEPLOYMENT_POLICY_COUNT,
     o.SOURCE_SWAP_POLICY_COUNT,
-    (o.TENANTS_ACCESS_ERROR IS NOT NULL)            AS TENANT_ENUM_DENIED,
-    o.TENANTS_ACCESS_ERROR,
+    (o.TENANTS_LIST_ERROR IS NOT NULL)              AS TENANT_ENUM_DENIED,
+    o.TENANTS_LIST_ERROR,
+    o.TENANT_SELF_ERROR,
     CASE
         WHEN o.ORG_ROLE = 'parent'
             THEN 'Parent/host org with ' || o.TENANT_COUNT || ' tenant(s); assess deployment + source-swap policy coverage'
+        WHEN o.ORG_ROLE = 'child'
+            THEN 'Child tenant'
+                 || COALESCE(' of parent ' || o.PARENT_ORGANIZATION_ID, '')
+                 || IFF(o.ROLE_SOURCE = 'operator', ' (operator-asserted; API self-lookup denied)', ' (API-confirmed)')
         WHEN o.ORG_ROLE = 'standalone'
             THEN 'Standalone org, no tenants/policies -- candidate to become a parent or be deployed as a tenant'
-        ELSE 'Role indeterminate from the API -- tenant enumeration denied (403). This org may be a CHILD tenant, or a non-parent / unentitled org; /v2/tenants cannot distinguish these. Confirm the role out-of-band (see 9c8.12).'
+        ELSE 'Role indeterminate from the API -- tenant list + self-lookup both denied (403). May be a CHILD tenant or a non-parent / unentitled org; re-run with ORG_ROLE_OVERRIDE when the role is known out-of-band (see 9c8.12).'
     END                                             AS TOPOLOGY_NOTE,
     o.SNAPSHOT_TS
 FROM STG_ORGANIZATION o;
