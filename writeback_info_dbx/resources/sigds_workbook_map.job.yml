@@ -1,0 +1,52 @@
+resources:
+  jobs:
+    sigds_workbook_map:
+      name: sigds_workbook_map — Sigma writeback inventory
+
+      # Daily refresh. Paused in dev, unpaused in prod (see databricks.yml).
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause}
+
+      # One notification email is enough; extend as needed.
+      # email_notifications:
+      #   on_failure:
+      #     - data-platform@example.com
+
+      tasks:
+        # Fan out over every writeback schema. map_schema stays fixed; the loop
+        # variable {{input}} supplies scan_schema per iteration. concurrency: 1
+        # keeps Sigma API load and warehouse pressure predictable — raise it if
+        # you have many schemas and want them in parallel.
+        - task_key: populate_all_schemas
+          for_each_task:
+            inputs: ${var.schemas}
+            concurrency: 1
+            task:
+              task_key: populate
+              notebook_task:
+                notebook_path: ../src/populate_sigds_workbook_map.py
+                base_parameters:
+                  catalog: ${var.catalog}
+                  scan_schema: "{{input}}"
+                  map_schema: ${var.map_schema}
+                  sigma_api_base: ${var.sigma_api_base}
+                  secret_scope: ${var.secret_scope}
+                  # Tuning knobs keep their notebook defaults unless set here:
+                  # max_wal_tables: "0"
+                  # describe_workers: "16"
+                  # wal_batch_size: "100"
+
+      # Runs on serverless job compute (no cluster block needed). If serverless
+      # is not enabled on your workspace, define a job_cluster instead and add
+      #   job_cluster_key: <key>
+      # to the inner task above. Example:
+      #
+      # job_clusters:
+      #   - job_cluster_key: sigds
+      #     new_cluster:
+      #       spark_version: 15.4.x-scala2.12
+      #       node_type_id: m5d.large      # match your cloud/region
+      #       num_workers: 1
+      #       data_security_mode: SINGLE_USER

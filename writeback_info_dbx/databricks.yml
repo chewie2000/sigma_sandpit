@@ -1,0 +1,70 @@
+# Databricks Asset Bundle — writeback_info_dbx
+#
+# Inventories Sigma writeback (input-table) activity across one or more Unity
+# Catalog schemas and populates a central SIGDS_WORKBOOK_MAP table. The populate
+# notebook is deployed once and run per schema via a for_each task; Sigma OAuth
+# client credentials live in a Databricks secret scope (never in this repo).
+#
+# Deploy:   databricks bundle deploy -t dev
+# Run:      databricks bundle run sigds_workbook_map -t dev
+bundle:
+  name: writeback_info_dbx
+
+include:
+  - resources/*.yml
+
+# ---------------------------------------------------------------------------
+# Variables — override per target below, or with --var on the CLI.
+# ---------------------------------------------------------------------------
+variables:
+  catalog:
+    description: Unity Catalog name containing the writeback schemas.
+    default: ""
+  map_schema:
+    description: Schema where the shared SIGDS_WORKBOOK_MAP table lives.
+    default: ""
+  sigma_api_base:
+    description: Regional Sigma API base URL including the /v2 suffix.
+    default: ""
+  secret_scope:
+    description: Databricks secret scope holding Sigma client_id / client_secret.
+    default: sigma
+  schemas:
+    description: >-
+      JSON array of schemas to scan, one for_each iteration per entry. Keep
+      map_schema fixed; this list only drives scan_schema.
+    default: '[]'
+  schedule_pause:
+    description: PAUSED or UNPAUSED for the scheduled trigger.
+    default: PAUSED
+
+# ---------------------------------------------------------------------------
+# Targets
+# ---------------------------------------------------------------------------
+targets:
+  # Replace every <...> token below with your own values. See the README
+  # ("Set bundle variables") for what each one is and where to find it.
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://<your-databricks-workspace-url>
+    variables:
+      catalog: <your-catalog>
+      map_schema: <your-map-schema>
+      sigma_api_base: <your-sigma-api-base-url>
+      schemas: '["<your-schema>"]'
+
+  prod:
+    mode: production
+    workspace:
+      host: https://<your-databricks-workspace-url>
+      # Scope prod deploys to the deploying principal (ideally a dedicated
+      # service principal in CI), not a world-writable shared folder.
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      schedule_pause: UNPAUSED
+      catalog: <your-catalog>
+      map_schema: <your-map-schema>
+      sigma_api_base: <your-sigma-api-base-url>
+      schemas: '["<your-schema>","<another-schema>"]'

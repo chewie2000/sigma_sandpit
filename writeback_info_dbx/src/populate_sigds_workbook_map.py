@@ -1,3 +1,16 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # populate_sigds_workbook_map
+# MAGIC
+# MAGIC Run as a **notebook task** inside the `writeback_info_dbx` Databricks Asset
+# MAGIC Bundle. Configuration is supplied at runtime via job/task parameters
+# MAGIC (widgets); Sigma OAuth client credentials are read from a Databricks
+# MAGIC **secret scope** — never hard-coded. See `databricks.yml` and the README
+# MAGIC for the deploy/run path. The scan logic below is unchanged from the
+# MAGIC original single-script version.
+
+# COMMAND ----------
+
 """
 populate_sigds_workbook_map.py
 
@@ -60,28 +73,103 @@ from pyspark.sql.types import (
 )
 
 spark = SparkSession.builder.getOrCreate()
+dbutils = globals().get("dbutils")  # provided by the Databricks notebook runtime
 
 # ---------------------------------------------------------------------------
-# Configuration — update before running
+# Configuration — supplied at runtime, not edited in source
 # ---------------------------------------------------------------------------
-CATALOG          = "<YOUR_CATALOG>"     # Databricks Unity Catalog name
-SCAN_SCHEMA      = "<YOUR_SCAN_SCHEMA>" # Schema to scan for sigds_wal_* and sigds_* tables
-MAP_SCHEMA       = "<YOUR_MAP_SCHEMA>"  # Schema where SIGDS_WORKBOOK_MAP lives
-#   Single schema:  set SCAN_SCHEMA = MAP_SCHEMA = your writeback schema
-#   Multi-schema:   keep MAP_SCHEMA fixed; change SCAN_SCHEMA each run
-TARGET_TABLE     = f"{CATALOG}.{MAP_SCHEMA}.SIGDS_WORKBOOK_MAP"
+# Non-secret config arrives as job/task parameters (widgets). The for_each
+# task in the bundle sets `scan_schema` per iteration while `map_schema` stays
+# fixed, so one deployed artifact covers every writeback schema.
+#
+#   Single schema:  set scan_schema = map_schema to your writeback schema
+#   Multi-schema:   keep map_schema fixed; the for_each task varies scan_schema
+dbutils.widgets.text("catalog",         "", "Unity Catalog name")
+dbutils.widgets.text("scan_schema",     "", "Schema to scan for sigds_wal_* / sigds_* tables")
+dbutils.widgets.text("map_schema",      "", "Schema where SIGDS_WORKBOOK_MAP lives")
 # Sigma API base URL — find your regional endpoint at:
 # https://help.sigmacomputing.com/reference/get-started-sigma-api
-SIGMA_API_BASE      = "<YOUR_API_BASE_URL>/v2"
-SIGMA_CLIENT_ID     = "<YOUR_SIGMA_CLIENT_ID>"
-SIGMA_CLIENT_SECRET = "<YOUR_SIGMA_CLIENT_SECRET>"
-MAX_WAL_TABLE_FQNS   = 0   # 0 = all; set > 0 to cap WAL tables for testing
-DESCRIBE_WORKERS = 16  # thread-pool size for all parallel DESCRIBE DETAIL calls
-WAL_BATCH_SIZE   = 100 # max WAL tables per UNION ALL query
+dbutils.widgets.text("sigma_api_base",  "", "Sigma API base URL incl. /v2 suffix")
+dbutils.widgets.text("secret_scope",    "sigma", "Databricks secret scope holding Sigma client creds")
+dbutils.widgets.text("max_wal_tables",  "0",  "0 = all; > 0 caps WAL tables for testing")
+dbutils.widgets.text("describe_workers", "16", "Thread-pool size for parallel DESCRIBE DETAIL")
+dbutils.widgets.text("wal_batch_size",  "100", "Max WAL tables per UNION ALL query")
+dbutils.widgets.text("use_tqdm",        "false", "Render tqdm progress bars in notebook output (UI)")
+
+CATALOG        = dbutils.widgets.get("catalog").strip()
+SCAN_SCHEMA    = dbutils.widgets.get("scan_schema").strip()
+MAP_SCHEMA     = dbutils.widgets.get("map_schema").strip()
+SIGMA_API_BASE = dbutils.widgets.get("sigma_api_base").strip().rstrip("/")
+SECRET_SCOPE   = dbutils.widgets.get("secret_scope").strip()
+TARGET_TABLE   = f"{CATALOG}.{MAP_SCHEMA}.SIGDS_WORKBOOK_MAP"
+
+MAX_WAL_TABLE_FQNS = int(dbutils.widgets.get("max_wal_tables"))
+DESCRIBE_WORKERS   = int(dbutils.widgets.get("describe_workers"))
+WAL_BATCH_SIZE     = int(dbutils.widgets.get("wal_batch_size"))
+USE_TQDM           = dbutils.widgets.get("use_tqdm").strip().lower() in ("1", "true", "yes")
+
+_required = [
+    ("catalog", CATALOG), ("scan_schema", SCAN_SCHEMA),
+    ("map_schema", MAP_SCHEMA), ("sigma_api_base", SIGMA_API_BASE),
+]
+_missing = [name for name, val in _required if not val]
+if _missing:
+    raise ValueError(
+        f"Missing required parameter(s): {', '.join(_missing)}. "
+        "Set them in databricks.yml (see README — Set bundle variables)."
+    )
+# Catch placeholder tokens left unfilled (e.g. <your-catalog>) so the run fails
+# with a clear message rather than a cryptic catalog/schema-not-found error.
+_placeholders = [name for name, val in _required if "<" in val and ">" in val]
+if _placeholders:
+    raise ValueError(
+        f"Parameter(s) still contain placeholder values: {', '.join(_placeholders)}. "
+        "Replace the <...> tokens in databricks.yml with your real values "
+        "(see README — Set bundle variables)."
+    )
+
+# Secrets — read from the Databricks secret scope, never hard-coded. The
+# returned values are automatically redacted from notebook/log output.
+SIGMA_CLIENT_ID     = dbutils.secrets.get(SECRET_SCOPE, "client_id")
+SIGMA_CLIENT_SECRET = dbutils.secrets.get(SECRET_SCOPE, "client_secret")
 # ---------------------------------------------------------------------------
 
-if any(v.startswith("<YOUR_") for v in [CATALOG, SCAN_SCHEMA, MAP_SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID, SIGMA_CLIENT_SECRET]):
-    raise ValueError("Set CATALOG, SCAN_SCHEMA, MAP_SCHEMA, SIGMA_API_BASE, SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET before running.")
+
+# ===========================================================================
+# Progress reporting
+# ===========================================================================
+# The run has 7 phases. Each phase's log lines are prefixed "[Phase n/7] ...".
+# Long-running steps (WAL batch extraction, parallel DESCRIBE DETAIL) also emit
+# an ASCII progress bar. These print() lines appear both in the CLI run logs and
+# in the notebook output. Set use_tqdm=true to additionally render tqdm bars in
+# the notebook UI (no effect on the plain-text CLI logs).
+
+def _bar(done: int, total: int, width: int = 24) -> str:
+    """Render an ASCII progress bar like ▕███████░░░░░░░░░░░▏ 3/5."""
+    if not total:
+        return "0/0"
+    filled = int(width * done / total)
+    return "▕" + "█" * filled + "░" * (width - filled) + f"▏ {done}/{total}"
+
+
+def progress_completed(futures_iter, total: int, label: str):
+    """
+    Wrap an as_completed() iterator, yielding each future while reporting
+    progress.  With use_tqdm=true a tqdm bar is used (notebook UI); otherwise an
+    ASCII bar is printed at ~10 increments (CLI-friendly, no carriage returns).
+    """
+    if USE_TQDM:
+        try:
+            from tqdm.auto import tqdm
+            yield from tqdm(futures_iter, total=total, desc=label)
+            return
+        except Exception:
+            pass  # tqdm unavailable — fall back to plain prints
+    step = max(1, total // 10)
+    for i, fut in enumerate(futures_iter, start=1):
+        if i == total or i % step == 0:
+            print(f"  {label} {_bar(i, total)}")
+        yield fut
 
 
 # ===========================================================================
@@ -192,7 +280,9 @@ def parallel_wal_last_modified(wal_names: list) -> dict:
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=DESCRIBE_WORKERS) as pool:
         futures = {pool.submit(get_wal_last_modified, w): w for w in wal_names}
-        for future in concurrent.futures.as_completed(futures):
+        for future in progress_completed(
+            concurrent.futures.as_completed(futures), len(futures), "DESCRIBE WAL"
+        ):
             name, ts = future.result()
             results[name] = ts
     return results
@@ -222,7 +312,9 @@ def parallel_describe_sigds(table_names: list) -> dict:
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=DESCRIBE_WORKERS) as pool:
         futures = {pool.submit(describe_sigds_table, t): t for t in table_names}
-        for future in concurrent.futures.as_completed(futures):
+        for future in progress_completed(
+            concurrent.futures.as_completed(futures), len(futures), "DESCRIBE SIGDS"
+        ):
             results[futures[future]] = future.result()
     return results
 
@@ -275,6 +367,67 @@ def extract_wal_records_batch(wal_batch: list) -> list:
 
 
 # ===========================================================================
+# Target-table schema (single source of truth)
+# ===========================================================================
+# MERGE_SCHEMA defines every column written to SIGDS_WORKBOOK_MAP. It is used
+# both to CREATE the table on first run and to type the MERGE staging DataFrame,
+# so the two can never drift. The standalone DDL in sql/create_sigds_workbook_map.sql
+# is an equivalent manual/reference copy (with column comments) for anyone who
+# prefers to provision the table by hand.
+MERGE_SCHEMA = StructType([
+    StructField("WAL_TABLE_FQN",            StringType(),    True),
+    StructField("WAL_DS_ID",                StringType(),    True),
+    StructField("SIGDS_TABLE",              StringType(),    True),
+    StructField("SCAN_SCHEMA",              StringType(),    True),
+    StructField("WORKBOOK_ID",          StringType(),    True),
+    StructField("WAL_WORKBOOK_URL",         StringType(),    True),
+    StructField("ORG_SLUG",             StringType(),    True),
+    StructField("WAL_INPUT_TABLE_NAME",     StringType(),    True),
+    StructField("WAL_LAST_EDIT_AT",         TimestampType(), True),
+    StructField("WAL_LAST_EDIT_BY",         StringType(),    True),
+    StructField("WORKBOOK_NAME",        StringType(),    True),
+    StructField("WORKBOOK_PATH",        StringType(),    True),
+    StructField("OBJECT_TYPE",          StringType(),    True),
+    StructField("SIGDS_TABLE_ID",             StringType(),    True),
+    StructField("SIGDS_TABLE_LOCATION",       StringType(),    True),
+    StructField("SIGDS_TABLE_CREATED_AT",     TimestampType(), True),
+    StructField("SIGDS_TABLE_LAST_MODIFIED",  TimestampType(), True),
+    StructField("SIGDS_TABLE_SIZE_BYTES",     LongType(),      True),
+    StructField("WAL_MAX_EDIT_NUM",         LongType(),      True),
+    StructField("WAL_TABLE_LAST_MODIFIED",     TimestampType(), True),
+    StructField("IS_ORPHANED",          BooleanType(),   True),
+    StructField("IS_DELETED",           BooleanType(),   True),
+    StructField("DELETED_AT",           TimestampType(), True),
+    StructField("IS_LEGACY_WAL",        BooleanType(),   True),
+    # Version tag fields
+    StructField("IS_TAGGED_VERSION",   BooleanType(),   True),
+    StructField("VERSION_TAG_NAME",    StringType(),    True),
+    StructField("PARENT_WORKBOOK_ID",  StringType(),    True),
+    # Sigma API enrichment fields
+    StructField("API_WORKBOOK_URL",              StringType(),    True),
+    StructField("API_OWNER_ID",         StringType(),    True),
+    StructField("API_IS_ARCHIVED",      BooleanType(),   True),
+    StructField("API_OWNER_FIRST_NAME", StringType(),    True),
+    StructField("API_OWNER_LAST_NAME",  StringType(),    True),
+])
+
+
+def ensure_target_table() -> bool:
+    """
+    Create SIGDS_WORKBOOK_MAP if it does not already exist, deriving the column
+    DDL from MERGE_SCHEMA so the table and the MERGE always agree. Idempotent:
+    a no-op when the table is already present. Returns True if it created it.
+    """
+    existed = spark.catalog.tableExists(TARGET_TABLE)
+    if not existed:
+        cols = ",\n  ".join(
+            f"{f.name} {f.dataType.simpleString().upper()}" for f in MERGE_SCHEMA.fields
+        )
+        spark.sql(f"CREATE TABLE IF NOT EXISTS {TARGET_TABLE} (\n  {cols}\n) USING DELTA")
+    return not existed
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -282,7 +435,16 @@ def extract_wal_records_batch(wal_batch: list) -> list:
 # Step 1 — Authenticate with Sigma
 # ---------------------------------------------------------------------------
 sigma_token = get_sigma_token(SIGMA_CLIENT_ID, SIGMA_CLIENT_SECRET)
-print("Step 1: Sigma token obtained.")
+print("[Phase 1/7] Sigma token obtained.")
+
+# Ensure the target table exists before we read from it. Idempotent — created
+# from MERGE_SCHEMA on first run, a no-op thereafter. Removes the need to run
+# sql/create_sigds_workbook_map.sql by hand. (Keep for_each concurrency at 1 on
+# the very first run so iterations don't race to create the same table.)
+if ensure_target_table():
+    print(f"[Phase 1/7] Created {TARGET_TABLE} (first run).")
+else:
+    print(f"[Phase 1/7] Target table {TARGET_TABLE} already exists.")
 
 # ---------------------------------------------------------------------------
 # Step 2 — Load stored watermarks, known WORKBOOK_IDs, and enrichment cache
@@ -343,7 +505,7 @@ for row in stored_rows:
             known_non_orphaned_sigds.add(st)
 
 print(
-    f"Step 2: Loaded watermarks for {len(watermarks)} WAL tables (schema={SCAN_SCHEMA}); "
+    f"[Phase 2/7] Loaded watermarks for {len(watermarks)} WAL tables (schema={SCAN_SCHEMA}); "
     f"{len(known_wb_ids)} WORKBOOK_IDs already enriched (all schemas); "
     f"{len(previously_deleted_wals)} previously flagged as deleted; "
     f"{len(known_orphaned_sigds)} previously flagged as orphaned."
@@ -373,18 +535,18 @@ if MAX_WAL_TABLE_FQNS == 0:
     newly_deleted_wals = known_wal_tables - all_wal_set        # in map, gone from schema
     reappeared_wals    = previously_deleted_wals & all_wal_set # was deleted, now back
     if newly_deleted_wals:
-        print(f"Step 3: {len(newly_deleted_wals)} WAL table(s) no longer in schema — will be flagged as deleted:")
+        print(f"[Phase 3/7] {len(newly_deleted_wals)} WAL table(s) no longer in schema — will be flagged as deleted:")
         for w in sorted(newly_deleted_wals):
             print(f"  {w}")
     if reappeared_wals:
-        print(f"Step 3: {len(reappeared_wals)} previously deleted WAL table(s) have reappeared — deletion flag will be cleared.")
+        print(f"[Phase 3/7] {len(reappeared_wals)} previously deleted WAL table(s) have reappeared — deletion flag will be cleared.")
 else:
     newly_deleted_wals = set()
     reappeared_wals    = set()
-    print("Step 3: Deletion detection skipped (MAX_WAL_TABLE_FQNS is set — full WAL list not available).")
+    print("[Phase 3/7] Deletion detection skipped (MAX_WAL_TABLE_FQNS is set — full WAL list not available).")
 
 print(
-    f"Step 3: Discovered {len(all_wal_names)} WAL tables. "
+    f"[Phase 3/7] Discovered {len(all_wal_names)} WAL tables. "
     f"Running parallel DESCRIBE DETAIL to check for changes..."
 )
 wal_modified = parallel_wal_last_modified(all_wal_names)
@@ -397,7 +559,7 @@ to_process = [
 ]
 
 print(
-    f"Step 3: {len(to_process)} WAL tables require reprocessing; "
+    f"[Phase 3/7] {len(to_process)} WAL tables require reprocessing; "
     f"{len(all_wal_names) - len(to_process)} unchanged and skipped."
 )
 
@@ -406,7 +568,7 @@ if not to_process and not newly_deleted_wals and not reappeared_wals:
         # Capped run — orphan checks on existing records are unreliable, so exit.
         print("SIGDS_WORKBOOK_MAP is already up to date. Nothing to do.")
         raise SystemExit(0)
-    print("Step 3: No WAL changes — proceeding to check existing records for orphan status changes.")
+    print("[Phase 3/7] No WAL changes — proceeding to check existing records for orphan status changes.")
 
 # ---------------------------------------------------------------------------
 # Step 4 — Extract latest WAL records for changed tables (batched UNION ALL)
@@ -420,10 +582,10 @@ batches          = [
 
 new_records = []
 for idx, batch in enumerate(batches, start=1):
-    print(f"  Step 4: Extracting WAL batch {idx}/{len(batches)} ({len(batch)} tables)...")
+    print(f"  Extracting WAL batches {_bar(idx, len(batches))} (this batch: {len(batch)} tables)")
     new_records.extend(extract_wal_records_batch(batch))
 
-print(f"Step 4: Extracted {len(new_records)} new/updated SIGDS table records.")
+print(f"[Phase 4/7] Extracted {len(new_records)} new/updated SIGDS table records.")
 
 # Deduplicate by SIGDS_TABLE (the MERGE key), keeping the highest WAL_MAX_EDIT_NUM.
 # Sigma can maintain two WAL tables for the same dataset when it migrates from
@@ -436,7 +598,7 @@ for r in new_records:
     if t and (t not in _seen or (r["WAL_MAX_EDIT_NUM"] or 0) > (_seen[t]["WAL_MAX_EDIT_NUM"] or 0)):
         _seen[t] = r
 new_records = list(_seen.values())
-print(f"Step 4: {len(new_records)} unique SIGDS tables after deduplication.")
+print(f"[Phase 4/7] {len(new_records)} unique SIGDS tables after deduplication.")
 
 # ---------------------------------------------------------------------------
 # Step 5 — DESCRIBE DETAIL (parallel) for each new/updated SIGDS table
@@ -454,16 +616,16 @@ orphaned_tables  = {t for t in all_sigds_names if t.lower() not in existing_tabl
 sigds_bare_names = [t for t in all_sigds_names if t.lower() in existing_tables]
 
 if orphaned_tables:
-    print(f"Step 5: {len(orphaned_tables)} orphaned WAL record(s) — SIGDS table not found in schema:")
+    print(f"[Phase 5/7] {len(orphaned_tables)} orphaned WAL record(s) — SIGDS table not found in schema:")
     for t in sorted(orphaned_tables):
         print(f"  {t}")
 
 print(
-    f"Step 5: Running DESCRIBE DETAIL on {len(sigds_bare_names)} SIGDS tables "
+    f"[Phase 5/7] Running DESCRIBE DETAIL on {len(sigds_bare_names)} SIGDS tables "
     f"using {DESCRIBE_WORKERS} workers..."
 )
 detail_map = parallel_describe_sigds(sigds_bare_names)
-print(f"Step 5: DESCRIBE DETAIL complete. {len(sigds_bare_names)} valid, {len(orphaned_tables)} orphaned.")
+print(f"[Phase 5/7] DESCRIBE DETAIL complete. {len(sigds_bare_names)} valid, {len(orphaned_tables)} orphaned.")
 
 # When running a full scan (MAX_WAL_TABLE_FQNS == 0), also check existing records
 # in the map that were not part of this run's WAL changes.
@@ -478,15 +640,15 @@ if MAX_WAL_TABLE_FQNS == 0:
         if t.lower() in existing_tables and t not in new_record_sigds
     }
     if newly_orphaned_existing:
-        print(f"Step 5: {len(newly_orphaned_existing)} existing record(s) newly orphaned:")
+        print(f"[Phase 5/7] {len(newly_orphaned_existing)} existing record(s) newly orphaned:")
         for t in sorted(newly_orphaned_existing):
             print(f"  {t}")
     if recovered_existing:
-        print(f"Step 5: {len(recovered_existing)} previously orphaned record(s) have recovered.")
+        print(f"[Phase 5/7] {len(recovered_existing)} previously orphaned record(s) have recovered.")
 else:
     newly_orphaned_existing = set()
     recovered_existing      = set()
-    print("Step 5: Orphan check for existing records skipped (MAX_WAL_TABLE_FQNS is set).")
+    print("[Phase 5/7] Orphan check for existing records skipped (MAX_WAL_TABLE_FQNS is set).")
 
 # ---------------------------------------------------------------------------
 # Step 6 — Sigma API enrichment (new IDs) + archive status refresh (all IDs)
@@ -507,12 +669,12 @@ all_wb_ids_to_check = new_wb_ids | known_wb_ids
 
 if all_wb_ids_to_check:
     print(
-        f"Step 6: Fetching Sigma workbook/data-model list "
+        f"[Phase 6/7] Fetching Sigma workbook/data-model list "
         f"({len(new_wb_ids)} new enrichment, {len(known_wb_ids)} archive re-check)..."
     )
     workbooks  = sigma_paginate(sigma_token, "workbooks")
     datamodels = sigma_paginate(sigma_token, "dataModels")
-    print(f"Step 6: Sigma API returned {len(workbooks)} workbook(s), {len(datamodels)} data model(s).")
+    print(f"[Phase 6/7] Sigma API returned {len(workbooks)} workbook(s), {len(datamodels)} data model(s).")
     wb_index = build_id_index(workbooks,  all_wb_ids_to_check)
     dm_index = build_id_index(datamodels, all_wb_ids_to_check)
 
@@ -520,7 +682,7 @@ if all_wb_ids_to_check:
     # taggedWorkbookId values found in WAL records can be resolved
     # back to their parent workbook metadata.
     all_tags = sigma_paginate(sigma_token, "tags")
-    print(f"Step 6: Sigma API returned {len(all_tags)} version tag(s).")
+    print(f"[Phase 6/7] Sigma API returned {len(all_tags)} version tag(s).")
     tagged_wb_index = {}   # {taggedWorkbookId.lower() -> parent/tag info}
     for tag in all_tags:
         tag_id   = tag.get("versionTagId")
@@ -540,7 +702,7 @@ if all_wb_ids_to_check:
                         "workbook_url":       wb.get("url"),
                         "ownerId":            wb.get("ownerId"),
                     }
-    print(f"Step 6: Built tagged workbook index with {len(tagged_wb_index)} entry(ies).")
+    print(f"[Phase 6/7] Built tagged workbook index with {len(tagged_wb_index)} entry(ies).")
 
     # Full enrichment for newly-seen WORKBOOK_IDs.
     for wid in new_wb_ids:
@@ -585,9 +747,9 @@ if all_wb_ids_to_check:
     # Resolve owner display names for new IDs via /v2/members.
     owner_ids = {m["API_OWNER_ID"] for m in wb_meta.values() if m.get("API_OWNER_ID")}
     if owner_ids:
-        print(f"Step 6: Fetching Sigma members to resolve {len(owner_ids)} owner ID(s)...")
+        print(f"[Phase 6/7] Fetching Sigma members to resolve {len(owner_ids)} owner ID(s)...")
         all_members  = sigma_paginate(sigma_token, "members")
-        print(f"Step 6: Sigma API returned {len(all_members)} member(s).")
+        print(f"[Phase 6/7] Sigma API returned {len(all_members)} member(s).")
         member_index = {
             m["memberId"].strip().lower(): m
             for m in all_members
@@ -601,7 +763,7 @@ if all_wb_ids_to_check:
                 meta["API_OWNER_LAST_NAME"]  = member.get("lastName")
 
     if new_wb_ids:
-        print(f"Step 6: Resolved {len(wb_meta)} of {len(new_wb_ids)} new WORKBOOK_IDs.")
+        print(f"[Phase 6/7] Resolved {len(wb_meta)} of {len(new_wb_ids)} new WORKBOOK_IDs.")
 
     # Archive status re-check for all existing WORKBOOK_IDs.
     # Only update when the API explicitly provides an archived state:
@@ -635,52 +797,15 @@ if all_wb_ids_to_check:
             archive_updates[wid] = current_archived
 
     if archive_updates:
-        print(f"Step 6: Archive status changed for {len(archive_updates)} existing WORKBOOK_ID(s).")
+        print(f"[Phase 6/7] Archive status changed for {len(archive_updates)} existing WORKBOOK_ID(s).")
     else:
-        print("Step 6: No archive status changes detected.")
+        print("[Phase 6/7] No archive status changes detected.")
 else:
-    print("Step 6: No WORKBOOK_IDs to process — Sigma API fetch skipped.")
+    print("[Phase 6/7] No WORKBOOK_IDs to process — Sigma API fetch skipped.")
 
 # ---------------------------------------------------------------------------
 # Step 7 — Assemble rows and MERGE into SIGDS_WORKBOOK_MAP
 # ---------------------------------------------------------------------------
-MERGE_SCHEMA = StructType([
-    StructField("WAL_TABLE_FQN",            StringType(),    True),
-    StructField("WAL_DS_ID",                StringType(),    True),
-    StructField("SIGDS_TABLE",              StringType(),    True),
-    StructField("SCAN_SCHEMA",              StringType(),    True),
-    StructField("WORKBOOK_ID",          StringType(),    True),
-    StructField("WAL_WORKBOOK_URL",         StringType(),    True),
-    StructField("ORG_SLUG",             StringType(),    True),
-    StructField("WAL_INPUT_TABLE_NAME",     StringType(),    True),
-    StructField("WAL_LAST_EDIT_AT",         TimestampType(), True),
-    StructField("WAL_LAST_EDIT_BY",         StringType(),    True),
-    StructField("WORKBOOK_NAME",        StringType(),    True),
-    StructField("WORKBOOK_PATH",        StringType(),    True),
-    StructField("OBJECT_TYPE",          StringType(),    True),
-    StructField("SIGDS_TABLE_ID",             StringType(),    True),
-    StructField("SIGDS_TABLE_LOCATION",       StringType(),    True),
-    StructField("SIGDS_TABLE_CREATED_AT",     TimestampType(), True),
-    StructField("SIGDS_TABLE_LAST_MODIFIED",  TimestampType(), True),
-    StructField("SIGDS_TABLE_SIZE_BYTES",     LongType(),      True),
-    StructField("WAL_MAX_EDIT_NUM",         LongType(),      True),
-    StructField("WAL_TABLE_LAST_MODIFIED",     TimestampType(), True),
-    StructField("IS_ORPHANED",          BooleanType(),   True),
-    StructField("IS_DELETED",           BooleanType(),   True),
-    StructField("DELETED_AT",           TimestampType(), True),
-    StructField("IS_LEGACY_WAL",        BooleanType(),   True),
-    # Version tag fields
-    StructField("IS_TAGGED_VERSION",   BooleanType(),   True),
-    StructField("VERSION_TAG_NAME",    StringType(),    True),
-    StructField("PARENT_WORKBOOK_ID",  StringType(),    True),
-    # Sigma API enrichment fields
-    StructField("API_WORKBOOK_URL",              StringType(),    True),
-    StructField("API_OWNER_ID",         StringType(),    True),
-    StructField("API_IS_ARCHIVED",      BooleanType(),   True),
-    StructField("API_OWNER_FIRST_NAME", StringType(),    True),
-    StructField("API_OWNER_LAST_NAME",  StringType(),    True),
-])
-
 rows = []
 for r in new_records:
     detail = detail_map.get(r["SIGDS_TABLE"], {})
@@ -740,9 +865,9 @@ if rows:
         WHEN NOT MATCHED THEN
             INSERT *
     """)
-    print(f"Step 7: MERGE complete — {len(rows)} rows upserted into {TARGET_TABLE}.")
+    print(f"[Phase 7/7] MERGE complete — {len(rows)} rows upserted into {TARGET_TABLE}.")
 else:
-    print("Step 7: No WAL changes — MERGE skipped.")
+    print("[Phase 7/7] No WAL changes — MERGE skipped.")
 
 # Flag records whose WAL table has disappeared since the last run.
 if newly_deleted_wals:
@@ -755,7 +880,7 @@ if newly_deleted_wals:
           AND  WAL_TABLE_FQN IN ({wal_csv})
           AND  (IS_DELETED IS NULL OR IS_DELETED = FALSE)
     """)
-    print(f"Step 7: Flagged {len(newly_deleted_wals)} record(s) as deleted.")
+    print(f"[Phase 7/7] Flagged {len(newly_deleted_wals)} record(s) as deleted.")
 
 # Apply archive status changes for existing WORKBOOK_IDs.
 if archive_updates:
@@ -764,11 +889,11 @@ if archive_updates:
     if newly_archived:
         wid_csv = ", ".join(f"'{w}'" for w in newly_archived)
         spark.sql(f"UPDATE {TARGET_TABLE} SET API_IS_ARCHIVED = TRUE  WHERE WORKBOOK_ID IN ({wid_csv})")
-        print(f"Step 7: Marked {len(newly_archived)} workbook(s) as archived.")
+        print(f"[Phase 7/7] Marked {len(newly_archived)} workbook(s) as archived.")
     if newly_unarchived:
         wid_csv = ", ".join(f"'{w}'" for w in newly_unarchived)
         spark.sql(f"UPDATE {TARGET_TABLE} SET API_IS_ARCHIVED = FALSE WHERE WORKBOOK_ID IN ({wid_csv})")
-        print(f"Step 7: Marked {len(newly_unarchived)} workbook(s) as unarchived.")
+        print(f"[Phase 7/7] Marked {len(newly_unarchived)} workbook(s) as unarchived.")
 
 # Update IS_ORPHANED for existing records not covered by the MERGE.
 if newly_orphaned_existing:
@@ -779,7 +904,7 @@ if newly_orphaned_existing:
         WHERE  SCAN_SCHEMA = '{SCAN_SCHEMA}'
           AND  SIGDS_TABLE IN ({sigds_csv})
     """)
-    print(f"Step 7: Marked {len(newly_orphaned_existing)} existing record(s) as orphaned.")
+    print(f"[Phase 7/7] Marked {len(newly_orphaned_existing)} existing record(s) as orphaned.")
 
 if recovered_existing:
     sigds_csv = ", ".join(f"'{t}'" for t in recovered_existing)
@@ -789,7 +914,7 @@ if recovered_existing:
         WHERE  SCAN_SCHEMA = '{SCAN_SCHEMA}'
           AND  SIGDS_TABLE IN ({sigds_csv})
     """)
-    print(f"Step 7: Cleared orphan flag for {len(recovered_existing)} recovered record(s).")
+    print(f"[Phase 7/7] Cleared orphan flag for {len(recovered_existing)} recovered record(s).")
 
 # Clear the deletion flag for WAL tables that have reappeared.
 if reappeared_wals:
@@ -801,7 +926,7 @@ if reappeared_wals:
         WHERE  SCAN_SCHEMA    = '{SCAN_SCHEMA}'
           AND  WAL_TABLE_FQN IN ({wal_csv})
     """)
-    print(f"Step 7: Cleared deletion flag for {len(reappeared_wals)} reappeared record(s).")
+    print(f"[Phase 7/7] Cleared deletion flag for {len(reappeared_wals)} reappeared record(s).")
 
 # Sanity check — show most recently modified entries
 spark.sql(f"""

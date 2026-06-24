@@ -1,6 +1,6 @@
 # writeback_info_dbx
 
-A Databricks toolkit for inventorying and monitoring Sigma writeback (input table) activity across a Unity Catalog schema. It maps every active writeback WAL table to its Sigma workbook or data model, enriches records with Delta metadata and Sigma API ownership data, and populates a central `SIGDS_WORKBOOK_MAP` table for reporting and cleanup.
+A Databricks toolkit for inventorying and monitoring Sigma writeback (input table) activity across one or more Unity Catalog schemas. It maps every active writeback table pair — the SIGDS data table (`sigds_*`) and its SIGDS_WAL write-ahead-log table (`sigds_wal_*`) — to its Sigma workbook or data model, enriches records with Delta metadata and Sigma API ownership data, and populates a central `SIGDS_WORKBOOK_MAP` table for reporting and cleanup.
 
 ## Overview
 
@@ -10,41 +10,38 @@ When Sigma writebacks are enabled, Sigma creates a WAL table (`sigds_wal_*`) and
 
 | File | Purpose |
 |---|---|
-| `create_sigds_workbook_map.sql` | DDL — creates the `SIGDS_WORKBOOK_MAP` table in Unity Catalog (run once) |
-| `populate_sigds_workbook_map.py` | Main script — incrementally populates `SIGDS_WORKBOOK_MAP` from WAL tables and the Sigma API |
-| `archival_scoring.sql` | Weighted confidence scoring matrix — scores every record across multiple signals to surface archival candidates |
-| `geninfo_queries.sql` | Reporting queries — landscape overview, storage reclamation, owner accountability, multi-table workbooks, legacy WAL inventory |
+| `databricks.yml` | Asset Bundle root — variables, dev/prod targets, deploy entrypoint |
+| `resources/sigds_workbook_map.job.yml` | Job definition — `for_each`-over-schemas task running the populate notebook |
+| `src/populate_sigds_workbook_map.py` | Main notebook — incrementally populates `SIGDS_WORKBOOK_MAP` from WAL tables and the Sigma API |
+| `sql/create_sigds_workbook_map.sql` | DDL reference — the notebook auto-creates the table on first run; use this only for manual/ahead-of-time provisioning |
+| `sql/archival_scoring.sql` | Weighted confidence scoring matrix — scores every record across multiple signals to surface archival candidates |
+| `sql/geninfo_queries.sql` | Reporting queries — landscape overview, storage reclamation, owner accountability, multi-table workbooks, legacy WAL inventory |
+
+This toolkit ships as a **Databricks Asset Bundle**: the populate notebook is
+deployed once and run per writeback schema via a `for_each` task, configuration
+is supplied as job parameters, and Sigma credentials are read from a Databricks
+**secret scope** (never stored in the repo).
 
 ---
 
-## Setup
+## Prerequisites
 
-### 1. Create the table (once)
+- Databricks CLI v0.218+ authenticated to the target workspace (`databricks auth login`)
+- Unity Catalog access for the job's run identity: `SELECT` on the scan schema(s), `SELECT` + `MODIFY` on the map schema
+- Sigma OAuth client credentials (`client_id` / `client_secret`) generated in Sigma — admin scope recommended for full org visibility (the scope to hold them is created in Setup step 1)
+- Permission to create a Databricks secret scope (or an existing scope you can write to)
+- Serverless job compute enabled, or a job cluster defined in `resources/sigds_workbook_map.job.yml`
+- `requests` available in the runtime (standard on Databricks Runtime / serverless)
 
-Edit `create_sigds_workbook_map.sql` and replace the placeholders, then run in Databricks SQL or a notebook:
+---
 
-```sql
--- Replace before running:
-USE CATALOG <YOUR_CATALOG>;
-USE SCHEMA  <YOUR_SCHEMA>;
-```
+## Sigma details to gather first
 
-### 2. Configure and run the populate script
+Setup needs two values from Sigma: your **API base URL** (used in step 3) and a
+pair of **OAuth client credentials** (used in step 1). Collect both before you
+start.
 
-Edit the configuration block at the top of `populate_sigds_workbook_map.py`:
-
-```python
-CATALOG             = "<YOUR_CATALOG>"
-SCAN_SCHEMA         = "<YOUR_SCAN_SCHEMA>"  # schema containing sigds_wal_* tables to scan
-MAP_SCHEMA          = "<YOUR_MAP_SCHEMA>"   # schema where SIGDS_WORKBOOK_MAP lives
-SIGMA_API_BASE      = "<YOUR_API_BASE_URL>/v2"
-SIGMA_CLIENT_ID     = "<YOUR_SIGMA_CLIENT_ID>"
-SIGMA_CLIENT_SECRET = "<YOUR_SIGMA_CLIENT_SECRET>"
-```
-
-For a single-schema setup, set `SCAN_SCHEMA` and `MAP_SCHEMA` to the same value.
-
-#### SIGMA_API_BASE
+### SIGMA_API_BASE
 
 The base URL depends on the cloud and region your Sigma organisation is hosted on. The `/v2` suffix is required — all API calls are versioned under this path.
 
@@ -55,16 +52,11 @@ The base URL depends on the cloud and region your Sigma organisation is hosted o
 | Azure US | `https://api.us.azure.sigmacomputing.com/v2` |
 | GCP US | `https://api.us.gcp.sigmacomputing.com/v2` |
 
-Your organisation's base URL can be found in the [Sigma API documentation](https://help.sigmacomputing.com/reference/get-started-sigma-api) — look for the **Base URL** section which lists all available endpoints by cloud provider and region.
+Your organisation's base URL can be found in the [Sigma API documentation](https://help.sigmacomputing.com/reference/get-started-sigma-api) — look for the **Base URL** section which lists all available endpoints by cloud provider and region. This is the value you put in the `sigma_api_base` variable in step 3.
 
-Example configuration:
-```python
-SIGMA_API_BASE = "https://api.eu.aws.sigmacomputing.com/v2"
-```
+### Generating Sigma client credentials
 
-#### SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET
-
-These are OAuth 2.0 client credentials generated from within Sigma. You will need **Admin** access to your Sigma organisation to generate them.
+`client_id` and `client_secret` are OAuth 2.0 client credentials generated from within Sigma; you store them in the secret scope in step 1. You will need **Admin** access to your Sigma organisation to generate them.
 
 To generate credentials:
 
@@ -75,13 +67,241 @@ To generate credentials:
 
 Full instructions are available in the [Sigma API credentials documentation](https://help.sigmacomputing.com/reference/generate-client-credentials).
 
-> **Note:** Admin scope is recommended so the script can resolve workbook ownership and see all workbooks regardless of folder permissions. A non-admin credential will still work but may return incomplete results for workbooks the credential owner cannot access.
+> **Note:** Admin scope is recommended so the job can resolve workbook ownership and see all workbooks regardless of folder permissions. A non-admin credential will still work but may return incomplete results for workbooks the credential owner cannot access.
 
-Run the script from a Databricks notebook or job attached to a cluster with access to the Unity Catalog schema containing your `sigds_wal_*` and `sigds_*` tables.
+---
+
+## Setup
+
+The bundle is deployed with the [Databricks CLI](https://docs.databricks.com/dev-tools/cli/) (v0.218+). Two required one-time steps (secret scope, bundle variables) plus an optional table-creation step, then deploy.
+
+> **Where everything lives / where to run commands.** The bundle root is the
+> `databricks.yml` file in **this `writeback_info_dbx/` folder** — the same
+> folder as this README, alongside `src/`, `sql/`, and `resources/`. Run every
+> `databricks bundle ...` command from inside this folder so the CLI can find
+> `databricks.yml`:
+>
+> ```bash
+> cd path/to/sigma_sandpit/writeback_info_dbx
+> ```
+>
+> (The CLI searches the current directory and its parents for `databricks.yml`,
+> so a subfolder works too — but `cd`-ing here is the simple, reliable choice.)
+
+### 1. Create the secret scope (once)
+
+Store the Sigma OAuth client credentials in a Databricks secret scope so they
+never enter the repo or appear in logs. The default scope name is `sigma`
+(override via the `secret_scope` parameter).
+
+```bash
+databricks secrets create-scope sigma
+databricks secrets put-secret sigma client_id     --string-value "<YOUR_SIGMA_CLIENT_ID>"
+databricks secrets put-secret sigma client_secret --string-value "<YOUR_SIGMA_CLIENT_SECRET>"
+```
+
+> For an Azure Key Vault- or AWS Secrets Manager-backed scope, create the scope
+> against that backend instead; the notebook reads `client_id` / `client_secret`
+> the same way via `dbutils.secrets.get`.
+
+See [generating Sigma client credentials](#generating-sigma-client-credentials) above for how to obtain the values.
+
+### 2. Create the table — optional
+
+**You can skip this.** On its first run the notebook creates
+`SIGDS_WORKBOOK_MAP` automatically (in `catalog.map_schema`) if it doesn't
+already exist, using the same schema definition as the upsert — so the table and
+the job can't drift. It's idempotent: every later run just confirms the table is
+there.
+
+You only need to provision it by hand if you'd rather create it ahead of time
+(e.g. to grant permissions first, or apply table properties). To do that, run
+`sql/create_sigds_workbook_map.sql` in Databricks SQL or a notebook, after
+replacing the placeholders — the schema must be your `map_schema`:
+
+```sql
+-- Replace before running:
+USE CATALOG <YOUR_CATALOG>;
+USE SCHEMA  <YOUR_SCHEMA>;
+```
+
+> If you let the job auto-create on first run, keep the `for_each`
+> `concurrency` at its default of `1` for that first run, so two schema
+> iterations don't race to create the same table.
+
+### 3. Set bundle variables
+
+This is where you tell the job *which* catalog, schemas, and Sigma endpoint to
+use. You do it by editing one file — `databricks.yml`, in this folder. If you've
+never edited a YAML file, follow this exactly; the whole step is "find four
+commented lines, remove the `#`, and type in your values".
+
+#### 3a. The five variables
+
+The first four are required; `secret_scope` only if you didn't name your scope
+`sigma` in step 1.
+
+| Variable | What to put | Where it comes from / example |
+|---|---|---|
+| `catalog` | Your Unity Catalog name | The catalog holding your writeback tables, e.g. `analytics` |
+| `map_schema` | Schema that holds the `SIGDS_WORKBOOK_MAP` table | The same schema you used in step 2, e.g. `prod_writes` |
+| `sigma_api_base` | Your Sigma API URL, ending in `/v2` | Pick your region from the [SIGMA_API_BASE](#sigma_api_base) table, e.g. `https://aws-api.sigmacomputing.com/v2` |
+| `schemas` | The schema(s) to scan, as a quoted list | One: `'["prod_writes"]'`. Two: `'["prod_writes","dev_writes"]'` |
+| `secret_scope` | *(optional)* scope name from step 1 | Omit unless you named it something other than `sigma` |
+
+#### 3b. Make the edit
+
+Open `databricks.yml` in this folder. Under the `dev:` target you'll see a host
+line and a `variables:` block already filled with `<...>` placeholder tokens:
+
+```yaml
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://<your-databricks-workspace-url>
+    variables:
+      catalog: <your-catalog>
+      map_schema: <your-map-schema>
+      sigma_api_base: <your-sigma-api-base-url>
+      schemas: '["<your-schema>"]'
+```
+
+**Replace each `<...>` token with your own value** — there's nothing to
+uncomment, just overwrite the placeholders. After editing it looks like this:
+
+```yaml
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://acme.cloud.databricks.com
+    variables:
+      catalog: analytics
+      map_schema: prod_writes
+      sigma_api_base: https://aws-api.sigmacomputing.com/v2
+      schemas: '["prod_writes"]'
+```
+
+Then save the file. (Use your own values, of course — the workspace host comes
+from `databricks auth describe`, and `sigma_api_base` from the
+[SIGMA_API_BASE](#sigma_api_base) table.)
+
+To **scan several schemas in one job**, just add more names to the `schemas`
+list — everything else stays the same. For example, to scan `prod_writes`,
+`dev_writes`, and `team_sales` (all written into the single `map_schema` table):
+
+```yaml
+    variables:
+      catalog: analytics
+      map_schema: prod_writes
+      sigma_api_base: https://aws-api.sigmacomputing.com/v2
+      schemas: '["prod_writes","dev_writes","team_sales"]'
+```
+
+The job then runs the notebook once per entry in the list. See
+[Multiple writeback schemas](#multiple-writeback-schemas) for the full worked
+example.
+
+When you're ready for production, fill in the `<...>` tokens under the `prod:`
+target the same way (it already has a `schedule_pause: UNPAUSED` line above the
+placeholders — leave that as is).
+
+> If you leave a placeholder unfilled, the job fails fast with a clear
+> *"Parameter(s) still contain placeholder values"* error rather than a cryptic
+> catalog-not-found failure.
+
+#### 3c. YAML rules that will bite you if you ignore them
+
+- **Only change what's to the right of the colon.** The placeholder lines are
+  already indented correctly — just overwrite the `<...>` value, don't move the
+  line. Changing the leading spaces (or replacing them with a tab) breaks the
+  file.
+- **Spaces, never tabs.** If your editor inserts a tab, the file won't parse.
+  (VS Code: click "Spaces" / "Tab" in the bottom status bar to switch.)
+- **Keep the quotes around `schemas`.** It stays `schemas: '["prod_writes"]'` —
+  single quotes outside, double quotes inside. It's one string the job splits
+  into a list, *not* a YAML list. One schema is still a one-element list.
+- **`map_schema` is fixed; `schemas` is what varies.** The job always writes its
+  output into `map_schema` and scans each entry in `schemas`. To cover more
+  schemas later you only add names to `schemas`.
+- **`map_schema` must match the schema you used in step 2's DDL.**
+
+#### 3d. Check it parsed
+
+After saving, confirm the file is valid before deploying:
+
+```bash
+databricks bundle validate -t dev
+```
+
+You want `Validation OK!`. A YAML error here almost always means a stray tab, a
+misaligned line, or a missing quote around `schemas` — re-check 3c.
+
+> **Alternative (no file editing).** You can instead pass values on the command
+> line at deploy time using environment variables:
+>
+> ```bash
+> BUNDLE_VAR_catalog=analytics \
+> BUNDLE_VAR_map_schema=prod_writes \
+> BUNDLE_VAR_sigma_api_base=<your-sigma-api-base-url> \
+> BUNDLE_VAR_schemas='["prod_writes"]' \
+>   databricks bundle validate -t dev
+> ```
+>
+> Use the `BUNDLE_VAR_` form, not `--var="schemas=..."` — the `--var` parser
+> chokes on the quotes and brackets in the `schemas` value.
+
+### 4. Deploy and run
+
+```bash
+databricks bundle validate -t dev          # check the bundle resolves
+databricks bundle deploy   -t dev          # deploy the job to the workspace
+databricks bundle run sigds_workbook_map -t dev   # run on demand
+```
+
+Swap `-t dev` for `-t prod` for the production target (which unpauses the daily
+schedule). The `for_each` task runs the populate notebook once per schema in
+`schemas`, keeping `map_schema` fixed — no file edits between schemas.
+
+### Watching progress
+
+`databricks bundle run` waits for the run to finish (pass `--no-wait` to return
+immediately) and prints a **run-page URL** plus the run's state transitions. You
+get progress at two levels:
+
+- **In the terminal / run logs.** The notebook logs each of its seven phases as
+  `[Phase n/7] …`, and the long-running steps draw an ASCII bar, e.g.:
+
+  ```
+  [Phase 3/7] Discovered 1,222 WAL tables. Running parallel DESCRIBE DETAIL…
+    DESCRIBE WAL ▕███████████░░░░░░░░░░░░░▏ 560/1222
+  [Phase 4/7] Extracted 87 new/updated SIGDS table records.
+  ```
+
+- **On the run page (UI).** Open the printed URL to watch the `for_each` task as
+  a matrix — one tile per schema, going grey → running → green — and to see each
+  iteration's full notebook output live.
+
+For graphical `tqdm` bars in the notebook UI, set the `use_tqdm` parameter to
+`true` (job parameter or `--params use_tqdm=true`). It has no effect on the
+plain-text CLI logs. Other tuning parameters: `describe_workers`,
+`wal_batch_size`, `max_wal_tables`.
+
+### Compute
+
+The job runs on **serverless** job compute by default (no cluster to manage).
+If serverless is not enabled on your workspace, uncomment the `job_clusters`
+block in `resources/sigds_workbook_map.job.yml` and set a `node_type_id` /
+`spark_version` for your cloud, then add `job_cluster_key` to the task.
+
+---
+
+## Maintenance & migration notes
 
 ### Upgrading an existing table (SOURCE_SCHEMA → SCAN_SCHEMA)
 
-If you ran an earlier version of the script, your table will have a column called `SOURCE_SCHEMA`. Delta requires column mapping to be enabled before a rename can be performed:
+If you ran an earlier version, your table will have a column called `SOURCE_SCHEMA`. Delta requires column mapping to be enabled before a rename can be performed:
 
 ```sql
 -- Step 1: enable column mapping (one-time, metadata-only)
@@ -103,21 +323,55 @@ No data is rewritten — both steps are metadata-only operations.
 
 `SIGDS_WORKBOOK_MAP` supports multiple writeback schemas in a single table. Every row is stamped with the `SCAN_SCHEMA` value from the run that produced it, so results from different schemas remain distinguishable. The MERGE key is the composite `SIGDS_TABLE + SCAN_SCHEMA`, preventing collisions when the same bare table name exists in more than one schema.
 
-To cover multiple schemas, run the script once per schema — either manually or as separate tasks in a Databricks job:
+To cover multiple schemas, list them all in the `schemas` bundle variable — the
+`for_each` task runs the populate notebook once per entry, with `map_schema`
+held fixed. **The only thing that changes versus a single-schema setup is the
+`schemas` list** — add more names and you scan more schemas.
 
-```python
-# Run 1 — production writeback schema
-CATALOG     = "my_catalog"
-SCAN_SCHEMA = "prod_writes"   # schema to scan for sigds_wal_* tables
-MAP_SCHEMA  = "prod_writes"   # schema where SIGDS_WORKBOOK_MAP lives
+#### Worked example — scan three schemas in one job
 
-# Run 2 — development writeback schema (map table stays the same)
-CATALOG     = "my_catalog"
-SCAN_SCHEMA = "dev_writes"    # change this each run
-MAP_SCHEMA  = "prod_writes"   # always points to the shared map table
+Say your writeback tables live across `prod_writes`, `dev_writes`, and
+`team_sales`, and you want them all inventoried into one `SIGDS_WORKBOOK_MAP`
+table in `prod_writes`. Configure the `prod` target like this:
+
+```yaml
+# databricks.yml
+targets:
+  prod:
+    mode: production
+    workspace:
+      host: https://<your-databricks-workspace-url>
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      schedule_pause: UNPAUSED
+      catalog: analytics
+      map_schema: prod_writes
+      sigma_api_base: <your-sigma-api-base-url>
+      schemas: '["prod_writes","dev_writes","team_sales"]'
 ```
 
-Both runs write to the same `SIGDS_WORKBOOK_MAP` table. All analysis queries (`archival_scoring.sql`, `geninfo_queries.sql`) include `SCAN_SCHEMA` in their output so you can filter or group by schema. Sigma API enrichment (workbook names, owner details) is shared across schemas — a `WORKBOOK_ID` seen in any previous run is not re-fetched.
+Then deploy and run as normal:
+
+```bash
+databricks bundle validate -t prod
+databricks bundle deploy   -t prod
+databricks bundle run sigds_workbook_map -t prod
+```
+
+What happens on that single run: the `for_each` task fires the populate notebook
+**three times** — once with `scan_schema=prod_writes`, once with
+`scan_schema=dev_writes`, once with `scan_schema=team_sales` — each scanning its
+own schema's `sigds_wal_*` tables. All three write into the one
+`analytics.prod_writes.SIGDS_WORKBOOK_MAP` table (the `map_schema`), each row
+stamped with the `SCAN_SCHEMA` it came from. To add or drop a schema later, edit
+only the `schemas` list and redeploy — nothing else changes.
+
+> By default the iterations run **one at a time** (`concurrency: 1` in
+> `resources/sigds_workbook_map.job.yml`), which keeps Sigma API and warehouse
+> load predictable. If you have many schemas and want them to run in parallel,
+> raise that `concurrency` value.
+
+Every iteration writes to the same `SIGDS_WORKBOOK_MAP` table. All analysis queries (`archival_scoring.sql`, `geninfo_queries.sql`) include `SCAN_SCHEMA` in their output so you can filter or group by schema. Sigma API enrichment (workbook names, owner details) is shared across schemas — a `WORKBOOK_ID` seen in any previous run is not re-fetched.
 
 ---
 
@@ -253,10 +507,3 @@ This applies equally to the WAL table — Sigma holds the WAL table name in its 
 
 If a table is moved or renamed rather than dropped outright, recovery is straightforward — rename the table back to its original location (`<CATALOG>.<SCHEMA>.<SIGDS_TABLE_NAME>`) and the workbook resumes functioning immediately. A direct `DROP TABLE` is irreversible and eliminates this recovery path.
 
----
-
-## Prerequisites
-
-- Databricks cluster with Unity Catalog access and `SELECT` + `MODIFY` on the target catalog/schema
-- Sigma API client credentials (admin scope recommended for full org visibility)
-- `requests` available in the cluster environment (standard on Databricks Runtime)
