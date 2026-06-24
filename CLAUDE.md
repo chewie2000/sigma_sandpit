@@ -49,6 +49,7 @@ Use these labels consistently:
 | `writeback_info_sf`        | `writeback-sf`         |
 | `writeback_info_dbx`       | `writeback-dbx`        |
 | `sigma_skills`             | `sigma-skills`         |
+| `sigma_org_audit`          | `sigma-org-audit`      |
 | Cross-cutting / general    | `sigma-sandpit`        |
 
 To filter by workstream:
