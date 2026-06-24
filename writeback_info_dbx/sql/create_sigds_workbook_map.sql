@@ -2,11 +2,11 @@
 -- create_sigds_workbook_map.sql
 --
 -- DDL for the SIGDS_WORKBOOK_MAP table in Databricks Unity Catalog.
--- Run this once before executing populate_sigds_workbook_map.py.
+-- Run this once (Setup step 2) before deploying/running the bundle.
 --
 -- Before running, replace <YOUR_CATALOG> and <YOUR_SCHEMA> below with the
 -- Unity Catalog catalog and schema where the table should be created.
--- These must match the CATALOG and SCHEMA values set in the Python script.
+-- These must match the bundle's `catalog` and `map_schema` variables.
 --
 -- Logical primary key : SIGDS_TABLE + SCAN_SCHEMA  (one row per table per schema)
 -- Merge key           : SIGDS_TABLE + SCAN_SCHEMA  (composite key in the MERGE statement)
