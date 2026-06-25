@@ -806,7 +806,11 @@ else:
 # ---------------------------------------------------------------------------
 # Step 7 — Assemble rows and MERGE into SIGDS_WORKBOOK_MAP
 # ---------------------------------------------------------------------------
-rows = []
+# Assemble one dict per record, keyed by column name. Tuples for the MERGE
+# DataFrame are generated from MERGE_SCHEMA's field order below — so the row
+# layout is driven by the schema alone and can never drift from the table /
+# MERGE definition (the failure mode a positional tuple silently allowed).
+records_out = []
 for r in new_records:
     detail = detail_map.get(r["SIGDS_TABLE"], {})
     # Prefer freshly-fetched enrichment; fall back to cached values for known IDs
@@ -817,42 +821,55 @@ for r in new_records:
         if r["WORKBOOK_ID"]
         else {}
     )
-    rows.append((
-        r["WAL_TABLE_FQN"],
-        r["WAL_DS_ID"],
-        r["SIGDS_TABLE"],
-        SCAN_SCHEMA,
-        r["WORKBOOK_ID"],
-        r["WAL_WORKBOOK_URL"],
-        r["ORG_SLUG"],
-        r["WAL_INPUT_TABLE_NAME"],
-        r["WAL_LAST_EDIT_AT"],
-        r["WAL_LAST_EDIT_BY"],
-        enrichment.get("WORKBOOK_NAME"),
-        enrichment.get("WORKBOOK_PATH"),
-        enrichment.get("OBJECT_TYPE"),
-        detail.get("SIGDS_TABLE_ID"),
-        detail.get("SIGDS_TABLE_LOCATION"),
-        detail.get("SIGDS_TABLE_CREATED_AT"),
-        detail.get("SIGDS_TABLE_LAST_MODIFIED"),
-        detail.get("SIGDS_TABLE_SIZE_BYTES"),
-        r["WAL_MAX_EDIT_NUM"],
-        wal_last_altered.get(r["WAL_TABLE_FQN"]),
-        r["SIGDS_TABLE"] in orphaned_tables,
-        False,   # IS_DELETED — active record
-        None,    # DELETED_AT — active record
-        'sigds_wal_ds_' not in (r["WAL_TABLE_FQN"] or "").lower(),  # IS_LEGACY_WAL
-        enrichment.get("IS_TAGGED_VERSION", False),
-        enrichment.get("VERSION_TAG_NAME"),
-        enrichment.get("PARENT_WORKBOOK_ID"),
-        enrichment.get("API_WORKBOOK_URL"),
-        enrichment.get("API_OWNER_ID"),
-        enrichment.get("API_IS_ARCHIVED"),
-        enrichment.get("API_OWNER_FIRST_NAME"),
-        enrichment.get("API_OWNER_LAST_NAME"),
-    ))
+    records_out.append({
+        "WAL_TABLE_FQN":             r["WAL_TABLE_FQN"],
+        "WAL_DS_ID":                 r["WAL_DS_ID"],
+        "SIGDS_TABLE":               r["SIGDS_TABLE"],
+        "SCAN_SCHEMA":               SCAN_SCHEMA,
+        "WORKBOOK_ID":               r["WORKBOOK_ID"],
+        "WAL_WORKBOOK_URL":          r["WAL_WORKBOOK_URL"],
+        "ORG_SLUG":                  r["ORG_SLUG"],
+        "WAL_INPUT_TABLE_NAME":      r["WAL_INPUT_TABLE_NAME"],
+        "WAL_LAST_EDIT_AT":          r["WAL_LAST_EDIT_AT"],
+        "WAL_LAST_EDIT_BY":          r["WAL_LAST_EDIT_BY"],
+        "WORKBOOK_NAME":             enrichment.get("WORKBOOK_NAME"),
+        "WORKBOOK_PATH":             enrichment.get("WORKBOOK_PATH"),
+        "OBJECT_TYPE":               enrichment.get("OBJECT_TYPE"),
+        "SIGDS_TABLE_ID":            detail.get("SIGDS_TABLE_ID"),
+        "SIGDS_TABLE_LOCATION":      detail.get("SIGDS_TABLE_LOCATION"),
+        "SIGDS_TABLE_CREATED_AT":    detail.get("SIGDS_TABLE_CREATED_AT"),
+        "SIGDS_TABLE_LAST_MODIFIED": detail.get("SIGDS_TABLE_LAST_MODIFIED"),
+        "SIGDS_TABLE_SIZE_BYTES":    detail.get("SIGDS_TABLE_SIZE_BYTES"),
+        "WAL_MAX_EDIT_NUM":          r["WAL_MAX_EDIT_NUM"],
+        "WAL_TABLE_LAST_MODIFIED":   wal_last_altered.get(r["WAL_TABLE_FQN"]),
+        "IS_ORPHANED":               r["SIGDS_TABLE"] in orphaned_tables,
+        "IS_DELETED":                False,   # active record
+        "DELETED_AT":                None,    # active record
+        "IS_LEGACY_WAL":             'sigds_wal_ds_' not in (r["WAL_TABLE_FQN"] or "").lower(),
+        "IS_TAGGED_VERSION":         enrichment.get("IS_TAGGED_VERSION", False),
+        "VERSION_TAG_NAME":          enrichment.get("VERSION_TAG_NAME"),
+        "PARENT_WORKBOOK_ID":        enrichment.get("PARENT_WORKBOOK_ID"),
+        "API_WORKBOOK_URL":          enrichment.get("API_WORKBOOK_URL"),
+        "API_OWNER_ID":              enrichment.get("API_OWNER_ID"),
+        "API_IS_ARCHIVED":           enrichment.get("API_IS_ARCHIVED"),
+        "API_OWNER_FIRST_NAME":      enrichment.get("API_OWNER_FIRST_NAME"),
+        "API_OWNER_LAST_NAME":       enrichment.get("API_OWNER_LAST_NAME"),
+    })
 
-if rows:
+if records_out:
+    # Validate the dicts cover exactly the schema's columns — a typo'd or
+    # forgotten key fails fast here rather than writing misaligned data.
+    field_names = [f.name for f in MERGE_SCHEMA.fields]
+    provided    = set().union(*(d.keys() for d in records_out))
+    unknown     = provided - set(field_names)
+    missing     = set(field_names) - provided
+    if unknown or missing:
+        raise ValueError(
+            "Row dict does not match MERGE_SCHEMA — "
+            f"unknown keys: {sorted(unknown)}; missing columns: {sorted(missing)}"
+        )
+    # Order columns by the schema itself, so layout can't drift.
+    rows = [tuple(d[name] for name in field_names) for d in records_out]
     updates_df = spark.createDataFrame(rows, MERGE_SCHEMA)
     updates_df.createOrReplaceTempView("_SIGDS_UPDATES")
     spark.sql(f"""
