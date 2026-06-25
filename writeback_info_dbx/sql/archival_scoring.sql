@@ -137,18 +137,26 @@ scored AS (
         DAYS_SINCE_LAST_EDIT,
         DAYS_SINCE_SIGDS_MODIFIED,
 
-        -- Status (0–40). Orphaned is intentionally NOT a branch here — orphaned
-        -- rows have no data table to reclaim and are reported separately.
-        -- NULL flags are coalesced to FALSE so an unset flag never silently
-        -- zeroes a real signal.
+        -- Status (0–40). Every branch is guarded with IS_ORPHANED = FALSE:
+        -- IS_DELETED only means the WAL table vanished — it does NOT imply the
+        -- data table still exists (if both are gone, IS_DELETED and IS_ORPHANED
+        -- are BOTH true). Orphaned rows have nothing to reclaim and are reported
+        -- by the separate dangling-cleanup query, so they must not earn a status
+        -- score here. NULL flags are coalesced to FALSE so an unset flag never
+        -- silently zeroes — or wrongly awards — a signal.
         CASE
-            WHEN COALESCE(IS_DELETED, FALSE) = TRUE
-                THEN 40   -- WAL gone, data table remains — leftover to reclaim
+            WHEN COALESCE(IS_DELETED,  FALSE) = TRUE
+             AND COALESCE(IS_ORPHANED, FALSE) = FALSE
+                THEN 40   -- WAL gone AND data table still present — clean leftover to reclaim
             WHEN COALESCE(API_IS_ARCHIVED, FALSE) = TRUE
+             AND COALESCE(IS_DELETED,      FALSE) = FALSE
+             AND COALESCE(IS_ORPHANED,     FALSE) = FALSE
                 THEN 15   -- archived in Sigma (REVERSIBLE) — retain unless permanently deleted
             WHEN WORKBOOK_NAME   IS NULL
              AND API_IS_ARCHIVED IS NULL
              AND WORKBOOK_ID     IS NOT NULL
+             AND COALESCE(IS_DELETED,  FALSE) = FALSE
+             AND COALESCE(IS_ORPHANED, FALSE) = FALSE
                 THEN 10   -- absent from API — LOW confidence (may be an enrichment gap)
             ELSE 0
         END                                                     AS SCORE_STATUS,
