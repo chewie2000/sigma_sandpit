@@ -64,11 +64,9 @@ Design notes
   VERSION_TAG_NAME, and PARENT_WORKBOOK_ID.
 """
 
-import base64
 import concurrent.futures
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import os
+import sys
 from pyspark.sql import SparkSession
 from pyspark.sql.types import (
     BooleanType, LongType, StringType, StructField, StructType, TimestampType,
@@ -76,6 +74,15 @@ from pyspark.sql.types import (
 
 spark = SparkSession.builder.getOrCreate()
 dbutils = globals().get("dbutils")  # provided by the Databricks notebook runtime
+
+# Warehouse-agnostic, importable logic lives in the sibling core.py (Sigma REST
+# client + pure helpers). Databricks workspace files put the notebook's folder
+# on sys.path; the insert is a belt-and-suspenders for other run contexts.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd())
+from core import (
+    build_session, get_sigma_token, sigma_paginate, build_id_index,
+    bar, is_legacy_wal, dedup_latest_by_edit_num, select_enrichment,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration — supplied at runtime, not edited in source
@@ -146,14 +153,6 @@ SIGMA_CLIENT_SECRET = dbutils.secrets.get(SECRET_SCOPE, "client_secret")
 # in the notebook output. Set use_tqdm=true to additionally render tqdm bars in
 # the notebook UI (no effect on the plain-text CLI logs).
 
-def _bar(done: int, total: int, width: int = 24) -> str:
-    """Render an ASCII progress bar like ▕███████░░░░░░░░░░░▏ 3/5."""
-    if not total:
-        return "0/0"
-    filled = int(width * done / total)
-    return "▕" + "█" * filled + "░" * (width - filled) + f"▏ {done}/{total}"
-
-
 def progress_completed(futures_iter, total: int, label: str):
     """
     Wrap an as_completed() iterator, yielding each future while reporting
@@ -170,117 +169,12 @@ def progress_completed(futures_iter, total: int, label: str):
     step = max(1, total // 10)
     for i, fut in enumerate(futures_iter, start=1):
         if i == total or i % step == 0:
-            print(f"  {label} {_bar(i, total)}")
+            print(f"  {label} {bar(i, total)}")
         yield fut
 
 
-# ===========================================================================
-# Sigma API helpers
-# ===========================================================================
-
-def _build_session() -> requests.Session:
-    """
-    Shared HTTP session with automatic retry/backoff for all Sigma API calls.
-    Retries transient failures — 429 and 5xx responses plus connection/read
-    errors — with exponential backoff, honouring any Retry-After header. A
-    single transient blip no longer aborts a scheduled run. raise_on_status is
-    False so callers' resp.raise_for_status() stays the single error path once
-    retries are exhausted; the Session also pools connections across the many
-    paginated requests.
-    """
-    retry = Retry(
-        total=5,
-        connect=5,
-        read=5,
-        backoff_factor=1.0,                       # waits ~0, 2, 4, 8, 16s
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "POST"]),
-        respect_retry_after_header=True,
-        raise_on_status=False,
-    )
-    session = requests.Session()
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-
-# One shared, retry-enabled session for the whole run.
-SESSION = _build_session()
-
-
-def get_sigma_token(client_id: str, client_secret: str) -> str:
-    """Obtain a Sigma OAuth bearer token using the client credentials flow."""
-    auth_b64 = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-    resp = SESSION.post(
-        f"{SIGMA_API_BASE}/auth/token",
-        headers={
-            "Authorization": f"Basic {auth_b64}",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        data={"grant_type": "client_credentials"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    token = resp.json().get("access_token")
-    if not token:
-        raise RuntimeError("Sigma token response did not contain access_token.")
-    return token
-
-
-def sigma_paginate(token: str, endpoint: str) -> list:
-    """
-    Fetch all pages from a Sigma list endpoint and return a flat list of items.
-    Tries common root-key names (entries, workbooks, dataModels, data, items)
-    to handle variation across Sigma API response shapes.
-    """
-    headers = {"Authorization": f"Bearer {token}"}
-    items, params = [], {}
-    while True:
-        resp = SESSION.get(
-            f"{SIGMA_API_BASE}/{endpoint}",
-            headers=headers, params=params, timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        matched = False
-        for key in ("entries", "workbooks", "dataModels", "data", "items"):
-            chunk = data.get(key)
-            if isinstance(chunk, list):
-                items.extend(chunk)
-                matched = True
-                break
-        if not matched:
-            print(f"  WARN: sigma_paginate({endpoint!r}) — no recognised list key in response: {list(data.keys())}")
-        next_page = data.get("nextPage")
-        if not next_page:
-            break
-        params["page"] = next_page
-    return items
-
-
-def build_id_index(entries: list, target_ids: set) -> dict:
-    """
-    Index a list of Sigma API objects by the ID field that best overlaps
-    with target_ids.  Inspects every key containing 'id' in the first entry
-    and picks the one with the highest match count against target_ids.  This
-    avoids hard-coding field names that differ between API versions.
-    Returns {normalised_id_string: entry_dict}.
-    """
-    if not entries or not target_ids:
-        return {}
-    target_norm = {v.strip().lower() for v in target_ids}
-    candidates  = [k for k in entries[0] if "id" in k.lower()] or ["id"]
-    best_key    = max(
-        candidates,
-        key=lambda k: len(
-            {e[k].strip().lower() for e in entries if e.get(k)} & target_norm
-        ),
-    )
-    return {
-        e[best_key].strip().lower(): e
-        for e in entries if e.get(best_key)
-    }
+# One shared, retry-enabled session for the whole run (built in core).
+SESSION = build_session()
 
 
 # ===========================================================================
@@ -467,7 +361,7 @@ def ensure_target_table() -> bool:
 # ---------------------------------------------------------------------------
 # Step 1 — Authenticate with Sigma
 # ---------------------------------------------------------------------------
-sigma_token = get_sigma_token(SIGMA_CLIENT_ID, SIGMA_CLIENT_SECRET)
+sigma_token = get_sigma_token(SESSION, SIGMA_API_BASE, SIGMA_CLIENT_ID, SIGMA_CLIENT_SECRET)
 print("[Phase 1/7] Sigma token obtained.")
 
 # Ensure the target table exists before we read from it. Idempotent — created
@@ -615,22 +509,14 @@ batches          = [
 
 new_records = []
 for idx, batch in enumerate(batches, start=1):
-    print(f"  Extracting WAL batches {_bar(idx, len(batches))} (this batch: {len(batch)} tables)")
+    print(f"  Extracting WAL batches {bar(idx, len(batches))} (this batch: {len(batch)} tables)")
     new_records.extend(extract_wal_records_batch(batch))
 
 print(f"[Phase 4/7] Extracted {len(new_records)} new/updated SIGDS table records.")
 
-# Deduplicate by SIGDS_TABLE (the MERGE key), keeping the highest WAL_MAX_EDIT_NUM.
-# Sigma can maintain two WAL tables for the same dataset when it migrates from
-# the old random-UUID naming (sigds_wal_<uuid>) to the DS_ID-based naming
-# (sigds_wal_ds_<ds_id>).  Both appear in SHOW TABLES and both pass the
-# rn=1 filter within their own UNION ALL subquery, so we must dedup here.
-_seen: dict = {}
-for r in new_records:
-    t = r["SIGDS_TABLE"]
-    if t and (t not in _seen or (r["WAL_MAX_EDIT_NUM"] or 0) > (_seen[t]["WAL_MAX_EDIT_NUM"] or 0)):
-        _seen[t] = r
-new_records = list(_seen.values())
+# Deduplicate by SIGDS_TABLE (the MERGE key), keeping the highest WAL_MAX_EDIT_NUM
+# (see core.dedup_latest_by_edit_num for the why — old vs DS_ID WAL naming).
+new_records = dedup_latest_by_edit_num(new_records)
 print(f"[Phase 4/7] {len(new_records)} unique SIGDS tables after deduplication.")
 
 # ---------------------------------------------------------------------------
@@ -705,8 +591,8 @@ if all_wb_ids_to_check:
         f"[Phase 6/7] Fetching Sigma workbook/data-model list "
         f"({len(new_wb_ids)} new enrichment, {len(known_wb_ids)} archive re-check)..."
     )
-    workbooks  = sigma_paginate(sigma_token, "workbooks")
-    datamodels = sigma_paginate(sigma_token, "dataModels")
+    workbooks  = sigma_paginate(SESSION, SIGMA_API_BASE, sigma_token,"workbooks")
+    datamodels = sigma_paginate(SESSION, SIGMA_API_BASE, sigma_token,"dataModels")
     print(f"[Phase 6/7] Sigma API returned {len(workbooks)} workbook(s), {len(datamodels)} data model(s).")
     wb_index = build_id_index(workbooks,  all_wb_ids_to_check)
     dm_index = build_id_index(datamodels, all_wb_ids_to_check)
@@ -714,14 +600,14 @@ if all_wb_ids_to_check:
     # Fetch version tags and build tagged-workbook index so that
     # taggedWorkbookId values found in WAL records can be resolved
     # back to their parent workbook metadata.
-    all_tags = sigma_paginate(sigma_token, "tags")
+    all_tags = sigma_paginate(SESSION, SIGMA_API_BASE, sigma_token,"tags")
     print(f"[Phase 6/7] Sigma API returned {len(all_tags)} version tag(s).")
     tagged_wb_index = {}   # {taggedWorkbookId.lower() -> parent/tag info}
     for tag in all_tags:
         tag_id   = tag.get("versionTagId")
         if not tag_id:
             continue
-        tagged_wbs = sigma_paginate(sigma_token, f"tags/{tag_id}/workbooks")
+        tagged_wbs = sigma_paginate(SESSION, SIGMA_API_BASE, sigma_token,f"tags/{tag_id}/workbooks")
         for wb in tagged_wbs:
             for t in wb.get("tags", []):
                 twid = t.get("taggedWorkbookId")
@@ -781,7 +667,7 @@ if all_wb_ids_to_check:
     owner_ids = {m["API_OWNER_ID"] for m in wb_meta.values() if m.get("API_OWNER_ID")}
     if owner_ids:
         print(f"[Phase 6/7] Fetching Sigma members to resolve {len(owner_ids)} owner ID(s)...")
-        all_members  = sigma_paginate(sigma_token, "members")
+        all_members  = sigma_paginate(SESSION, SIGMA_API_BASE, sigma_token,"members")
         print(f"[Phase 6/7] Sigma API returned {len(all_members)} member(s).")
         member_index = {
             m["memberId"].strip().lower(): m
@@ -847,13 +733,7 @@ records_out = []
 for r in new_records:
     detail = detail_map.get(r["SIGDS_TABLE"], {})
     # Prefer freshly-fetched enrichment; fall back to cached values for known IDs
-    enrichment = (
-        wb_meta.get(r["WORKBOOK_ID"])
-        if r["WORKBOOK_ID"] and r["WORKBOOK_ID"] in wb_meta
-        else known_enrichment.get(r["WORKBOOK_ID"], {})
-        if r["WORKBOOK_ID"]
-        else {}
-    )
+    enrichment = select_enrichment(r["WORKBOOK_ID"], wb_meta, known_enrichment)
     records_out.append({
         "WAL_TABLE_FQN":             r["WAL_TABLE_FQN"],
         "WAL_DS_ID":                 r["WAL_DS_ID"],
@@ -878,7 +758,7 @@ for r in new_records:
         "IS_ORPHANED":               r["SIGDS_TABLE"] in orphaned_tables,
         "IS_DELETED":                False,   # active record
         "DELETED_AT":                None,    # active record
-        "IS_LEGACY_WAL":             'sigds_wal_ds_' not in (r["WAL_TABLE_FQN"] or "").lower(),
+        "IS_LEGACY_WAL":             is_legacy_wal(r["WAL_TABLE_FQN"]),
         "IS_TAGGED_VERSION":         enrichment.get("IS_TAGGED_VERSION", False),
         "VERSION_TAG_NAME":          enrichment.get("VERSION_TAG_NAME"),
         "PARENT_WORKBOOK_ID":        enrichment.get("PARENT_WORKBOOK_ID"),
