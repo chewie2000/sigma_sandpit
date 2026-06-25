@@ -48,6 +48,10 @@ data via the **`sigma-cli` sub-skill**.
 
 ## Setup
 
+> **One-command path:** `deploy.sh` automates everything below — `./deploy.sh setup`
+> then `./deploy.sh bootstrap`. See [DEPLOY.md](DEPLOY.md). The manual steps below
+> remain the reference for what it does (and for running pieces individually).
+
 1. **Prerequisites (once, as ACCOUNTADMIN):** edit and run `setup_prerequisites.sql`
    — set your Sigma API host and client credentials, and the execution role.
    Admin-scoped credentials are required for org-wide visibility
