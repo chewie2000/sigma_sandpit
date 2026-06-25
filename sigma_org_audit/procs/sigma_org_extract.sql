@@ -196,6 +196,7 @@ class RawCollector:
         "tenant":          ("tenantOrganizationId", "organizationId", "id"),
         "deployment_policy": ("deploymentPolicyId", "id"),
         "source_swap_policy": ("policyId", "sourceSwapPolicyId", "id"),
+        "user_attribute":  ("userAttributeId", "id"),
     }
 
     def __init__(self):
@@ -461,6 +462,27 @@ def main(session, target_database, target_schema, target_table,
                        "sourceSwapPolicies": sws_err}.items():
         if err:
             errors[label] = err
+
+    # --- 5c) Data-isolation model: user attributes + bindings ------------------
+    # User attributes drive row-level security / per-user|team|tenant data scoping
+    # -- the backbone of multi-tenant data isolation. Capture each attribute and
+    # its user/team/tenant bindings (each binding carries the per-grantee value).
+    user_attributes, ua_err = _safe_list("/v2/user-attributes")
+    collector.add_many("user_attribute", user_attributes)
+    for ua in user_attributes:
+        ua_id = RawCollector._extract_id("user_attribute", ua)
+        if not ua_id:
+            continue
+        ua_users,   _ = _safe_list(f"/v2/user-attributes/{ua_id}/users")
+        ua_teams,   _ = _safe_list(f"/v2/user-attributes/{ua_id}/teams")
+        ua_tenants, _ = _safe_list(f"/v2/user-attributes/{ua_id}/tenants")
+        collector.add("user_attribute_detail",
+                      {"userAttributeId": ua_id, "name": ua.get("name"),
+                       "users": ua_users, "teams": ua_teams, "tenants": ua_tenants},
+                      object_id=ua_id)
+    counts["user_attribute"] = len(user_attributes)
+    if ua_err:
+        errors["userAttributes"] = ua_err
 
     # --- 6) Land everything as raw VARIANT snapshots ---------------------------
     session.sql(f"""

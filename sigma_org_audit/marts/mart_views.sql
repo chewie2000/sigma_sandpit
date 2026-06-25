@@ -225,3 +225,77 @@ SELECT
     END                                             AS TOPOLOGY_NOTE,
     o.SNAPSHOT_TS
 FROM STG_ORGANIZATION o;
+
+-- ------------------------------------------------------------------------------
+-- V_USER_ATTRIBUTE_USAGE -- per attribute: binding counts + whether any data
+-- model references it (a heuristic RLS-in-use signal: the attribute id or name
+-- appears in the model's detail spec). Provenance: REFERENCED_BY_MODELS is
+-- inferred (string match), binding counts are observed.
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW V_USER_ATTRIBUTE_USAGE AS
+WITH binds AS (
+    SELECT ORG_ID, USER_ATTRIBUTE_ID,
+           COUNT_IF(GRANTEE_TYPE = 'user')   AS USER_BINDINGS,
+           COUNT_IF(GRANTEE_TYPE = 'team')   AS TEAM_BINDINGS,
+           COUNT_IF(GRANTEE_TYPE = 'tenant') AS TENANT_BINDINGS,
+           COUNT(*)                          AS TOTAL_BINDINGS
+    FROM STG_USER_ATTRIBUTE_BINDINGS GROUP BY 1, 2
+),
+refs AS (
+    SELECT ua.ORG_ID, ua.USER_ATTRIBUTE_ID,
+           COUNT(DISTINCT dm.DATA_MODEL_ID) AS REFERENCED_BY_MODELS
+    FROM STG_USER_ATTRIBUTES ua
+    JOIN STG_DATAMODELS dm
+      ON dm.ORG_ID = ua.ORG_ID
+     AND (CONTAINS(TO_VARCHAR(dm.DETAIL_PAYLOAD), ua.USER_ATTRIBUTE_ID)
+          OR CONTAINS(TO_VARCHAR(dm.DETAIL_PAYLOAD), ua.NAME))
+    GROUP BY 1, 2
+)
+SELECT
+    ua.ORG_ID, ua.USER_ATTRIBUTE_ID, ua.NAME, ua.DESCRIPTION, ua.DEFAULT_VALUE,
+    COALESCE(b.USER_BINDINGS, 0)   AS USER_BINDINGS,
+    COALESCE(b.TEAM_BINDINGS, 0)   AS TEAM_BINDINGS,
+    COALESCE(b.TENANT_BINDINGS, 0) AS TENANT_BINDINGS,
+    COALESCE(b.TOTAL_BINDINGS, 0)  AS TOTAL_BINDINGS,
+    COALESCE(r.REFERENCED_BY_MODELS, 0)        AS REFERENCED_BY_MODELS,
+    (COALESCE(r.REFERENCED_BY_MODELS, 0) > 0)  AS USED_IN_DATA_MODEL,
+    ua.SNAPSHOT_TS
+FROM STG_USER_ATTRIBUTES ua
+LEFT JOIN binds b ON b.ORG_ID = ua.ORG_ID AND b.USER_ATTRIBUTE_ID = ua.USER_ATTRIBUTE_ID
+LEFT JOIN refs  r ON r.ORG_ID = ua.ORG_ID AND r.USER_ATTRIBUTE_ID = ua.USER_ATTRIBUTE_ID;
+
+-- ------------------------------------------------------------------------------
+-- V_DATA_ISOLATION -- per-org data-isolation posture for multi-tenant readiness.
+-- One row per audited org (driven by STG_ORGANIZATION so the "no attributes"
+-- case is still reported).
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW V_DATA_ISOLATION AS
+WITH agg AS (
+    SELECT ORG_ID,
+           COUNT(*)                       AS USER_ATTRIBUTES,
+           SUM(USER_BINDINGS)             AS USER_BINDINGS,
+           SUM(TEAM_BINDINGS)             AS TEAM_BINDINGS,
+           SUM(TENANT_BINDINGS)           AS TENANT_BINDINGS,
+           COUNT_IF(USED_IN_DATA_MODEL)   AS ATTRS_USED_IN_MODELS
+    FROM V_USER_ATTRIBUTE_USAGE GROUP BY 1
+)
+SELECT
+    o.ORG_ID,
+    o.ORG_ROLE,
+    COALESCE(a.USER_ATTRIBUTES, 0)     AS USER_ATTRIBUTES,
+    COALESCE(a.USER_BINDINGS, 0)       AS USER_BINDINGS,
+    COALESCE(a.TEAM_BINDINGS, 0)       AS TEAM_BINDINGS,
+    COALESCE(a.TENANT_BINDINGS, 0)     AS TENANT_BINDINGS,
+    COALESCE(a.ATTRS_USED_IN_MODELS, 0) AS ATTRS_USED_IN_MODELS,
+    CASE
+        WHEN COALESCE(a.USER_ATTRIBUTES, 0) = 0
+            THEN 'NONE -- no user attributes; no row-level data isolation configured'
+        WHEN COALESCE(a.TENANT_BINDINGS, 0) > 0
+            THEN 'TENANT-scoped isolation in use'
+        WHEN COALESCE(a.USER_BINDINGS, 0) + COALESCE(a.TEAM_BINDINGS, 0) > 0
+            THEN 'USER/TEAM-scoped isolation in use'
+        ELSE 'ATTRIBUTES defined but no bindings -- isolation not active'
+    END                                AS ISOLATION_POSTURE,
+    o.SNAPSHOT_TS
+FROM STG_ORGANIZATION o
+LEFT JOIN agg a ON a.ORG_ID = o.ORG_ID;

@@ -66,6 +66,8 @@ hold many orgs.
 | `member` | GET | `/v2/members?limit=500` | List. Paged. Display-name resolution. |
 | `team` | GET | `/v2/teams?limit=500` | List. Paged. |
 | `grant` | GET | `/v2/grants?inodeId={id}` | Optional (`INCLUDE_GRANTS`). One call per workbook/dataset/datamodel inode. Lands `{inodeId, artifactType, grants[]}`. |
+| `user_attribute` | GET | `/v2/user-attributes` | RLS / data-isolation backbone. List of attributes (id, name, description, defaultValue). |
+| `user_attribute_detail` | GET | `/v2/user-attributes/{id}/users` + `/teams` + `/tenants` | Per-attribute bindings; each binding carries the per-grantee `value`. Lands `{userAttributeId, name, users[], teams[], tenants[]}`. |
 
 ### Connection detail payload — the writeback locations
 

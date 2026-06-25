@@ -330,3 +330,52 @@ SELECT
     PAYLOAD:name::STRING                    AS NAME,
     SNAPSHOT_TS, SNAPSHOT_ID, PAYLOAD
 FROM latest WHERE rn = 1;
+
+-- ------------------------------------------------------------------------------
+-- DATA ISOLATION -- user attributes (RLS backbone) + their bindings.
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW STG_USER_ATTRIBUTES AS
+WITH latest AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY ORG_ID, OBJECT_ID ORDER BY SNAPSHOT_TS DESC) AS rn
+    FROM RAW_SIGMA_OBJECTS WHERE OBJECT_TYPE = 'user_attribute'
+)
+SELECT
+    ORG_ID,
+    OBJECT_ID                            AS USER_ATTRIBUTE_ID,
+    PAYLOAD:name::STRING                 AS NAME,
+    PAYLOAD:description::STRING          AS DESCRIPTION,
+    PAYLOAD:defaultValue:val::STRING     AS DEFAULT_VALUE,
+    PAYLOAD:createdBy::STRING            AS CREATED_BY,
+    SNAPSHOT_TS, SNAPSHOT_ID
+FROM latest WHERE rn = 1;
+
+-- One row per (attribute -> grantee) binding, flattened from the detail's
+-- users/teams/tenants arrays. Grantee names resolved where a source exists.
+CREATE OR REPLACE VIEW STG_USER_ATTRIBUTE_BINDINGS AS
+WITH det AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY ORG_ID, OBJECT_ID ORDER BY SNAPSHOT_TS DESC) AS rn
+    FROM RAW_SIGMA_OBJECTS WHERE OBJECT_TYPE = 'user_attribute_detail'
+),
+flat AS (
+    SELECT d.ORG_ID, d.OBJECT_ID AS USER_ATTRIBUTE_ID, d.PAYLOAD:name::STRING AS NAME,
+           'user' AS GRANTEE_TYPE, b.value:userId::STRING AS GRANTEE_ID,
+           b.value:value:val::STRING AS VALUE, d.SNAPSHOT_TS, d.SNAPSHOT_ID
+    FROM det d, LATERAL FLATTEN(input => COALESCE(d.PAYLOAD:users, ARRAY_CONSTRUCT())) b
+    WHERE d.rn = 1
+    UNION ALL
+    SELECT d.ORG_ID, d.OBJECT_ID, d.PAYLOAD:name::STRING,
+           'team', b.value:teamId::STRING, b.value:value:val::STRING, d.SNAPSHOT_TS, d.SNAPSHOT_ID
+    FROM det d, LATERAL FLATTEN(input => COALESCE(d.PAYLOAD:teams, ARRAY_CONSTRUCT())) b
+    WHERE d.rn = 1
+    UNION ALL
+    SELECT d.ORG_ID, d.OBJECT_ID, d.PAYLOAD:name::STRING,
+           'tenant', b.value:tenantOrganizationId::STRING, b.value:value:val::STRING, d.SNAPSHOT_TS, d.SNAPSHOT_ID
+    FROM det d, LATERAL FLATTEN(input => COALESCE(d.PAYLOAD:tenants, ARRAY_CONSTRUCT())) b
+    WHERE d.rn = 1
+)
+SELECT
+    f.*,
+    COALESCE(m.DISPLAY_NAME, t.NAME) AS GRANTEE_NAME
+FROM flat f
+LEFT JOIN STG_MEMBERS m ON m.ORG_ID = f.ORG_ID AND f.GRANTEE_TYPE = 'user' AND m.MEMBER_ID = f.GRANTEE_ID
+LEFT JOIN STG_TEAMS   t ON t.ORG_ID = f.ORG_ID AND f.GRANTEE_TYPE = 'team' AND t.TEAM_ID   = f.GRANTEE_ID;
