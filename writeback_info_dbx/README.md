@@ -452,20 +452,28 @@ Column names use consistent prefixes to make the data source immediately obvious
 
 ## Archival Scoring (`archival_scoring.sql`)
 
-Scores every record in `SIGDS_WORKBOOK_MAP` across eight weighted signals to produce a ranked list of archival candidates.
+The script creates one view, `SIGDS_ARCHIVAL_SCORED` (single source of truth for the logic), then runs three queries: **archival candidates**, a **tier rollup**, and a **dangling-cleanup** list. It deliberately keeps three different questions apart rather than blending them into one number:
 
-### Scoring model (total = 100 pts, higher = stronger archival candidate)
+- **`ARCHIVABILITY_SCORE` (0–100)** — *is this writeback dead and reclaimable?* This is the score.
+- **`SIGDS_TABLE_SIZE_MB`** — *how much would we reclaim?* A priority axis: shown as a column and used only as a sort tie-breaker, **not added to the score** (a large active table must not outrank a tiny dead one).
+- **`MIGRATION_PRIORITY`** — legacy (pre-MultiWAL) tables to **migrate, not archive**: a flag, not scored.
+
+**Orphaned records** (the SIGDS data table is already gone) are reported by a **separate dangling-cleanup query** — there's nothing to quarantine, so they're kept out of the scored tiers entirely.
+
+### Scoring model (sum = 100 pts, higher = stronger archival candidate)
 
 | Dimension | Max | Logic |
 |---|---|---|
-| Archival / deletion status | 30 | `IS_ORPHANED`=TRUE → 30 / `IS_DELETED`=TRUE → 25 / `API_IS_ARCHIVED`=TRUE → 20 / workbook absent from API (deleted or never saved) → 15 |
-| WAL edit recency | 25 | >365 days (or NULL) → 25 / >180 → 18 / >90 → 10 / >30 → 4 |
-| SIGDS table modification | 15 | >365 days (or NULL) → 15 / >180 → 10 / >90 → 5 |
-| Edit volume (`WAL_MAX_EDIT_NUM`) | 10 | 0/NULL → 10 / ≤10 → 8 / ≤50 → 5 / ≤200 → 2 |
-| Legacy WAL flag | 10 | Legacy + active (<180 days) → 10 / Legacy + inactive → 5 |
-| Storage reclamation | 10 | >1 GB → 10 / >100 MB → 7 / >10 MB → 4 / else → 1 |
+| Status | 30 | `IS_DELETED`=TRUE → **40**\* / `API_IS_ARCHIVED`=TRUE → 15 (reversible — retain unless permanently deleted) / workbook absent from API (`WORKBOOK_ID` present but unresolved) → 10 (low confidence — may be an enrichment gap) |
+| WAL edit recency | 35 | >365 days (or NULL) → 35 / >180 → 25 / >90 → 14 / >30 → 5 — primary abandonment signal |
+| SIGDS table modification | 15 | >365 days (or NULL) → 15 / >180 → 10 / >90 → 5 — secondary & noisy (moves on OPTIMIZE/VACUUM) |
+| Edit volume (`WAL_MAX_EDIT_NUM`) | 10 | 0/NULL → 10 / ≤10 → 6 / ≤50 → 3 / ≤200 → 1 — weak signal |
+
+\* Status component caps at **40**; the table header shows nominal weights. `IS_DELETED` (WAL gone, data table still present) is the strongest signal because it's the clean leftover-to-reclaim case. `IS_ORPHANED` is **not** scored here — see the dangling-cleanup query.
 
 **Risk penalty:** `IS_TAGGED_VERSION` = TRUE → subtract 15 pts (floor at 0). Tagged versions (Prod, QA) are high-risk to archive and are penalised to prevent automatic tier promotion.
+
+**Not in the score (by design):** storage size (→ `SIGDS_TABLE_SIZE_MB` column / sort), legacy-WAL status (→ `MIGRATION_PRIORITY` flag), orphaned records (→ separate query).
 
 ### Confidence tiers
 
@@ -476,7 +484,7 @@ Scores every record in `SIGDS_WORKBOOK_MAP` across eight weighted signals to pro
 | 25–49 | **TIER 3** | Monitor — check in 90 days |
 | < 25 | **TIER 4** | Keep — active or protected |
 
-The query outputs every individual score component alongside the total, making it easy to understand why a record scored highly and to tune thresholds for your organisation. A tier summary rollup at the end of the file groups record counts, total storage (GB), average score, and min/max edit age by tier.
+Every component score is exposed alongside the total so you can see why a record scored as it did and tune thresholds. The rollup reads the same view as the candidate list, so the tier counts always match the rows.
 
 > **Important — read before taking any action based on these scores.**
 >
