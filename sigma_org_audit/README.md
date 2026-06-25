@@ -163,6 +163,55 @@ To refresh an org later, just re-run its `sigma_org_extract` call — every run 
 new append-only snapshot, and re-running the scan + SCD2 calls accrues history and
 drift across all orgs.
 
+### Refresh many orgs from one trigger — the tenant registry + fan-out
+
+For auditing several orgs (a parent + its tenants, unrelated orgs, or any mix)
+from a single trigger, use the **registry + fan-out** rather than one `CALL` per
+org. One Snowflake secret holds every org's credentials, and
+`sigma_org_extract_all` loops over it.
+
+Why one secret? A stored procedure can only read secrets declared statically in
+its `SECRETS` clause — it cannot resolve a secret name at runtime. So a single
+registry secret (bound once to the integration) scales to any number of orgs with
+no proc/integration change.
+
+1. **Create the registry secret** (a JSON array of orgs):
+   ```sql
+   USE ROLE ACCOUNTADMIN;
+   CREATE OR REPLACE SECRET sigma_tenant_registry TYPE = GENERIC_STRING
+     SECRET_STRING = '[
+       {"label":"acme",  "baseUrl":"https://aws-api.sigmacomputing.com",   "clientId":"<id>","clientSecret":"<sec>","role":"child", "enabled":true},
+       {"label":"globex","baseUrl":"https://api.eu.aws.sigmacomputing.com","clientId":"<id>","clientSecret":"<sec>","role":"parent","enabled":true}
+     ]';
+   ALTER EXTERNAL ACCESS INTEGRATION sigma_api_access
+     SET ALLOWED_AUTHENTICATION_SECRETS = (sigma_base_url, sigma_client_id, sigma_client_secret, sigma_tenant_registry);
+   GRANT READ ON SECRET sigma_tenant_registry TO ROLE <YOUR_ROLE>;
+   ```
+   Each org's `clientId`/`clientSecret` is generated in *that org's* Administration
+   → Developer Access. `role` (parent/child/standalone) is recorded via
+   `ORG_ROLE_OVERRIDE` — needed because a child org cannot self-identify via the
+   tenants API. **Add/remove an org** = edit the JSON and `CREATE OR REPLACE` again
+   (no proc or integration change). Inject the value via a temp file so the creds
+   stay out of shell history.
+
+2. **Run it:**
+   ```sql
+   CALL sigma_org_extract_all('SIGMA_ORG_AUDIT','AUDIT');                      -- all enabled orgs
+   CALL sigma_org_extract_all('SIGMA_ORG_AUDIT','AUDIT','RAW_SIGMA_OBJECTS','acme');  -- just one org
+   ```
+   It returns a per-org summary (`orgs_selected`, `orgs_succeeded`, and each org's
+   result/error). One org's failure (e.g. a 403) does not abort the batch.
+
+3. **Trigger from Sigma:** a workbook *Refresh all* button maps to the no-label
+   call; a per-row *Refresh this org* button passes the label — both via a Call API
+   action to the Snowflake SQL API, or a scheduled Task. Credentials are passed to
+   `sigma_org_extract` as bound call arguments, not embedded in logged SQL.
+
+> Alternative store: keep the org list (and even secrets) in a **table** instead
+> of the registry secret — easier to manage and can be a Sigma input table for
+> self-service onboarding, at the cost of holding secrets in a table column.
+> The fan-out can read either.
+
 ## Writeback scan — discovered, not configured
 
 `sigma_writeback_scan` does **not** take a schema parameter. It reads the

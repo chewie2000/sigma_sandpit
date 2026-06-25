@@ -116,6 +116,23 @@ GRANT READ   ON SECRET sigma_client_secret  TO ROLE <YOUR_ROLE>;
 
 
 -- ==============================================================================
+-- 6. (Optional) Multi-org / multi-tenant registry (for sigma_org_extract_all)
+--    To refresh many orgs (a parent + tenants, unrelated orgs, or any mix) from
+--    one trigger, create a single registry secret holding each org's credentials
+--    and bind it to the integration. sigma_org_extract_all loops over it.
+--    See README "Refresh many orgs from one trigger". Sketch:
+--
+--    CREATE OR REPLACE SECRET sigma_tenant_registry TYPE = GENERIC_STRING
+--      SECRET_STRING = '[{"label":"acme","baseUrl":"https://<host>",
+--                         "clientId":"...","clientSecret":"...",
+--                         "role":"child","enabled":true}]';
+--    ALTER EXTERNAL ACCESS INTEGRATION sigma_api_access
+--      SET ALLOWED_AUTHENTICATION_SECRETS =
+--        (sigma_base_url, sigma_client_id, sigma_client_secret, sigma_tenant_registry);
+--    GRANT READ ON SECRET sigma_tenant_registry TO ROLE <YOUR_ROLE>;
+-- ==============================================================================
+
+-- ==============================================================================
 -- 5. Writeback scan reachability (for sigma_writeback_scan)
 --    The writeback scan reads INFORMATION_SCHEMA metadata and the input-table
 --    write-ahead-log (WAL) tables in whatever databases/schemas your Sigma
