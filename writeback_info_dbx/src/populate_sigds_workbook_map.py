@@ -67,6 +67,8 @@ Design notes
 import base64
 import concurrent.futures
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from pyspark.sql import SparkSession
 from pyspark.sql.types import (
     BooleanType, LongType, StringType, StructField, StructType, TimestampType,
@@ -176,10 +178,41 @@ def progress_completed(futures_iter, total: int, label: str):
 # Sigma API helpers
 # ===========================================================================
 
+def _build_session() -> requests.Session:
+    """
+    Shared HTTP session with automatic retry/backoff for all Sigma API calls.
+    Retries transient failures — 429 and 5xx responses plus connection/read
+    errors — with exponential backoff, honouring any Retry-After header. A
+    single transient blip no longer aborts a scheduled run. raise_on_status is
+    False so callers' resp.raise_for_status() stays the single error path once
+    retries are exhausted; the Session also pools connections across the many
+    paginated requests.
+    """
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=1.0,                       # waits ~0, 2, 4, 8, 16s
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+# One shared, retry-enabled session for the whole run.
+SESSION = _build_session()
+
+
 def get_sigma_token(client_id: str, client_secret: str) -> str:
     """Obtain a Sigma OAuth bearer token using the client credentials flow."""
     auth_b64 = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-    resp = requests.post(
+    resp = SESSION.post(
         f"{SIGMA_API_BASE}/auth/token",
         headers={
             "Authorization": f"Basic {auth_b64}",
@@ -204,7 +237,7 @@ def sigma_paginate(token: str, endpoint: str) -> list:
     headers = {"Authorization": f"Bearer {token}"}
     items, params = [], {}
     while True:
-        resp = requests.get(
+        resp = SESSION.get(
             f"{SIGMA_API_BASE}/{endpoint}",
             headers=headers, params=params, timeout=30,
         )
