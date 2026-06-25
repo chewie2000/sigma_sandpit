@@ -464,16 +464,15 @@ The script creates one view, `SIGDS_ARCHIVAL_SCORED` (single source of truth for
 
 | Dimension | Max | Logic |
 |---|---|---|
-| Status | 30 | `IS_DELETED`=TRUE → **40**\* / `API_IS_ARCHIVED`=TRUE → 15 (reversible — retain unless permanently deleted) / workbook absent from API (`WORKBOOK_ID` present but unresolved) → 10 (low confidence — may be an enrichment gap) |
-| WAL edit recency | 35 | >365 days (or NULL) → 35 / >180 → 25 / >90 → 14 / >30 → 5 — primary abandonment signal |
+| Status | 40 | `IS_DELETED`=TRUE → 40 (WAL gone, data table still present — clean leftover to reclaim) / `API_IS_ARCHIVED`=TRUE → 15 (reversible — retain unless permanently deleted) / workbook absent from API (`WORKBOOK_ID` present but unresolved) → 10 (low confidence — may be an enrichment gap). All branches guarded `IS_ORPHANED = FALSE`; `IS_ORPHANED` is not scored — see the dangling-cleanup query |
+| WAL edit recency | 45 | >365 days (or NULL) → 45 / >180 → 32 / >90 → 18 / >30 → 6 — the primary, directional abandonment signal, so it carries the most weight |
 | SIGDS table modification | 15 | >365 days (or NULL) → 15 / >180 → 10 / >90 → 5 — secondary & noisy (moves on OPTIMIZE/VACUUM) |
-| Edit volume (`WAL_MAX_EDIT_NUM`) | 10 | 0/NULL → 10 / ≤10 → 6 / ≤50 → 3 / ≤200 → 1 — weak signal |
 
-\* Status component caps at **40**; the table header shows nominal weights. `IS_DELETED` (WAL gone, data table still present) is the strongest signal because it's the clean leftover-to-reclaim case. `IS_ORPHANED` is **not** scored here — see the dangling-cleanup query.
+(Status 40 + WAL recency 45 + SIGDS recency 15 = 100.)
 
 **Risk penalty:** `IS_TAGGED_VERSION` = TRUE → subtract 15 pts (floor at 0). Tagged versions (Prod, QA) are high-risk to archive and are penalised to prevent automatic tier promotion.
 
-**Not in the score (by design):** storage size (→ `SIGDS_TABLE_SIZE_MB` column / sort), legacy-WAL status (→ `MIGRATION_PRIORITY` flag), orphaned records (→ separate query).
+**Not in the score (by design):** edit volume (`WAL_MAX_EDIT_NUM` is a lifetime counter, not a recency measure — kept as a context column only), storage size (→ `SIGDS_TABLE_SIZE_MB` column / sort), legacy-WAL status (→ `MIGRATION_PRIORITY` flag), orphaned records (→ separate query).
 
 ### Confidence tiers
 

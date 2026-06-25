@@ -51,18 +51,22 @@ USE SCHEMA  <YOUR_SCHEMA>;
 --                                        (A definitive fix needs an
 --                                        "enrichment attempted" flag on the
 --                                        populate side.)
--- WAL edit recency (0–35)   Days since last writeback. The primary abandonment
---                           signal. NULL treated as > 365 (no evidence of use).
+-- WAL edit recency (0–45)   Days since last writeback. The primary, directional
+--                           abandonment signal, so it carries the most weight.
+--                           NULL treated as > 365 (no evidence of use).
 -- SIGDS table recency (0–15) Days since last data-table write. SECONDARY and
 --                           noisy: SIGDS_TABLE_LAST_MODIFIED moves on OPTIMIZE /
 --                           VACUUM, so Delta maintenance can make a dead table
 --                           look active and lower its score — cross-check WAL
 --                           recency, do not trust this alone.
--- Edit volume (0–10)        WAL_MAX_EDIT_NUM. Weak signal (a NEW active table
---                           also has few edits). Thresholds calibrated for
---                           high-volume prod; tune for your org.
 -- Risk penalty: IS_TAGGED_VERSION = TRUE → −15 (tagged Prod/QA versions are
 --               high-risk to archive; floor the total at 0).
+--
+-- NOT scored (by design): edit volume. WAL_MAX_EDIT_NUM is a lifetime cumulative
+-- counter, not a recency measure — a low count is "new & active" as often as
+-- "never used", and a high count on a cold table would wrongly read as "keep".
+-- It is shown as a context column for the human reviewer but does not affect the
+-- score; abandonment is captured directionally by WAL edit recency instead.
 --
 -- CONFIDENCE TIERS  (>=75 TIER 1 quarantine now · 50–74 TIER 2 review w/ owner ·
 --                    25–49 TIER 3 monitor · <25 TIER 4 keep)
@@ -161,13 +165,18 @@ scored AS (
             ELSE 0
         END                                                     AS SCORE_STATUS,
 
-        -- WAL edit recency (0–35) — primary abandonment signal.
+        -- WAL edit recency (0–45) — the primary, directional abandonment signal,
+        -- so it carries the most weight. (Edit *volume* is deliberately NOT scored:
+        -- WAL_MAX_EDIT_NUM is a lifetime counter, not a recency measure — a low
+        -- count means "new & active" as often as "never used", and a high count
+        -- on a cold table would wrongly read as "keep". It's kept as a context
+        -- column only.)
         CASE
             WHEN DAYS_SINCE_LAST_EDIT IS NULL
-              OR DAYS_SINCE_LAST_EDIT > 365   THEN 35
-            WHEN DAYS_SINCE_LAST_EDIT > 180   THEN 25
-            WHEN DAYS_SINCE_LAST_EDIT > 90    THEN 14
-            WHEN DAYS_SINCE_LAST_EDIT > 30    THEN 5
+              OR DAYS_SINCE_LAST_EDIT > 365   THEN 45
+            WHEN DAYS_SINCE_LAST_EDIT > 180   THEN 32
+            WHEN DAYS_SINCE_LAST_EDIT > 90    THEN 18
+            WHEN DAYS_SINCE_LAST_EDIT > 30    THEN 6
             ELSE 0
         END                                                     AS SCORE_WAL_RECENCY,
 
@@ -179,16 +188,6 @@ scored AS (
             WHEN DAYS_SINCE_SIGDS_MODIFIED > 90    THEN 5
             ELSE 0
         END                                                     AS SCORE_SIGDS_RECENCY,
-
-        -- Edit volume (0–10) — weak signal.
-        CASE
-            WHEN WAL_MAX_EDIT_NUM IS NULL
-              OR WAL_MAX_EDIT_NUM = 0    THEN 10
-            WHEN WAL_MAX_EDIT_NUM <= 10  THEN 6
-            WHEN WAL_MAX_EDIT_NUM <= 50  THEN 3
-            WHEN WAL_MAX_EDIT_NUM <= 200 THEN 1
-            ELSE 0
-        END                                                     AS SCORE_EDIT_VOLUME,
 
         -- Risk penalty (0 or −15).
         CASE
@@ -235,26 +234,24 @@ SELECT
     SCORE_STATUS,
     SCORE_WAL_RECENCY,
     SCORE_SIGDS_RECENCY,
-    SCORE_EDIT_VOLUME,
     PENALTY_TAGGED_VERSION,
 
     GREATEST(0, LEAST(100,
           SCORE_STATUS
         + SCORE_WAL_RECENCY
         + SCORE_SIGDS_RECENCY
-        + SCORE_EDIT_VOLUME
         + PENALTY_TAGGED_VERSION
     ))                                                          AS ARCHIVABILITY_SCORE,
 
     CASE
         WHEN GREATEST(0, LEAST(100, SCORE_STATUS + SCORE_WAL_RECENCY
-            + SCORE_SIGDS_RECENCY + SCORE_EDIT_VOLUME + PENALTY_TAGGED_VERSION)) >= 75
+            + SCORE_SIGDS_RECENCY + PENALTY_TAGGED_VERSION)) >= 75
             THEN 'TIER 1 — Strong candidate (quarantine now)'
         WHEN GREATEST(0, LEAST(100, SCORE_STATUS + SCORE_WAL_RECENCY
-            + SCORE_SIGDS_RECENCY + SCORE_EDIT_VOLUME + PENALTY_TAGGED_VERSION)) >= 50
+            + SCORE_SIGDS_RECENCY + PENALTY_TAGGED_VERSION)) >= 50
             THEN 'TIER 2 — Likely candidate (review with owner)'
         WHEN GREATEST(0, LEAST(100, SCORE_STATUS + SCORE_WAL_RECENCY
-            + SCORE_SIGDS_RECENCY + SCORE_EDIT_VOLUME + PENALTY_TAGGED_VERSION)) >= 25
+            + SCORE_SIGDS_RECENCY + PENALTY_TAGGED_VERSION)) >= 25
             THEN 'TIER 3 — Monitor (check in 90 days)'
         ELSE 'TIER 4 — Keep (active or protected)'
     END                                                         AS ARCHIVAL_TIER
@@ -286,7 +283,6 @@ SELECT
     SCORE_STATUS,
     SCORE_WAL_RECENCY,
     SCORE_SIGDS_RECENCY,
-    SCORE_EDIT_VOLUME,
     PENALTY_TAGGED_VERSION,
     WAL_WORKBOOK_URL
 FROM SIGDS_ARCHIVAL_SCORED
