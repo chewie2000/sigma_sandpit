@@ -13,6 +13,8 @@ When Sigma writebacks are enabled, Sigma creates a WAL table (`sigds_wal_*`) and
 | `databricks.yml` | Asset Bundle root — variables, dev/prod targets, deploy entrypoint |
 | `resources/sigds_workbook_map.job.yml` | Job definition — `for_each`-over-schemas task running the populate notebook |
 | `src/populate_sigds_workbook_map.py` | Main notebook — incrementally populates `SIGDS_WORKBOOK_MAP` from WAL tables and the Sigma API |
+| `src/core.py` | Warehouse-agnostic, importable core — Sigma REST client (retry-enabled session, token, paginator) + pure helpers (ID indexing, WAL-record dedup, enrichment selection, legacy-WAL detection, progress bar). No Spark/dbutils; unit-testable and reusable by the Snowflake port |
+| `tests/test_core.py` | Unit tests for `core.py` — pure logic + the paginator via a fake session; no Spark/network. Run with `pytest` |
 | `sql/create_sigds_workbook_map.sql` | DDL reference — the notebook auto-creates the table on first run; use this only for manual/ahead-of-time provisioning |
 | `sql/archival_scoring.sql` | Weighted confidence scoring matrix — scores every record across multiple signals to surface archival candidates |
 | `sql/geninfo_queries.sql` | Reporting queries — landscape overview, storage reclamation, owner accountability, multi-table workbooks, legacy WAL inventory |
