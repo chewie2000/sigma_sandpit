@@ -132,9 +132,12 @@ cd sigma_org_audit
 ```
 Then verify and explore:
 ```bash
+# Acceptance checks — expect all PASS / INFO
 snow sql -c <conn> --role SYSADMIN --database SIGMA_ORG_AUDIT --schema AUDIT \
-  --warehouse <wh> -f tests/acceptance_checks.sql     # expect all PASS / INFO
-snow sql ... -f audit_queries.sql                      # the report queries
+  --warehouse <wh> -f tests/acceptance_checks.sql
+# The report queries
+snow sql -c <conn> --role SYSADMIN --database SIGMA_ORG_AUDIT --schema AUDIT \
+  --warehouse <wh> -f audit_queries.sql
 ```
 Re-pull data anytime with `./deploy.sh refresh` (all orgs) or
 `./deploy.sh refresh <label>` (one org).

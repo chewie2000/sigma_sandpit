@@ -36,6 +36,10 @@
 #   --db SIGMA_ORG_AUDIT  --schema AUDIT
 #   --role SYSADMIN  --warehouse COMPUTE_WH  --admin-role ACCOUNTADMIN
 #
+# Output: file deploys print just ">> <file> ... ok" (the compiled SQL/Python is
+# hidden on success). Set DEPLOY_VERBOSE=1 to echo full snow output; failures are
+# always shown in full.
+#
 # Connection: if --conn is not given, the Snowflake CLI's own default connection
 # is used (set one with `snow connection set-default <name>`). A connection name
 # is local to ~/.snowflake/connections.toml, so there is no portable hardcoded
@@ -103,7 +107,23 @@ _filter() { grep -v -iE "bad owner|too wide|config_manager|UserWarning|chown|chm
 sf()  { snow sql ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --role "$ROLE"       --database "$DB" --schema "$SCHEMA" --warehouse "$WH" "$@" 2>&1 | _filter; }
 sfa() { snow sql ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --role "$ADMIN_ROLE" --database "$DB" --schema "$SCHEMA" --warehouse "$WH" "$@" 2>&1 | _filter; }
 
-run_files() { local f; for f in "$@"; do echo ">> $f"; sf -f "$HERE/$f"; done; }
+# Quiet by default: print ">> <file> ... ok" per file rather than the large
+# SQL / Python bodies snow echoes while compiling. On failure, the full snow
+# output is shown and the run aborts. Set DEPLOY_VERBOSE=1 to see everything.
+run_files() {
+  local f out
+  for f in "$@"; do
+    printf '>> %s ... ' "$f"
+    if out=$(sf -f "$HERE/$f"); then
+      echo "ok"
+      if [[ "${DEPLOY_VERBOSE:-0}" == 1 ]]; then printf '%s\n' "$out"; fi
+    else
+      echo "FAILED"
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+  done
+}
 
 drop_procs() {
   local sig
