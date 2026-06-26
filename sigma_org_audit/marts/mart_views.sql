@@ -15,26 +15,78 @@
 -- ==============================================================================
 
 -- ------------------------------------------------------------------------------
+-- V_OBJECT_LIFECYCLE -- deletion/tombstone detection from the append-only raw.
+-- An object is DELETED if it was seen in an earlier snapshot but is absent from
+-- its (org, object_type) cohort's LATEST snapshot. Because raw is append-only and
+-- the stage views keep each object's last-seen row, a deleted object would
+-- otherwise show forever as live -- this view is the authoritative current/deleted
+-- signal. Needs >= 2 snapshots of a type to detect deletion (COHORT_SNAPSHOTS).
+-- Caveat: a partial/under-paged latest extract can mark live objects deleted;
+-- completeness hardening is tracked in 9c8.8.
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW V_OBJECT_LIFECYCLE AS
+WITH fc AS (
+    SELECT ORG_ID, OBJECT_TYPE, OBJECT_ID, SNAPSHOT_TS
+    FROM RAW_SIGMA_OBJECTS
+    WHERE OBJECT_TYPE IN ('workbook','datamodel','dataset','connection','member','team','user_attribute')
+),
+cohort AS (
+    SELECT ORG_ID, OBJECT_TYPE,
+           MAX(SNAPSHOT_TS)            AS COHORT_LATEST_TS,
+           COUNT(DISTINCT SNAPSHOT_TS) AS COHORT_SNAPSHOTS
+    FROM fc GROUP BY 1, 2
+),
+obj AS (
+    SELECT ORG_ID, OBJECT_TYPE, OBJECT_ID,
+           MIN(SNAPSHOT_TS)            AS FIRST_SEEN,
+           MAX(SNAPSHOT_TS)            AS LAST_SEEN,
+           COUNT(DISTINCT SNAPSHOT_TS) AS SNAPSHOTS_SEEN
+    FROM fc GROUP BY 1, 2, 3
+)
+SELECT
+    o.ORG_ID, o.OBJECT_TYPE, o.OBJECT_ID,
+    o.FIRST_SEEN, o.LAST_SEEN,
+    c.COHORT_LATEST_TS, c.COHORT_SNAPSHOTS,
+    (o.LAST_SEEN = c.COHORT_LATEST_TS) AS IS_CURRENT,
+    (o.LAST_SEEN < c.COHORT_LATEST_TS) AS IS_DELETED,
+    IFF(o.LAST_SEEN < c.COHORT_LATEST_TS, o.LAST_SEEN, NULL) AS DELETED_AFTER_TS
+FROM obj o
+JOIN cohort c ON c.ORG_ID = o.ORG_ID AND c.OBJECT_TYPE = o.OBJECT_TYPE;
+
+-- ------------------------------------------------------------------------------
 -- V_INVENTORY -- one row per first-class object, owner resolved, filterable.
+-- Carries IS_CURRENT / IS_DELETED so deleted objects are flagged, not silently
+-- presented as live. Filter `WHERE IS_CURRENT` for the live inventory.
 -- ------------------------------------------------------------------------------
 CREATE OR REPLACE VIEW V_INVENTORY AS
-SELECT w.ORG_ID, 'workbook'  AS OBJECT_TYPE, w.WORKBOOK_ID AS OBJECT_ID, w.NAME, w.PATH,
-       w.OWNER_ID, m.DISPLAY_NAME AS OWNER_NAME, m.EMAIL AS OWNER_EMAIL,
-       (m.MEMBER_ID IS NULL) AS OWNER_MISSING, COALESCE(m.IS_ARCHIVED, FALSE) AS OWNER_ARCHIVED,
-       w.CREATED_AT, w.UPDATED_AT, w.SNAPSHOT_TS
-FROM STG_WORKBOOKS w LEFT JOIN STG_MEMBERS m ON m.ORG_ID = w.ORG_ID AND m.MEMBER_ID = w.OWNER_ID
-UNION ALL
-SELECT d.ORG_ID, 'datamodel', d.DATA_MODEL_ID, d.NAME, d.PATH,
-       d.OWNER_ID, m.DISPLAY_NAME, m.EMAIL,
-       (m.MEMBER_ID IS NULL), COALESCE(m.IS_ARCHIVED, FALSE),
-       d.CREATED_AT, d.UPDATED_AT, d.SNAPSHOT_TS
-FROM STG_DATAMODELS d LEFT JOIN STG_MEMBERS m ON m.ORG_ID = d.ORG_ID AND m.MEMBER_ID = d.OWNER_ID
-UNION ALL
-SELECT ds.ORG_ID, 'dataset', ds.DATASET_ID, ds.NAME, ds.PATH,
-       ds.OWNER_ID, m.DISPLAY_NAME, m.EMAIL,
-       (m.MEMBER_ID IS NULL), COALESCE(m.IS_ARCHIVED, FALSE),
-       ds.CREATED_AT, ds.UPDATED_AT, ds.SNAPSHOT_TS
-FROM STG_DATASETS ds LEFT JOIN STG_MEMBERS m ON m.ORG_ID = ds.ORG_ID AND m.MEMBER_ID = ds.OWNER_ID;
+WITH inv AS (
+    SELECT w.ORG_ID, 'workbook'  AS OBJECT_TYPE, w.WORKBOOK_ID AS OBJECT_ID, w.NAME, w.PATH,
+           w.OWNER_ID, m.DISPLAY_NAME AS OWNER_NAME, m.EMAIL AS OWNER_EMAIL,
+           (m.MEMBER_ID IS NULL) AS OWNER_MISSING, COALESCE(m.IS_ARCHIVED, FALSE) AS OWNER_ARCHIVED,
+           w.CREATED_AT, w.UPDATED_AT, w.SNAPSHOT_TS
+    FROM STG_WORKBOOKS w LEFT JOIN STG_MEMBERS m ON m.ORG_ID = w.ORG_ID AND m.MEMBER_ID = w.OWNER_ID
+    UNION ALL
+    SELECT d.ORG_ID, 'datamodel', d.DATA_MODEL_ID, d.NAME, d.PATH,
+           d.OWNER_ID, m.DISPLAY_NAME, m.EMAIL,
+           (m.MEMBER_ID IS NULL), COALESCE(m.IS_ARCHIVED, FALSE),
+           d.CREATED_AT, d.UPDATED_AT, d.SNAPSHOT_TS
+    FROM STG_DATAMODELS d LEFT JOIN STG_MEMBERS m ON m.ORG_ID = d.ORG_ID AND m.MEMBER_ID = d.OWNER_ID
+    UNION ALL
+    SELECT ds.ORG_ID, 'dataset', ds.DATASET_ID, ds.NAME, ds.PATH,
+           ds.OWNER_ID, m.DISPLAY_NAME, m.EMAIL,
+           (m.MEMBER_ID IS NULL), COALESCE(m.IS_ARCHIVED, FALSE),
+           ds.CREATED_AT, ds.UPDATED_AT, ds.SNAPSHOT_TS
+    FROM STG_DATASETS ds LEFT JOIN STG_MEMBERS m ON m.ORG_ID = ds.ORG_ID AND m.MEMBER_ID = ds.OWNER_ID
+)
+SELECT
+    inv.*,
+    lc.LAST_SEEN,
+    lc.DELETED_AFTER_TS,
+    COALESCE(lc.IS_CURRENT, TRUE)  AS IS_CURRENT,
+    COALESCE(lc.IS_DELETED, FALSE) AS IS_DELETED
+FROM inv
+LEFT JOIN V_OBJECT_LIFECYCLE lc
+       ON lc.ORG_ID = inv.ORG_ID AND lc.OBJECT_TYPE = inv.OBJECT_TYPE AND lc.OBJECT_ID = inv.OBJECT_ID;
 
 -- ------------------------------------------------------------------------------
 -- V_MIGRATION_SCORE -- R/A/G migration readiness per dataset, with reasons.
@@ -174,7 +226,8 @@ GROUP BY 1, 2, 3, 4, 5;
 CREATE OR REPLACE VIEW V_OWNERSHIP_CLEANUP AS
 SELECT *
 FROM V_INVENTORY
-WHERE OWNER_MISSING = TRUE OR OWNER_ARCHIVED = TRUE;
+WHERE (OWNER_MISSING = TRUE OR OWNER_ARCHIVED = TRUE)
+  AND IS_CURRENT = TRUE;   -- don't chase ownership on already-deleted objects
 
 -- ------------------------------------------------------------------------------
 -- V_WORKBOOK_DRIFT -- changes to workbooks between snapshots, from SCD2 history.
