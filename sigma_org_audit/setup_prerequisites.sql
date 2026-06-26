@@ -38,7 +38,21 @@
 -- See https://help.sigmacomputing.com/reference/generate-client-credentials
 -- ==============================================================================
 
+-- ==============================================================================
+-- 0. Audit database + schema -- where everything below (and the procs/views) lives.
+--    Created by the build role so it can deploy procs/views/tables there. The
+--    network rule + secrets are schema-level objects, so this must exist first.
+--    Replace <AUDIT_DB> / <AUDIT_SCHEMA> (e.g. SIGMA_ORG_AUDIT / AUDIT) and use
+--    the SAME names everywhere downstream.
+-- ==============================================================================
+
+USE ROLE SYSADMIN;          -- the build/execution role (your <YOUR_ROLE>)
+CREATE DATABASE IF NOT EXISTS <AUDIT_DB>;
+CREATE SCHEMA   IF NOT EXISTS <AUDIT_DB>.<AUDIT_SCHEMA>;
+
 USE ROLE ACCOUNTADMIN;
+USE DATABASE <AUDIT_DB>;
+USE SCHEMA   <AUDIT_SCHEMA>;
 
 -- ==============================================================================
 -- 1. Network rule -- allows outbound HTTPS to the Sigma API

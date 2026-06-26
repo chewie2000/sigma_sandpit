@@ -140,18 +140,37 @@ cmd_reset() {
 }
 
 # ---- privileged: setup + registry (env-injected via 0600 temp file) ----------
+# Redact the two secret values from any streamed output.
+_redact() {
+  python3 -c "import sys,os
+red=[v for v in (os.environ.get('SIGMA_CLIENT_SECRET',''), os.environ.get('SIGMA_CLIENT_ID','')) if v]
+for line in sys.stdin:
+    for r in red: line=line.replace(r,'***')
+    sys.stdout.write(line)"
+}
+
 cmd_setup() {
   : "${SIGMA_BASE_URL:?}"; : "${SIGMA_CLIENT_ID:?}"; : "${SIGMA_CLIENT_SECRET:?}"
   local tmp; tmp="$(mktemp -t soa_setup.XXXXXX.sql)"; chmod 600 "$tmp"
-  ROLE_FOR_GRANTS="$ROLE" python3 - "$tmp" <<'PY'
+  SOA_DB="$DB" SOA_SCHEMA="$SCHEMA" SOA_GRANT_ROLE="$ROLE" SOA_ADMIN_ROLE="$ADMIN_ROLE" \
+  python3 - "$tmp" <<'PY'
 import os, sys
 base, cid, sec = os.environ["SIGMA_BASE_URL"], os.environ["SIGMA_CLIENT_ID"], os.environ["SIGMA_CLIENT_SECRET"]
-grant_role = os.environ["ROLE_FOR_GRANTS"]
+db, schema = os.environ["SOA_DB"], os.environ["SOA_SCHEMA"]
+grant_role, admin_role = os.environ["SOA_GRANT_ROLE"], os.environ["SOA_ADMIN_ROLE"]
 hosts = ["aws-api.sigmacomputing.com","api.us-a.aws.sigmacomputing.com","api.eu.aws.sigmacomputing.com",
          "api.uk.aws.sigmacomputing.com","api.ca.aws.sigmacomputing.com","api.au.aws.sigmacomputing.com",
          "api.us.azure.sigmacomputing.com","api.eu.azure.sigmacomputing.com","api.sigmacomputing.com"]
 vlist = ",\n    ".join(f"'{h}:443'" for h in hosts)
 open(sys.argv[1],"w").write(f"""
+-- build role owns the audit DB/schema so it can deploy procs/views/tables
+USE ROLE {grant_role};
+CREATE DATABASE IF NOT EXISTS {db};
+CREATE SCHEMA   IF NOT EXISTS {db}.{schema};
+-- account-level objects (network rule, secrets, integration) as the admin role
+USE ROLE {admin_role};
+USE DATABASE {db};
+USE SCHEMA {schema};
 CREATE OR REPLACE NETWORK RULE sigma_api_network_rule MODE=EGRESS TYPE=HOST_PORT
   VALUE_LIST = (\n    {vlist}\n  );
 CREATE OR REPLACE SECRET sigma_base_url      TYPE=GENERIC_STRING SECRET_STRING='{base}';
@@ -167,8 +186,9 @@ GRANT READ ON SECRET sigma_client_id     TO ROLE {grant_role};
 GRANT READ ON SECRET sigma_client_secret TO ROLE {grant_role};
 """)
 PY
-  sfa -f "$tmp" | python3 -c "import sys,os;r=[os.environ.get('SIGMA_CLIENT_SECRET',''),os.environ.get('SIGMA_CLIENT_ID','')];[sys.stdout.write(__import__('functools').reduce(lambda s,x:s.replace(x,'***') if x else s, r, l)) for l in sys.stdin]"
-  rm -f "$tmp"; echo "== setup complete (temp file deleted) =="
+  # No --database/--schema here: the script CREATEs and USEs them (they may not exist yet).
+  snow sql -c "$CONN" --warehouse "$WH" -f "$tmp" 2>&1 | _filter | _redact
+  rm -f "$tmp"; echo "== setup complete (db=$DB schema=$SCHEMA; temp file deleted) =="
 }
 
 cmd_registry() {
@@ -187,7 +207,7 @@ ALTER EXTERNAL ACCESS INTEGRATION sigma_api_access
 GRANT READ ON SECRET sigma_tenant_registry TO ROLE {os.environ['ROLE_FOR_GRANTS']};
 """)
 PY
-  sfa -f "$tmp" | python3 -c "import sys,os;r=[os.environ.get('SIGMA_CLIENT_SECRET',''),os.environ.get('SIGMA_CLIENT_ID','')];[sys.stdout.write(__import__('functools').reduce(lambda s,x:s.replace(x,'***') if x else s, r, l)) for l in sys.stdin]"
+  sfa -f "$tmp" 2>&1 | _filter | _redact
   rm -f "$tmp"; echo "== registry set (temp file deleted). Edit the JSON to add more orgs. =="
 }
 

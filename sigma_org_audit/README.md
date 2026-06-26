@@ -126,10 +126,16 @@ snow sql -c <conn> --role SYSADMIN --database SIGMA_ORG_AUDIT --schema AUDIT \
 snow sql ... -f audit_queries.sql                      # the report queries
 ```
 Re-pull data anytime with `./deploy.sh refresh` (all orgs) or
-`./deploy.sh refresh <label>` (one org). Defaults target
-`SIGMA_ORG_AUDIT.AUDIT` on connection `SUPPORT_SANDBOX`; override with
-`--conn / --db / --schema / --role / --warehouse`. Full command reference in
-[DEPLOY.md](DEPLOY.md).
+`./deploy.sh refresh <label>` (one org).
+
+**Where does it install?** Every command targets a database + schema set by flags
+(defaults `--db SIGMA_ORG_AUDIT --schema AUDIT` on connection `--conn
+SUPPORT_SANDBOX`, build role `--role SYSADMIN`, warehouse `--warehouse
+COMPUTE_WH`). `setup` **creates** that database + schema (owned by the build role)
+along with the secrets and integration; every later command then creates its
+objects there. Point at a different location by passing the flags consistently,
+e.g. `./deploy.sh bootstrap --db MY_DB --schema MY_SCHEMA --conn MY_CONN`. Full
+reference in [DEPLOY.md](DEPLOY.md).
 
 > The three steps must run **in order** — `bootstrap` reads the registry created
 > by `registry`, which uses the integration created by `setup`.
