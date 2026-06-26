@@ -106,10 +106,20 @@ data via the **`sigma-cli` sub-skill**.
 - The **Snowflake CLI** (`snow`) configured with a connection (a profile in
   `~/.snowflake/connections.toml`). Either set it as your default
   (`snow connection set-default <name>`) or pass `--conn <name>` to every command.
-- One Sigma org's **admin** API credentials in your environment:
-  `SIGMA_BASE_URL`, `SIGMA_CLIENT_ID`, `SIGMA_CLIENT_SECRET`
-  (generate at *Administration → Developer Access*; pick the host for your cloud
-  from the table in `setup_prerequisites.sql`).
+- One Sigma org's **admin** API credentials exported as environment variables —
+  `SIGMA_BASE_URL`, `SIGMA_CLIENT_ID`, `SIGMA_CLIENT_SECRET`. Generate the
+  client id/secret at *Administration → Developer Access*; the host comes from the
+  table in `setup_prerequisites.sql`. Set them in your shell:
+  ```bash
+  export SIGMA_BASE_URL=https://aws-api.sigmacomputing.com
+  export SIGMA_CLIENT_ID=...
+  export SIGMA_CLIENT_SECRET=...
+  ```
+  For a persistent setup put those lines in your shell profile (`~/.zshenv`,
+  `~/.zshrc`, or `~/.bashrc`) so every session has them. They are read **only** by
+  `./deploy.sh setup` and `./deploy.sh registry` (to seed the one env-based org);
+  the multi-org `registry --file orgs.json` path carries each org's creds in the
+  file instead, so the env vars aren't needed for it.
 - Snowflake rights: **ACCOUNTADMIN** for the one-time setup; a build role
   (e.g. **SYSADMIN**) for everything else.
 

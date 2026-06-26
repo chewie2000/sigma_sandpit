@@ -8,9 +8,16 @@ dependency order and is idempotent.
 - `snow` (Snowflake CLI) configured with a connection. If you don't pass `--conn`,
   the CLI's **default** connection is used — set one with
   `snow connection set-default <name>`, or pass `--conn <name>` each time.
-- `SIGMA_BASE_URL`, `SIGMA_CLIENT_ID`, `SIGMA_CLIENT_SECRET` in the environment
-  (used only by the privileged `setup` / `registry` commands; injected via a 0600
-  temp file that is deleted after — never on the command line).
+- `SIGMA_BASE_URL`, `SIGMA_CLIENT_ID`, `SIGMA_CLIENT_SECRET` exported in your shell
+  (or persisted in `~/.zshenv` / `~/.zshrc` / `~/.bashrc`):
+  ```bash
+  export SIGMA_BASE_URL=https://aws-api.sigmacomputing.com
+  export SIGMA_CLIENT_ID=...
+  export SIGMA_CLIENT_SECRET=...
+  ```
+  Read only by `setup` and `registry` (the env-based single org); injected via a
+  0600 temp file deleted after — never on the command line. The multi-org
+  `registry --file orgs.json` path carries creds in the file, not the env.
 
 ## One-time install
 ```bash
