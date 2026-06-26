@@ -4,9 +4,11 @@
 
 > **Disclaimer:** This project contains personal scripts and tools written independently by the author. Although the author is employed by Sigma Computing, this work is not created, endorsed, tested, or supported by Sigma Computing in any capacity. These scripts are provided as-is, with no warranty or guarantee of fitness for any purpose. Use at your own risk. For official Sigma Computing documentation, support, and tooling, refer to [Sigma's official documentation](https://help.sigmacomputing.com).
 
-A Snowflake-native toolkit that builds a **holistic, replayable audit of a Sigma
+A Snowflake-native toolkit that builds a **replayable audit of a Sigma
 organisation** from the Sigma REST API, for internal governance checks and
-migration-readiness assessment.
+migration-readiness assessment (single-org or multi-tenant). It covers the core
+content, people, writeback, tenancy, and data-isolation surface today — see
+[**Scope**](#scope--whats-covered-vs-not-yet) for exactly what is and isn't captured.
 
 ## The idea — a replayable three-layer pipeline
 
@@ -28,6 +30,56 @@ Writeback schemas┘   (VARIANT  (typed     (SCD2 history
 This shape is the distinguishing choice: a bug in transform logic, or a need to
 backfill a new computed column, never requires re-hitting the API — you rebuild
 stage/marts from raw.
+
+## Scope — what's covered vs. not yet
+
+**Captured & analysed today**
+
+- **Content:** workbooks (+ sources), data models (+ detail), datasets
+  (deprecated), connections (+ writeback locations).
+- **People & access:** members, teams, artifact grants (inode-level for
+  workbooks / datasets / data models).
+- **Tenancy & deployment:** org role (parent / child / standalone), tenants,
+  deployment policies, source-swap policies.
+- **Data isolation:** user attributes + their user/team/tenant bindings, with a
+  heuristic "used in a data model" (RLS) signal.
+- **Writeback:** SIGDS input tables + WAL activity, archival scoring, and
+  cross-org attribution for shared writeback schemas.
+- **Derived:** inventory, ownership cleanup, object lifecycle (deletion
+  detection), R/A/G migration scoring (dataset→model), SCD2 history + drift,
+  tenancy topology, data-isolation posture.
+
+**Not captured yet** (on the roadmap)
+
+- Workspaces (+ grants); the real folder/file tree (only path *strings* today);
+  connection-level grants.
+- Account types & permissions; API credentials / connectors; SAML/SSO config.
+- Pixel-perfect **reports**; tags / version tags; templates.
+- Schedules (exports), materialization schedules, embeds, cross-org shares,
+  bookmarks.
+- Workbook **internals** — elements / pages / controls / queries / lineage
+  (needed for source-binding & complexity / t-shirt sizing); per-tenant
+  deployment detail (what's deployed into each tenant).
+
+**Known limitations**
+
+- **Admin/org settings aren't API-readable** — `/v2/organizations/settings` is
+  PATCH-only (no GET). Auth (SAML), account types, and user attributes are
+  readable via their own endpoints; the monolithic settings object is not.
+- **Visibility scoping is uneven** — workbooks & datasets are fetched org-wide
+  (`skipPermissionCheck`); data models, connections, members, teams are not, so
+  those lists may reflect only what the token can see. No completeness flag yet.
+- **Scale unproven** — validated against one small org; list pagination and the
+  per-object detail fan-out haven't been exercised at large scale.
+- **Child org-role is operator-asserted** — a child can't self-identify via the
+  tenants API (403 from inside), so `role` comes from the registry, not the API.
+- **Snowflake-only writeback** — connections to other accounts or Databricks are
+  inventoried but their writeback contents are skipped (`SCAN_REACHABLE = FALSE`).
+- **RLS signal is heuristic** — a string match of the attribute in a model spec,
+  not a parsed security policy.
+
+This is a proof-of-concept under active development; the lists above change as the
+coverage epic progresses.
 
 ## Files
 
