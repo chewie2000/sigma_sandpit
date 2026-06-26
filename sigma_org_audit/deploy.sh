@@ -29,6 +29,10 @@
 #                  -> history -> marts
 #   refresh [lbl]  data refresh only: extract(all|lbl) + writeback + history
 #   reset          drop procs/views/SCD2 tables (keeps secrets + raw), then redeploy
+#   reset --hard   reset + also drop RAW_SIGMA_OBJECTS + SIGMA_EXTRACT_LOG, for a
+#                  from-scratch rebuild reusing setup/secrets/registry (then bootstrap)
+#   teardown       (ACCOUNTADMIN) DROP the audit DB + integration -- full clean-down.
+#                  Destructive; prompts to confirm unless --yes. Re-run setup after.
 #   help
 #
 # Flags (defaults shown):
@@ -82,6 +86,8 @@ CMD="${1:-help}"; shift || true
 LABEL=""              # org label: positional for `refresh`, or --label for `registry`
 ORG_ROLE_VAL="child"  # role recorded for the single-org `registry` seed (--org-role)
 REG_FILE=""           # registry: load a JSON file of orgs instead of env (--file)
+RESET_HARD=0          # reset --hard: also drop RAW_SIGMA_OBJECTS + SIGMA_EXTRACT_LOG
+ASSUME_YES=0          # teardown: skip the interactive confirmation (--yes)
 # capture an optional positional label for `refresh`
 if [[ "${CMD}" == "refresh" && "${1:-}" != "" && "${1:-}" != --* ]]; then LABEL="$1"; shift || true; fi
 while [[ $# -gt 0 ]]; do
@@ -95,6 +101,8 @@ while [[ $# -gt 0 ]]; do
     --label) LABEL="$2"; shift 2;;
     --org-role) ORG_ROLE_VAL="$2"; shift 2;;
     --file) REG_FILE="$2"; shift 2;;
+    --hard) RESET_HARD=1; shift;;
+    --yes|-y) ASSUME_YES=1; shift;;
     *) echo "unknown flag: $1" >&2; exit 2;;
   esac
 done
@@ -176,7 +184,35 @@ cmd_reset() {
     DROP VIEW IF EXISTS V_INVENTORY;
     DROP TABLE IF EXISTS SCD2_WORKBOOKS; DROP TABLE IF EXISTS SCD2_DATASETS;
     DROP TABLE IF EXISTS SCD2_CONNECTIONS; DROP TABLE IF EXISTS SCD2_WRITEBACK_TABLES;" >/dev/null || true
-  echo "== reset done (secrets + RAW_SIGMA_OBJECTS preserved); run bootstrap or deploy-procs/deploy-views =="
+  if [[ "$RESET_HARD" == 1 ]]; then
+    # --hard also clears the raw snapshots + progress log, for a from-scratch
+    # rebuild that reuses the existing setup/secrets/registry (no ACCOUNTADMIN).
+    sf -q "DROP TABLE IF EXISTS RAW_SIGMA_OBJECTS; DROP TABLE IF EXISTS SIGMA_EXTRACT_LOG;" >/dev/null || true
+    echo "== reset --hard done (also dropped RAW_SIGMA_OBJECTS + SIGMA_EXTRACT_LOG; secrets/registry kept). Run bootstrap. =="
+  else
+    echo "== reset done (secrets + RAW_SIGMA_OBJECTS preserved); run bootstrap or deploy-procs/deploy-views =="
+  fi
+}
+
+cmd_teardown() {
+  # Full clean-down: DROP the audit database (cascades schema, tables, views,
+  # procs, network rule + all secrets) and the account-level external-access
+  # integration -- i.e. everything `setup` created. Destructive + irreversible;
+  # requires interactive confirmation unless --yes is passed. Re-provision with
+  # setup -> registry -> bootstrap.
+  if [[ "$ASSUME_YES" != 1 ]]; then
+    if [[ ! -t 0 ]]; then
+      echo "teardown needs confirmation; re-run with --yes for non-interactive use." >&2
+      exit 2
+    fi
+    printf 'This DROPS DATABASE %s and INTEGRATION sigma_api_access (irreversible).\nType the database name to confirm: ' "$DB"
+    read -r ans
+    [[ "$ans" == "$DB" ]] || { echo "confirmation did not match '$DB'; aborted." >&2; exit 2; }
+  fi
+  # No --database/--schema (we are dropping it); admin role for the integration.
+  snow sql ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --role "$ADMIN_ROLE" --warehouse "$WH" \
+    -q "DROP DATABASE IF EXISTS \"$DB\"; DROP INTEGRATION IF EXISTS sigma_api_access;" 2>&1 | _filter || true
+  echo "== teardown complete: dropped database $DB + integration sigma_api_access. Re-provision: setup -> registry -> bootstrap. =="
 }
 
 # ---- privileged: setup + registry (env-injected via 0600 temp file) ----------
@@ -286,5 +322,6 @@ case "$CMD" in
   bootstrap|all) cmd_bootstrap;;
   refresh)      cmd_refresh;;
   reset)        cmd_reset;;
-  help|*)       sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
+  teardown)     cmd_teardown;;
+  help|*)       sed -n '2,/^# ===/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
 esac
