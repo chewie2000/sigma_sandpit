@@ -48,52 +48,59 @@ A companion **`sigma-org-audit` Claude Code skill** (in `../sigma_skills/`) driv
 this pipeline and interprets the results, optionally cross-checking against live
 data via the **`sigma-cli` sub-skill**.
 
-## Setup
+## Install
 
-> **One-command path (recommended):** `deploy.sh` automates everything below.
-> Requires `snow` (Snowflake CLI) configured and `SIGMA_BASE_URL` /
-> `SIGMA_CLIENT_ID` / `SIGMA_CLIENT_SECRET` in your environment. Run in order:
-> ```bash
-> ./deploy.sh setup       # ACCOUNTADMIN: network rule, secrets, integration, grants
-> ./deploy.sh registry    # ACCOUNTADMIN: seed the tenant registry (1 org from env)
-> ./deploy.sh bootstrap   # SYSADMIN: procs -> extract -> stage -> writeback -> history -> marts
-> ```
-> `bootstrap` calls `sigma_org_extract_all`, which reads the registry — so
-> `registry` must run **before** `bootstrap`. Override targets with
-> `--conn/--db/--schema/--role/--warehouse`. See [DEPLOY.md](DEPLOY.md). The manual
-> steps below are the reference for what it does (and for running pieces individually).
+### Prerequisites
+- The **Snowflake CLI** (`snow`) configured with a connection (a profile in
+  `~/.snowflake/connections.toml`).
+- One Sigma org's **admin** API credentials in your environment:
+  `SIGMA_BASE_URL`, `SIGMA_CLIENT_ID`, `SIGMA_CLIENT_SECRET`
+  (generate at *Administration → Developer Access*; pick the host for your cloud
+  from the table in `setup_prerequisites.sql`).
+- Snowflake rights: **ACCOUNTADMIN** for the one-time setup; a build role
+  (e.g. **SYSADMIN**) for everything else.
 
-1. **Prerequisites (once, as ACCOUNTADMIN):** edit and run `setup_prerequisites.sql`
-   — set your Sigma API host and client credentials, and the execution role.
-   Admin-scoped credentials are required for org-wide visibility
-   (`skipPermissionCheck`).
-2. **Deploy the procedures:** run `procs/sigma_org_extract.sql`,
-   `procs/sigma_writeback_scan.sql`, `procs/sigma_org_extract_all.sql`, then
-   `marts/scd2_history.sql`.
-   > Note: when a procedure's **parameter count changes** between versions,
-   > `CREATE OR REPLACE` cannot replace it (Snowflake rejects the ambiguous
-   > overload). `DROP PROCEDURE <name>(<old arg types>);` first, then re-create.
-3. **Extract** (set `USE DATABASE/SCHEMA` to where the raw table will live first):
-   ```sql
-   CALL sigma_org_extract('MY_DB', 'MY_SCHEMA');     -- API objects (single org, uses Secrets)
-   CALL sigma_writeback_scan('MY_DB', 'MY_SCHEMA');  -- writeback schemas (run after extract)
-   ```
-4. **Build stage views:** run `stage/stage_views.sql`.
-5. **Build history:** (the mart drift view depends on the SCD2 tables, so this runs
-   **before** the mart views)
-   ```sql
-   CALL sigma_scd2_apply('STG_WORKBOOKS',        'SCD2_WORKBOOKS',        'WORKBOOK_ID');
-   CALL sigma_scd2_apply('STG_DATASETS',         'SCD2_DATASETS',         'DATASET_ID');
-   CALL sigma_scd2_apply('STG_CONNECTIONS',      'SCD2_CONNECTIONS',      'CONNECTION_ID');
-   CALL sigma_scd2_apply('STG_WRITEBACK_TABLES', 'SCD2_WRITEBACK_TABLES', 'SIGDS_TABLE');
-   ```
-   Re-run these after each new extract to accrue history and power the drift views.
-6. **Build mart views:** run `marts/mart_views.sql`.
-7. **Query:** use `audit_queries.sql`, or point a Sigma workbook at the views.
+### Quick start (recommended)
+```bash
+cd sigma_org_audit
+./deploy.sh setup       # 1. once, ACCOUNTADMIN — network rule, secrets, integration, grants
+./deploy.sh registry    # 2. once, ACCOUNTADMIN — seed the org registry from your env vars
+./deploy.sh bootstrap   # 3. build + first load: procs -> extract -> views -> history -> marts
+```
+Then verify and explore:
+```bash
+snow sql -c <conn> --role SYSADMIN --database SIGMA_ORG_AUDIT --schema AUDIT \
+  --warehouse <wh> -f tests/acceptance_checks.sql     # expect all PASS / INFO
+snow sql ... -f audit_queries.sql                      # the report queries
+```
+Re-pull data anytime with `./deploy.sh refresh` (all orgs) or
+`./deploy.sh refresh <label>` (one org). Defaults target
+`SIGMA_ORG_AUDIT.AUDIT` on connection `SUPPORT_SANDBOX`; override with
+`--conn / --db / --schema / --role / --warehouse`. Full command reference in
+[DEPLOY.md](DEPLOY.md).
 
-> **Order matters:** procs → extract → writeback → stage views → history → mart
-> views. `marts/mart_views.sql` will fail to create `V_WORKBOOK_DRIFT` if the
-> `SCD2_*` tables don't exist yet. `deploy.sh bootstrap` does this in the right order.
+> The three steps must run **in order** — `bootstrap` reads the registry created
+> by `registry`, which uses the integration created by `setup`.
+
+### Manual install (no CLI / running SQL in Snowsight)
+`deploy.sh` just runs the SQL files in dependency order. To do it by hand:
+
+1. **Setup (ACCOUNTADMIN):** fill the placeholders in `setup_prerequisites.sql` and run it.
+2. **Procedures:** run `procs/sigma_org_extract.sql`, `procs/sigma_writeback_scan.sql`,
+   `procs/sigma_org_extract_all.sql`, `marts/scd2_history.sql`.
+3. **Extract** (set `USE DATABASE`/`USE SCHEMA` first):
+   `CALL sigma_org_extract('DB','SCHEMA');` then `CALL sigma_writeback_scan('DB','SCHEMA');`
+4. **Stage views:** run `stage/stage_views.sql`.
+5. **History:** the four `CALL sigma_scd2_apply(...)` statements (see `audit_queries.sql`
+   / the worked example below).
+6. **Mart views:** run `marts/mart_views.sql`.
+7. **Query:** `audit_queries.sql`.
+
+> **Order matters** (the reason `deploy.sh` exists): procs → extract → writeback →
+> stage → **history → marts**. `marts/mart_views.sql` creates `V_WORKBOOK_DRIFT`,
+> which needs the `SCD2_*` tables, so history must run first. Also: if a procedure's
+> **parameter count** changes between versions, `DROP PROCEDURE <name>(<types>)`
+> before re-creating (Snowflake rejects the ambiguous overload).
 
 ## Multiple orgs — one deployment, many orgs
 
