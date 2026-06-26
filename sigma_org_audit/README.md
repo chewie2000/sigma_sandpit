@@ -180,6 +180,8 @@ command creates its objects there. See the command + flag tables below.
 | `deploy-procs` | (re)create the stored procedures only |
 | `deploy-views` | (re)create the stage + mart views only |
 | `reset` | drop procs/views/SCD2 (keeps secrets + raw), ready to rebuild |
+| `reset --hard` | `reset` **plus** drop `RAW_SIGMA_OBJECTS` + `SIGMA_EXTRACT_LOG` — a from-scratch rebuild reusing setup/secrets/registry (then `bootstrap`). No ACCOUNTADMIN |
+| `teardown` | (ACCOUNTADMIN) **DROP the audit database + the `sigma_api_access` integration** — full clean-down. Destructive/irreversible; prompts to confirm unless `--yes`. Re-provision with `setup → registry → bootstrap` |
 | `help` | usage |
 
 ### `deploy.sh` flags
