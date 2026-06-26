@@ -253,31 +253,68 @@ ORDER BY SCD_VALID_TO DESC;
 -- ORG_ROLE: parent (can enumerate tenants and has them), standalone (reachable,
 -- none), or unknown (tenant enumeration denied -- e.g. 403, not entitled/parent).
 -- ------------------------------------------------------------------------------
+-- Per-org tenancy summary (one row per org). PARENT_ORGANIZATION_ID is backfilled
+-- from the tenant list of any parent that lists this org, for the common case where
+-- a child's own self-lookup is denied (403) and can't return its parent.
 CREATE OR REPLACE VIEW V_TENANCY_TOPOLOGY AS
 SELECT
     o.ORG_ID,
     o.ORG_ROLE,
     o.ROLE_SOURCE,                                  -- api (confirmed) | operator (asserted)
-    o.PARENT_ORGANIZATION_ID,
+    COALESCE(o.PARENT_ORGANIZATION_ID, tp.DERIVED_PARENT)  AS PARENT_ORGANIZATION_ID,
+    CASE
+        WHEN o.PARENT_ORGANIZATION_ID IS NOT NULL THEN 'api-self'      -- org self-reported it
+        WHEN tp.DERIVED_PARENT        IS NOT NULL THEN 'tenant-list'   -- inferred from a parent's tenant list
+        ELSE NULL
+    END                                             AS PARENT_SOURCE,
     o.TENANT_COUNT,
     o.DEPLOYMENT_POLICY_COUNT,
     o.SOURCE_SWAP_POLICY_COUNT,
     (o.TENANTS_LIST_ERROR IS NOT NULL)              AS TENANT_ENUM_DENIED,
     o.TENANTS_LIST_ERROR,
-    o.TENANT_SELF_ERROR,
+    o.TENANT_SELF_ERROR,                            -- NULL for a benign 404 (not a tenant); 403 = denied
     CASE
         WHEN o.ORG_ROLE = 'parent'
             THEN 'Parent/host org with ' || o.TENANT_COUNT || ' tenant(s); assess deployment + source-swap policy coverage'
         WHEN o.ORG_ROLE = 'child'
             THEN 'Child tenant'
-                 || COALESCE(' of parent ' || o.PARENT_ORGANIZATION_ID, '')
-                 || IFF(o.ROLE_SOURCE = 'operator', ' (operator-asserted; API self-lookup denied)', ' (API-confirmed)')
+                 || COALESCE(' of parent ' || COALESCE(o.PARENT_ORGANIZATION_ID, tp.DERIVED_PARENT), '')
+                 || CASE
+                        WHEN o.PARENT_ORGANIZATION_ID IS NOT NULL THEN ' (API-confirmed)'
+                        WHEN tp.DERIVED_PARENT        IS NOT NULL THEN ' (parent derived from a parent org''s tenant list)'
+                        WHEN o.ROLE_SOURCE = 'operator'           THEN ' (operator-asserted; API self-lookup denied)'
+                        ELSE ''
+                    END
         WHEN o.ORG_ROLE = 'standalone'
             THEN 'Standalone org, no tenants/policies -- candidate to become a parent or be deployed as a tenant'
         ELSE 'Role indeterminate from the API -- tenant list + self-lookup both denied (403). May be a CHILD tenant or a non-parent / unentitled org; re-run with ORG_ROLE_OVERRIDE when the role is known out-of-band (see 9c8.12).'
     END                                             AS TOPOLOGY_NOTE,
     o.SNAPSHOT_TS
-FROM STG_ORGANIZATION o;
+FROM STG_ORGANIZATION o
+LEFT JOIN (
+    SELECT TENANT_ORG_ID, ANY_VALUE(PARENT_ORG_ID) AS DERIVED_PARENT
+    FROM STG_TENANTS GROUP BY TENANT_ORG_ID
+) tp ON tp.TENANT_ORG_ID = o.ORG_ID;
+
+-- ------------------------------------------------------------------------------
+-- V_TENANT_RELATIONSHIPS -- the actual parent->tenant edges (the tenancy tree).
+-- One row per tenant a parent enumerated via /v2/tenants, so a parent's tenants
+-- are visible even when they weren't audited as their own org. TENANT_EXTRACTED
+-- flags whether a full audit snapshot exists for that tenant org.
+-- (V_TENANCY_TOPOLOGY is the per-org summary; this is the relationship grain.)
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW V_TENANT_RELATIONSHIPS AS
+SELECT
+    t.PARENT_ORG_ID,
+    po.ORG_ROLE                 AS PARENT_ROLE,
+    t.TENANT_ORG_ID,
+    t.NAME                      AS TENANT_NAME,
+    (te.ORG_ID IS NOT NULL)     AS TENANT_EXTRACTED,       -- did we also audit this tenant org?
+    te.ORG_ROLE                 AS TENANT_EXTRACTED_ROLE,
+    t.SNAPSHOT_TS
+FROM STG_TENANTS t
+LEFT JOIN STG_ORGANIZATION po ON po.ORG_ID = t.PARENT_ORG_ID
+LEFT JOIN STG_ORGANIZATION te ON te.ORG_ID = t.TENANT_ORG_ID;
 
 -- ------------------------------------------------------------------------------
 -- V_USER_ATTRIBUTE_USAGE -- per attribute: binding counts + whether any data

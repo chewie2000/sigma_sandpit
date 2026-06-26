@@ -72,6 +72,11 @@ UNION ALL SELECT 30,'mart: V_MIGRATION_SCORE runs (may be 0 = no datasets)',
        TO_VARCHAR(COUNT(*)), 'INFO' FROM V_MIGRATION_SCORE
 UNION ALL SELECT 31,'mart: V_WORKBOOK_DRIFT runs (may be 0 = single snapshot)',
        TO_VARCHAR(COUNT(*)), 'INFO' FROM V_WORKBOOK_DRIFT
+UNION ALL SELECT 32,'mart: V_TENANT_RELATIONSHIPS edges have non-null ids',
+       'rows=' || TO_VARCHAR(COUNT(*)) || ' nullids=' ||
+       TO_VARCHAR(COUNT_IF(PARENT_ORG_ID IS NULL OR TENANT_ORG_ID IS NULL)),
+       IFF(COUNT_IF(PARENT_ORG_ID IS NULL OR TENANT_ORG_ID IS NULL) = 0, 'PASS','FAIL')
+       FROM V_TENANT_RELATIONSHIPS
 
 -- HISTORY layer -----------------------------------------------------------------
 UNION ALL SELECT 40,'history: SCD2_WORKBOOKS rows',  TO_VARCHAR(COUNT(*)), IFF(COUNT(*)>0,'PASS','FAIL') FROM SCD2_WORKBOOKS
