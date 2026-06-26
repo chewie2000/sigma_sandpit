@@ -102,143 +102,70 @@ Re-pull data anytime with `./deploy.sh refresh` (all orgs) or
 > **parameter count** changes between versions, `DROP PROCEDURE <name>(<types>)`
 > before re-creating (Snowflake rejects the ambiguous overload).
 
-## Multiple orgs — one deployment, many orgs
+## Multiple orgs and tenants
 
-The pipeline is multi-org by default. `sigma_org_extract` calls `GET /v2/whoami`
-once per run and stamps the resulting **`ORG_ID`** onto every row in
-`RAW_SIGMA_OBJECTS`, so a single warehouse can hold many orgs side by side — each
-row attributed to the org it came from. Every `STG_*` and `V_*` view carries
-`ORG_ID` through, so you scope a report with `WHERE ORG_ID = '<uuid>'` or compare
-orgs with `GROUP BY ORG_ID`. (Query 0 in `audit_queries.sql` lists the orgs present.)
+Multi-org by default: every extract calls `GET /v2/whoami` and stamps **`ORG_ID`**
+on each row of `RAW_SIGMA_OBJECTS`, so one warehouse holds many orgs side by side —
+a parent + its tenants, unrelated orgs, or any mix. Every `STG_*`/`V_*` view carries
+`ORG_ID`, so you scope a report with `WHERE ORG_ID = '<uuid>'` or compare orgs with
+`GROUP BY ORG_ID`. (Query 0 in `audit_queries.sql` lists the orgs present.)
 
-### What's built once vs. per-org
+**Almost everything is built once and shared** — the setup objects, the audit
+database/schema, all procedures, the `STG_*`/`V_*` views, and the org-tagged
+`RAW_SIGMA_OBJECTS` table. Only the *extract* runs per org, and
+`sigma_writeback_scan` / `sigma_scd2_apply` are a single call each covering every
+org in the raw table. You never rebuild views per org.
 
-This is the key mental model — **almost everything is shared**:
+### The org registry (how `deploy.sh` does multi-org)
 
-| Built **once** (shared by all orgs) | Run **per org** |
-|---|---|
-| Setup objects: network rule, secrets, external access integration, role grants (`setup_prerequisites.sql`) | `sigma_org_extract(...)` — one call per org |
-| The audit database + schema (e.g. `SIGMA_ORG_AUDIT.AUDIT`) | — |
-| All procedures, `STG_*` / `V_*` views | — |
-| `RAW_SIGMA_OBJECTS` (org-tagged; holds every org) | — |
-
-`sigma_writeback_scan` and `sigma_scd2_apply` are **one call each, covering every
-org** present in the raw table — you do not run them per org (though
-`sigma_writeback_scan` accepts an optional `ORG_FILTER` if you want to limit it).
-You never rebuild the views per org.
-
-### Getting each org's credentials
-
-Generate an admin-scoped client ID + secret **in each org** you want to audit:
-its *Administration → Developer Access → Create New*. Note that org's API host
-from the table in `setup_prerequisites.sql` (the base URL). The secret is shown
-once at creation — copy it immediately.
-
-### Two ways to point an extract at a different org
-
-**Option A — rotate the Secrets** (credentials never leave the Secret store;
-nothing appears in query history; best for a small, stable set of orgs). The
-external access integration already references these secret *names*, so there is
-nothing else to change:
+A single secret holds every org's credentials; `sigma_org_extract_all` loops over
+it. (A stored proc can only read statically-declared secrets, so one registry
+secret — bound once — scales to any number of orgs with no proc/integration change.)
 
 ```sql
 USE ROLE ACCOUNTADMIN;
-CREATE OR REPLACE SECRET sigma_base_url      TYPE=GENERIC_STRING SECRET_STRING='https://<ORG_B_HOST>';
-CREATE OR REPLACE SECRET sigma_client_id     TYPE=GENERIC_STRING SECRET_STRING='<ORG_B_CLIENT_ID>';
-CREATE OR REPLACE SECRET sigma_client_secret TYPE=GENERIC_STRING SECRET_STRING='<ORG_B_CLIENT_SECRET>';
--- then re-run the extract (below) for org B
+CREATE OR REPLACE SECRET sigma_tenant_registry TYPE = GENERIC_STRING
+  SECRET_STRING = '[
+    {"label":"acme",  "baseUrl":"https://aws-api.sigmacomputing.com",   "clientId":"<id>","clientSecret":"<sec>","role":"child", "enabled":true},
+    {"label":"globex","baseUrl":"https://api.eu.aws.sigmacomputing.com","clientId":"<id>","clientSecret":"<sec>","role":"parent","enabled":true}
+  ]';
+ALTER EXTERNAL ACCESS INTEGRATION sigma_api_access
+  SET ALLOWED_AUTHENTICATION_SECRETS = (sigma_base_url, sigma_client_id, sigma_client_secret, sigma_tenant_registry);
+GRANT READ ON SECRET sigma_tenant_registry TO ROLE <YOUR_ROLE>;
 ```
 
-**Option B — pass override parameters** at call time (one `CALL` audits any org,
-no setup change; but the client secret then appears in Snowflake query history):
-
+Then run all orgs, or one by label:
 ```sql
-CALL sigma_org_extract(
-  'SIGMA_ORG_AUDIT','AUDIT','RAW_SIGMA_OBJECTS', TRUE, 10,
-  'https://api.eu.aws.sigmacomputing.com', '<ORG_B_CLIENT_ID>', '<ORG_B_CLIENT_SECRET>');
+CALL sigma_org_extract_all('SIGMA_ORG_AUDIT','AUDIT');                            -- all enabled
+CALL sigma_org_extract_all('SIGMA_ORG_AUDIT','AUDIT','RAW_SIGMA_OBJECTS','acme'); -- just 'acme'
 ```
+It returns a per-org summary; one org's failure (e.g. a 403) doesn't abort the batch.
 
-The network rule created by `setup_prerequisites.sql` already allows egress to
-**every** Sigma API host, so orgs on any cloud/region are reachable without
-re-running setup.
+- **`./deploy.sh registry`** seeds this secret with one org from your env vars; to
+  add more, edit the JSON and `CREATE OR REPLACE` (no proc/integration change).
+- **Per-org credentials:** generate an admin client id/secret in *each org's*
+  Administration → Developer Access; the host comes from the table in
+  `setup_prerequisites.sql`.
+- **`role`** (parent/child/standalone) is recorded as asserted, because a child
+  org can't self-identify via the tenants API (`/v2/tenants` returns 403 from
+  inside a child).
+- **Trigger from Sigma:** a *Refresh all* button → the no-label call; a *Refresh
+  this org* button → with a label. Via a Call API action to the Snowflake SQL API,
+  or a scheduled Task. Creds pass as bound call args, not logged SQL.
 
-### Worked example — audit two orgs end-to-end
+> **Alternative store:** keep the org list (and secrets) in a **table** instead of
+> the registry secret — easier to manage, can even be a Sigma input table for
+> self-service onboarding — at the cost of holding secrets in a column.
 
-Setup, procedures, and views are already deployed (steps 1–2 and 4 of **Setup**).
-Then:
+### Without the registry (single org)
 
-```sql
--- Org A (the org the Secrets point at) — extract
-CALL sigma_org_extract('SIGMA_ORG_AUDIT','AUDIT');
-
--- Org B — extract via override params (or rotate Secrets per Option A, then call with no overrides)
-CALL sigma_org_extract('SIGMA_ORG_AUDIT','AUDIT','RAW_SIGMA_OBJECTS', TRUE, 10,
-     'https://<ORG_B_HOST>', '<ORG_B_CLIENT_ID>', '<ORG_B_CLIENT_SECRET>');
-
--- Writeback scan + history — ONE call each, covers every org now in the raw table
-CALL sigma_writeback_scan('SIGMA_ORG_AUDIT','AUDIT');
-CALL sigma_scd2_apply('STG_WORKBOOKS',        'SCD2_WORKBOOKS',        'WORKBOOK_ID');
-CALL sigma_scd2_apply('STG_DATASETS',         'SCD2_DATASETS',         'DATASET_ID');
-CALL sigma_scd2_apply('STG_CONNECTIONS',      'SCD2_CONNECTIONS',      'CONNECTION_ID');
-CALL sigma_scd2_apply('STG_WRITEBACK_TABLES', 'SCD2_WRITEBACK_TABLES', 'SIGDS_TABLE');
-
--- List the orgs now present, then scope a report to one
-SELECT ORG_ID, COUNT(*) FROM RAW_SIGMA_OBJECTS GROUP BY ORG_ID;          -- query 0
-SELECT * FROM V_MIGRATION_SCORE WHERE ORG_ID = '<org-a-uuid>';
-```
-
-To refresh an org later, just re-run its `sigma_org_extract` call — every run is a
-new append-only snapshot, and re-running the scan + SCD2 calls accrues history and
-drift across all orgs.
-
-### Refresh many orgs from one trigger — the tenant registry + fan-out
-
-For auditing several orgs (a parent + its tenants, unrelated orgs, or any mix)
-from a single trigger, use the **registry + fan-out** rather than one `CALL` per
-org. One Snowflake secret holds every org's credentials, and
-`sigma_org_extract_all` loops over it.
-
-Why one secret? A stored procedure can only read secrets declared statically in
-its `SECRETS` clause — it cannot resolve a secret name at runtime. So a single
-registry secret (bound once to the integration) scales to any number of orgs with
-no proc/integration change.
-
-1. **Create the registry secret** (a JSON array of orgs):
-   ```sql
-   USE ROLE ACCOUNTADMIN;
-   CREATE OR REPLACE SECRET sigma_tenant_registry TYPE = GENERIC_STRING
-     SECRET_STRING = '[
-       {"label":"acme",  "baseUrl":"https://aws-api.sigmacomputing.com",   "clientId":"<id>","clientSecret":"<sec>","role":"child", "enabled":true},
-       {"label":"globex","baseUrl":"https://api.eu.aws.sigmacomputing.com","clientId":"<id>","clientSecret":"<sec>","role":"parent","enabled":true}
-     ]';
-   ALTER EXTERNAL ACCESS INTEGRATION sigma_api_access
-     SET ALLOWED_AUTHENTICATION_SECRETS = (sigma_base_url, sigma_client_id, sigma_client_secret, sigma_tenant_registry);
-   GRANT READ ON SECRET sigma_tenant_registry TO ROLE <YOUR_ROLE>;
-   ```
-   Each org's `clientId`/`clientSecret` is generated in *that org's* Administration
-   → Developer Access. `role` (parent/child/standalone) is recorded via
-   `ORG_ROLE_OVERRIDE` — needed because a child org cannot self-identify via the
-   tenants API. **Add/remove an org** = edit the JSON and `CREATE OR REPLACE` again
-   (no proc or integration change). Inject the value via a temp file so the creds
-   stay out of shell history.
-
-2. **Run it:**
-   ```sql
-   CALL sigma_org_extract_all('SIGMA_ORG_AUDIT','AUDIT');                      -- all enabled orgs
-   CALL sigma_org_extract_all('SIGMA_ORG_AUDIT','AUDIT','RAW_SIGMA_OBJECTS','acme');  -- just one org
-   ```
-   It returns a per-org summary (`orgs_selected`, `orgs_succeeded`, and each org's
-   result/error). One org's failure (e.g. a 403) does not abort the batch.
-
-3. **Trigger from Sigma:** a workbook *Refresh all* button maps to the no-label
-   call; a per-row *Refresh this org* button passes the label — both via a Call API
-   action to the Snowflake SQL API, or a scheduled Task. Credentials are passed to
-   `sigma_org_extract` as bound call arguments, not embedded in logged SQL.
-
-> Alternative store: keep the org list (and even secrets) in a **table** instead
-> of the registry secret — easier to manage and can be a Sigma input table for
-> self-service onboarding, at the cost of holding secrets in a table column.
-> The fan-out can read either.
+If you're auditing just one org, you don't need the registry — the base
+`sigma_base_url` / `sigma_client_id` / `sigma_client_secret` secrets created by
+setup are enough: `CALL sigma_org_extract('SIGMA_ORG_AUDIT','AUDIT');`. To point at
+a different single org, either rotate those three secrets, or pass per-call
+override params (`... , baseUrl, clientId, clientSecret` — convenient, but the
+secret then appears in query history). The network rule already allows egress to
+every Sigma API host, so any cloud/region is reachable without re-running setup.
 
 ## Writeback scan — discovered, not configured
 
