@@ -1,0 +1,18 @@
+[
+  {
+    "label":        "acme",
+    "baseUrl":      "https://aws-api.sigmacomputing.com",
+    "clientId":     "<acme client id>",
+    "clientSecret": "<acme client secret>",
+    "role":         "parent",
+    "enabled":      true
+  },
+  {
+    "label":        "acme-eu-tenant",
+    "baseUrl":      "https://api.eu.aws.sigmacomputing.com",
+    "clientId":     "<tenant client id>",
+    "clientSecret": "<tenant client secret>",
+    "role":         "child",
+    "enabled":      true
+  }
+]

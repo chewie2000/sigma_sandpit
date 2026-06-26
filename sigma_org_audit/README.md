@@ -210,40 +210,47 @@ org in the raw table. You never rebuild views per org.
 
 ### The org registry (how `deploy.sh` does multi-org)
 
-A single secret holds every org's credentials; `sigma_org_extract_all` loops over
-it. (A stored proc can only read statically-declared secrets, so one registry
-secret — bound once — scales to any number of orgs with no proc/integration change.)
+The registry is **one Snowflake secret** (`sigma_tenant_registry`) holding a JSON
+array of orgs; `sigma_org_extract_all` loops over it. (A stored proc can only read
+statically-declared secrets, so one registry secret — bound once — scales to any
+number of orgs with no proc/integration change.) `./deploy.sh registry` writes that
+secret for you; you don't hand-write SQL.
 
-```sql
-USE ROLE ACCOUNTADMIN;
-CREATE OR REPLACE SECRET sigma_tenant_registry TYPE = GENERIC_STRING
-  SECRET_STRING = '[
-    {"label":"acme",  "baseUrl":"https://aws-api.sigmacomputing.com",   "clientId":"<id>","clientSecret":"<sec>","role":"child", "enabled":true},
-    {"label":"globex","baseUrl":"https://api.eu.aws.sigmacomputing.com","clientId":"<id>","clientSecret":"<sec>","role":"parent","enabled":true}
-  ]';
-ALTER EXTERNAL ACCESS INTEGRATION sigma_api_access
-  SET ALLOWED_AUTHENTICATION_SECRETS = (sigma_base_url, sigma_client_id, sigma_client_secret, sigma_tenant_registry);
-GRANT READ ON SECRET sigma_tenant_registry TO ROLE <YOUR_ROLE>;
+**Each org needs:** `label` (your handle), `baseUrl` (the org's API host — see the
+table in `setup_prerequisites.sql`), `clientId` + `clientSecret` (generate in *that
+org's* Administration → Developer Access), `role` (`parent` / `child` / `standalone`
+— asserted, since a child can't self-identify via the tenants API), and `enabled`.
+
+**One org (from your env vars)** — the quick-start default:
+```bash
+./deploy.sh registry                              # label "primary", role "child"
+./deploy.sh registry --label acme --org-role parent
 ```
 
-Then run all orgs, or one by label:
-```sql
-CALL sigma_org_extract_all('SIGMA_ORG_AUDIT','AUDIT');                            -- all enabled
-CALL sigma_org_extract_all('SIGMA_ORG_AUDIT','AUDIT','RAW_SIGMA_OBJECTS','acme'); -- just 'acme'
+**Many orgs (from a JSON file)** — the multi-tenant path:
+```bash
+cp orgs.example.json orgs.json     # then edit: one object per org
+chmod 600 orgs.json                # it holds plaintext secrets
+./deploy.sh registry --file orgs.json
 ```
-It returns a per-org summary; one org's failure (e.g. a 403) doesn't abort the batch.
+`orgs.json` is git-ignored. The file shape is in
+[`orgs.example.json`](orgs.example.json). Re-running `registry` (either mode)
+replaces the whole registry — to add/remove an org, edit `orgs.json` and re-run.
 
-- **`./deploy.sh registry`** seeds this secret with one org from your env vars; to
-  add more, edit the JSON and `CREATE OR REPLACE` (no proc/integration change).
-- **Per-org credentials:** generate an admin client id/secret in *each org's*
-  Administration → Developer Access; the host comes from the table in
-  `setup_prerequisites.sql`.
-- **`role`** (parent/child/standalone) is recorded as asserted, because a child
-  org can't self-identify via the tenants API (`/v2/tenants` returns 403 from
-  inside a child).
+**Then run the audit** for all orgs, or one by label:
+```bash
+./deploy.sh refresh            # all enabled orgs
+./deploy.sh refresh acme       # just 'acme'
+```
+`sigma_org_extract_all` returns a per-org summary; one org's failure (e.g. a 403)
+doesn't abort the batch.
+
 - **Trigger from Sigma:** a *Refresh all* button → the no-label call; a *Refresh
   this org* button → with a label. Via a Call API action to the Snowflake SQL API,
   or a scheduled Task. Creds pass as bound call args, not logged SQL.
+- **Security:** registry secrets live in Snowflake's secret store; the `CREATE
+  SECRET` statement does land in Snowflake query history (inherent). Keep
+  `orgs.json` local (0600, git-ignored).
 
 > **Alternative store:** keep the org list (and secrets) in a **table** instead of
 > the registry secret — easier to manage, can even be a Sigma input table for

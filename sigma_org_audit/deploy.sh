@@ -16,8 +16,13 @@
 #   ./deploy.sh <command> [flags]
 #
 # Commands:
-#   setup          (ACCOUNTADMIN) network rule + secrets + integration + grants
-#   registry       (ACCOUNTADMIN) set the tenant registry secret from env (1 org)
+#   setup          (ACCOUNTADMIN) audit db/schema + network rule + secrets +
+#                  integration + grants
+#   registry       (ACCOUNTADMIN) set the org registry secret. Modes:
+#                    registry                          -> 1 org from env vars
+#                    registry --label acme --org-role child   -> name/role that org
+#                    registry --file orgs.json         -> many orgs from a JSON file
+#                  (orgs.json = JSON array; see orgs.example.json)
 #   deploy-procs   (re)create the stored procedures
 #   deploy-views   (re)create stage + mart views (needs SCD2 tables to exist)
 #   bootstrap      full first-time install: procs -> extract -> stage -> writeback
@@ -70,7 +75,9 @@ PROC_SIGNATURES=(
 
 # ---- arg parsing -------------------------------------------------------------
 CMD="${1:-help}"; shift || true
-LABEL=""
+LABEL=""              # org label: positional for `refresh`, or --label for `registry`
+ORG_ROLE_VAL="child"  # role recorded for the single-org `registry` seed (--org-role)
+REG_FILE=""           # registry: load a JSON file of orgs instead of env (--file)
 # capture an optional positional label for `refresh`
 if [[ "${CMD}" == "refresh" && "${1:-}" != "" && "${1:-}" != --* ]]; then LABEL="$1"; shift || true; fi
 while [[ $# -gt 0 ]]; do
@@ -81,6 +88,9 @@ while [[ $# -gt 0 ]]; do
     --role) ROLE="$2"; shift 2;;
     --warehouse) WH="$2"; shift 2;;
     --admin-role) ADMIN_ROLE="$2"; shift 2;;
+    --label) LABEL="$2"; shift 2;;
+    --org-role) ORG_ROLE_VAL="$2"; shift 2;;
+    --file) REG_FILE="$2"; shift 2;;
     *) echo "unknown flag: $1" >&2; exit 2;;
   esac
 done
@@ -201,14 +211,37 @@ PY
   rm -f "$tmp"; echo "== setup complete (db=$DB schema=$SCHEMA; temp file deleted) =="
 }
 
+# Seed/replace the org registry secret. Two modes:
+#   --file orgs.json   -> load a JSON array of orgs (the multi-org path)
+#   (default)          -> one org from env vars, label via --label, role --org-role
 cmd_registry() {
-  : "${SIGMA_BASE_URL:?}"; : "${SIGMA_CLIENT_ID:?}"; : "${SIGMA_CLIENT_SECRET:?}"
   local tmp; tmp="$(mktemp -t soa_reg.XXXXXX.sql)"; chmod 600 "$tmp"
-  ROLE_FOR_GRANTS="$ROLE" LABEL="${LABEL:-default-org}" python3 - "$tmp" <<'PY'
+  if [[ -n "$REG_FILE" ]]; then
+    [[ -f "$REG_FILE" ]] || { echo "registry file not found: $REG_FILE" >&2; exit 2; }
+    REG_FILE="$REG_FILE" ROLE_FOR_GRANTS="$ROLE" python3 - "$tmp" <<'PY'
+import os, sys, json
+orgs = json.load(open(os.environ["REG_FILE"]))
+assert isinstance(orgs, list) and orgs, "registry file must be a non-empty JSON array"
+for o in orgs:
+    for k in ("label","baseUrl","clientId","clientSecret"):
+        assert o.get(k), f"org {o.get('label','?')} missing '{k}'"
+    o.setdefault("role","standalone"); o.setdefault("enabled", True)
+j = json.dumps(orgs).replace("'","''")
+open(sys.argv[1],"w").write(f"""
+CREATE OR REPLACE SECRET sigma_tenant_registry TYPE=GENERIC_STRING SECRET_STRING='{j}';
+ALTER EXTERNAL ACCESS INTEGRATION sigma_api_access
+  SET ALLOWED_AUTHENTICATION_SECRETS=(sigma_base_url, sigma_client_id, sigma_client_secret, sigma_tenant_registry);
+GRANT READ ON SECRET sigma_tenant_registry TO ROLE {os.environ['ROLE_FOR_GRANTS']};
+""")
+print(f"loaded {len(orgs)} org(s) from {os.environ['REG_FILE']}: " + ", ".join(o['label'] for o in orgs), file=sys.stderr)
+PY
+  else
+    : "${SIGMA_BASE_URL:?}"; : "${SIGMA_CLIENT_ID:?}"; : "${SIGMA_CLIENT_SECRET:?}"
+    ROLE_FOR_GRANTS="$ROLE" LABEL="${LABEL:-primary}" ORG_ROLE_VAL="$ORG_ROLE_VAL" python3 - "$tmp" <<'PY'
 import os, sys, json
 reg=[{"label":os.environ["LABEL"],"baseUrl":os.environ["SIGMA_BASE_URL"],
       "clientId":os.environ["SIGMA_CLIENT_ID"],"clientSecret":os.environ["SIGMA_CLIENT_SECRET"],
-      "role":"child","enabled":True}]
+      "role":os.environ["ORG_ROLE_VAL"],"enabled":True}]
 j=json.dumps(reg).replace("'","''")
 open(sys.argv[1],"w").write(f"""
 CREATE OR REPLACE SECRET sigma_tenant_registry TYPE=GENERIC_STRING SECRET_STRING='{j}';
@@ -216,9 +249,13 @@ ALTER EXTERNAL ACCESS INTEGRATION sigma_api_access
   SET ALLOWED_AUTHENTICATION_SECRETS=(sigma_base_url, sigma_client_id, sigma_client_secret, sigma_tenant_registry);
 GRANT READ ON SECRET sigma_tenant_registry TO ROLE {os.environ['ROLE_FOR_GRANTS']};
 """)
+print(f"seeded 1 org from env: {os.environ['LABEL']} (role={os.environ['ORG_ROLE_VAL']})", file=sys.stderr)
 PY
-  sfa -f "$tmp" 2>&1 | _filter | _redact
-  rm -f "$tmp"; echo "== registry set (temp file deleted). Edit the JSON to add more orgs. =="
+  fi
+  # Drop the secret-bearing CREATE line from echoed output; redact env creds elsewhere.
+  sfa -f "$tmp" 2>&1 | _filter | grep -v -i "SECRET_STRING" | _redact
+  rm -f "$tmp"
+  echo "== registry set (temp file deleted). Re-run with --file to manage many orgs. =="
 }
 
 case "$CMD" in

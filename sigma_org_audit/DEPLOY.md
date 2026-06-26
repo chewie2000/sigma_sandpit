@@ -14,10 +14,20 @@ dependency order and is idempotent.
 
 ## One-time install
 ```bash
-./deploy.sh setup       # ACCOUNTADMIN: network rule, secrets, integration, grants
-./deploy.sh registry    # ACCOUNTADMIN: seed the tenant registry secret (1 org from env)
+./deploy.sh setup       # ACCOUNTADMIN: audit db/schema, network rule, secrets, integration, grants
+./deploy.sh registry    # ACCOUNTADMIN: seed the org registry (1 org from env; see modes below)
 ./deploy.sh bootstrap   # SYSADMIN: procs -> extract -> stage -> writeback -> history -> marts
 ```
+
+### Managing the org registry
+```bash
+./deploy.sh registry                                  # 1 org from env vars (label "primary")
+./deploy.sh registry --label acme --org-role parent   # name/role that single org
+cp orgs.example.json orgs.json && chmod 600 orgs.json # then edit one object per org
+./deploy.sh registry --file orgs.json                 # many orgs from a JSON file
+```
+Re-running `registry` replaces the whole registry. `orgs.json` holds plaintext
+secrets — it is git-ignored; keep it 0600. Org JSON shape: `orgs.example.json`.
 
 ## Day-to-day
 ```bash

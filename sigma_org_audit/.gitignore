@@ -1,0 +1,5 @@
+# Org registry files contain plaintext API client secrets — never commit them.
+orgs.json
+orgs.*.json
+*.orgs.json
+!orgs.example.json
