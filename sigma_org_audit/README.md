@@ -142,12 +142,34 @@ snow sql -c <conn> --role SYSADMIN --database SIGMA_ORG_AUDIT --schema AUDIT \
 Re-pull data anytime with `./deploy.sh refresh` (all orgs) or
 `./deploy.sh refresh <label>` (one org).
 
-#### Watching extract progress
+#### Watching progress
 
-The extract is otherwise silent for minutes. `sigma_org_extract` writes a
-best-effort breadcrumb per phase to a `SIGMA_EXTRACT_LOG` table (auto-created in
-the audit schema), so you can tail it live from a **second** session while a
-`bootstrap`/`refresh` runs:
+The extract and writeback scan otherwise block the terminal silently for
+minutes. Both procs write a best-effort breadcrumb per phase to a
+`SIGMA_EXTRACT_LOG` table (auto-created in the audit schema), and **`deploy.sh`
+streams those phases live into the same terminal** while a `bootstrap` /
+`refresh` / `extract` runs — no second session needed:
+
+```
+>> CALL sigma_org_extract_all (all enabled orgs) (live; poll 4s)
+   12:01:03  start  -  extract beginning
+   12:01:05  <org>  list endpoints  -  workbooks=210, datamodels=44, …
+   12:01:31  <org>  connection details  -  18/18
+   ... running (38s elapsed)
+   12:02:10  <org>  done  -  1,447 rows landed
+```
+
+This is **on by default when interactive** (a TTY); it's off in CI/pipes so logs
+stay clean. Override with `--progress` / `--no-progress`, or `SOA_PROGRESS=on|off`;
+tune the poll cadence with `SOA_PROGRESS_INTERVAL` (default 4s). Between phases an
+elapsed-seconds heartbeat shows liveness, so the terminal never looks frozen.
+
+Phases — extract: `start → whoami → list endpoints → connection details →
+workbook sources → datamodel details → grants → tenancy → user attributes →
+landing → done`; writeback: `writeback start → connections discovered →
+connection scan → writeback tables → wal scan → landing → writeback done`.
+
+You can also still tail the table directly from a second session:
 
 ```sql
 SELECT logged_at, org_id, phase, detail
@@ -156,11 +178,8 @@ ORDER  BY logged_at DESC
 LIMIT  30;
 ```
 
-You'll see phases stream in: `start` → `whoami` → `list endpoints` →
-`connection details` → `workbook sources` → `datamodel details` → `grants` →
-`tenancy` → `user attributes` → `landing` → `done`, most with counts. Logging is
-best-effort — it never blocks or fails the extract. (It relies on autocommit so
-rows appear mid-run; confirm on your first run that they do.)
+Logging is best-effort — it never blocks or fails the procs. (It relies on
+autocommit so rows appear mid-run; confirm on your first run that they do.)
 
 **Where does it install?** Into a database + schema chosen by the `--db` / `--schema`
 flags (defaults `SIGMA_ORG_AUDIT.AUDIT`). `setup` **creates** them; every later

@@ -235,9 +235,38 @@ def main(session, target_database, target_schema, target_table, connection_filte
     snapshot_ts = datetime.now(timezone.utc).replace(tzinfo=None)
     fq_raw = f'"{target_database}"."{target_schema}"."{target_table}"'
 
+    # --- Progress log (best-effort) --------------------------------------------
+    # Writes a breadcrumb per phase to SIGMA_EXTRACT_LOG (shared with the extract)
+    # so deploy.sh / a second session can tail it live. Must NEVER break the scan:
+    # the table create and every insert swallow exceptions.
+    fq_log = f'"{target_database}"."{target_schema}"."SIGMA_EXTRACT_LOG"'
+    try:
+        session.sql(f"""
+            CREATE TABLE IF NOT EXISTS {fq_log} (
+                LOGGED_AT TIMESTAMP_NTZ, RUN_ID STRING, ORG_ID STRING,
+                PHASE STRING, DETAIL STRING)
+        """).collect()
+    except Exception:
+        pass
+
+    def log(phase, detail=None, org_id=None):
+        try:
+            session.sql(
+                f"INSERT INTO {fq_log} (LOGGED_AT, RUN_ID, ORG_ID, PHASE, DETAIL) "
+                f"VALUES (CURRENT_TIMESTAMP(), ?, ?, ?, ?)",
+                params=[snapshot_id, org_id, phase,
+                        None if detail is None else str(detail)],
+            ).collect()
+        except Exception:
+            pass
+
+    log("writeback start", "scan beginning")
+
     conns = latest_connection_details(session, fq_raw, connection_filter, org_filter)
     if not conns:
+        log("writeback done", "no connection_detail rows")
         return json.dumps({"error": "no connection_detail rows found -- run sigma_org_extract first"})
+    log("connections discovered", f"{len(conns)} connection(s) to scan")
 
     raw_rows = []   # (object_type, object_id, org_id, payload_json)
     stats = {"connections": len(conns), "writeback_table": 0,
@@ -247,6 +276,7 @@ def main(session, target_database, target_schema, target_table, connection_filte
         cid = c["connection_id"]
         org_id = c["org_id"]
         reachable = True
+        log("connection scan", f"{cid} ({len(c['writeback_locations'])} writeback loc)", org_id=org_id)
 
         # --- writeback_table: inventory the input/writeback DATA tables in each
         #     writeback output schema. These have arbitrary (user-given) names --
@@ -271,6 +301,7 @@ def main(session, target_database, target_schema, target_table, connection_filte
                                  f"{cid}:{db}.{sch}.{t['table_name']}", org_id,
                                  json.dumps(payload)))
                 stats["writeback_table"] += 1
+        log("writeback tables", f"{cid}: {stats['writeback_table']} cumulative", org_id=org_id)
 
         # --- writeback_wal: watermark per SIGDS_WAL_* edit-log table.
         #     By Sigma's design the write-access destination schema is reserved for
@@ -310,10 +341,12 @@ def main(session, target_database, target_schema, target_table, connection_filte
                                  json.dumps(payload)))
                 stats["writeback_wal"] += 1
 
+        log("wal scan", f"{cid}: {stats['writeback_wal']} cumulative", org_id=org_id)
         if not reachable:
             stats["unreachable"] += 1
 
     # --- land everything as raw VARIANT snapshots ------------------------------
+    log("landing", f"{len(raw_rows)} rows")
     session.sql(f"""
         CREATE TABLE IF NOT EXISTS {fq_raw} (
             SNAPSHOT_ID   STRING,
@@ -346,6 +379,10 @@ def main(session, target_database, target_schema, target_table, connection_filte
         final_df.write.mode("append").save_as_table(
             [target_database, target_schema, target_table]
         )
+
+    log("writeback done", f"{len(raw_rows)} rows landed; "
+        f"tables={stats['writeback_table']}, wal={stats['writeback_wal']}, "
+        f"unreachable={stats['unreachable']}")
 
     return json.dumps({
         "snapshot_id": snapshot_id,

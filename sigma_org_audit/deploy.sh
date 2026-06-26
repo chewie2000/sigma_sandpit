@@ -41,10 +41,16 @@
 #   --conn <snow CLI default connection>   (omitted unless you pass --conn NAME)
 #   --db SIGMA_ORG_AUDIT  --schema AUDIT
 #   --role SYSADMIN  --warehouse COMPUTE_WH  --admin-role ACCOUNTADMIN
+#   --progress / --no-progress             live phase feed for extract + writeback
 #
 # Output: file deploys print just ">> <file> ... ok" (the compiled SQL/Python is
 # hidden on success). Set DEPLOY_VERBOSE=1 to echo full snow output; failures are
 # always shown in full.
+#
+# Live progress: long CALLs (extract, writeback_scan) stream their phases from
+# SIGMA_EXTRACT_LOG into this terminal while they run -- on by default when
+# interactive (TTY), off in CI/pipes. Override with --progress / --no-progress or
+# SOA_PROGRESS=on|off; poll cadence via SOA_PROGRESS_INTERVAL (default 4s).
 #
 # Connection: if --conn is not given, the Snowflake CLI's own default connection
 # is used (set one with `snow connection set-default <name>`). A connection name
@@ -91,6 +97,7 @@ REG_FILE=""           # registry: load a JSON file of orgs instead of env (--fil
 RESET_HARD=0          # reset --hard: also drop RAW_SIGMA_OBJECTS + SIGMA_EXTRACT_LOG
 RESET_DATA=0          # reset --data: drop data only (raw/log/SCD2), keep procs + views
 ASSUME_YES=0          # teardown: skip the interactive confirmation (--yes)
+PROGRESS_OPT=""       # --progress / --no-progress override of the live feed
 # capture an optional positional label for `refresh`
 if [[ "${CMD}" == "refresh" && "${1:-}" != "" && "${1:-}" != --* ]]; then LABEL="$1"; shift || true; fi
 while [[ $# -gt 0 ]]; do
@@ -107,6 +114,8 @@ while [[ $# -gt 0 ]]; do
     --hard) RESET_HARD=1; shift;;
     --data) RESET_DATA=1; shift;;
     --yes|-y) ASSUME_YES=1; shift;;
+    --progress) PROGRESS_OPT=on; shift;;
+    --no-progress) PROGRESS_OPT=off; shift;;
     *) echo "unknown flag: $1" >&2; exit 2;;
   esac
 done
@@ -115,9 +124,94 @@ done
 # (Guarded expansion so an empty array is safe under `set -u` on bash 3.2.)
 CONN_ARGS=(); [[ -n "$CONN" ]] && CONN_ARGS=(-c "$CONN")
 
+# Live-progress policy for long CALLs: flag > SOA_PROGRESS env > TTY autodetect
+# (on when interactive, off in CI/pipes).
+if   [[ -n "$PROGRESS_OPT" ]];     then PROGRESS="$PROGRESS_OPT"
+elif [[ -n "${SOA_PROGRESS:-}" ]]; then PROGRESS="$SOA_PROGRESS"
+elif [[ -t 1 ]];                   then PROGRESS=on
+else                                    PROGRESS=off
+fi
+
 _filter() { grep -v -iE "bad owner|too wide|config_manager|UserWarning|chown|chmod|skip this|^ *warn\(|SF_SKIP" || true; }
 sf()  { snow sql ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --role "$ROLE"       --database "$DB" --schema "$SCHEMA" --warehouse "$WH" "$@" 2>&1 | _filter; }
 sfa() { snow sql ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --role "$ADMIN_ROLE" --database "$DB" --schema "$SCHEMA" --warehouse "$WH" "$@" 2>&1 | _filter; }
+
+# ---- live progress for long-running CALLs ------------------------------------
+# A long proc (extract / writeback_scan) otherwise blocks the terminal silently.
+# When enabled, we run the CALL in the BACKGROUND and foreground-poll the proc's
+# own SIGMA_EXTRACT_LOG, streaming each new phase row plus an elapsed heartbeat,
+# until the CALL exits. Relies on the procs' best-effort per-phase logging.
+PROGRESS_INTERVAL="${SOA_PROGRESS_INTERVAL:-4}"   # seconds between polls
+
+# Clean single-value/row query for polling: CSV + silent => no table art / spinner,
+# header dropped. NOT piped through _filter (we need bare rows). Errors (e.g. the
+# log table not existing yet) are swallowed -> empty output, so the poll never crashes.
+_sf_csv() {
+  snow sql ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --role "$ROLE" \
+    --database "$DB" --schema "$SCHEMA" --warehouse "$WH" \
+    --format CSV --silent "$@" 2>/dev/null | tail -n +2
+}
+
+# run_call_with_progress  SQL  LABEL
+# Streams SIGMA_EXTRACT_LOG phases while SQL runs. Falls back to a plain blocking
+# `sf -q` when progress is off. Preserves the CALL's real exit code (it does NOT
+# go through sf's `| _filter`, which would mask failures under pipefail).
+run_call_with_progress() {
+  local sql="$1" label="$2"
+  if [[ "${PROGRESS:-off}" != on ]]; then
+    echo ">> CALL $label"; sf -q "$sql"; return
+  fi
+
+  # Snowflake-side start watermark (same clock as the rows the proc writes).
+  local start_ts
+  start_ts="$(_sf_csv -q "SELECT TO_CHAR(CURRENT_TIMESTAMP(),'YYYY-MM-DD HH24:MI:SS.FF3');" | head -n1 | tr -d '"\r')"
+  if [[ -z "$start_ts" ]]; then echo ">> CALL $label"; sf -q "$sql"; return; fi
+
+  echo ">> CALL $label (live; poll ${PROGRESS_INTERVAL}s)"
+  local tmp; tmp="$(mktemp -t soa_call.XXXXXX)"
+  trap 'rm -f "$tmp"' RETURN
+  # CALL in the background via snow directly (no _filter pipe) so we keep its exit code.
+  snow sql ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --role "$ROLE" \
+    --database "$DB" --schema "$SCHEMA" --warehouse "$WH" -q "$sql" >"$tmp" 2>&1 &
+  local pid=$! seen=0 t0; t0=$(date +%s)
+
+  while kill -0 "$pid" 2>/dev/null; do
+    # Display line built server-side as ONE column so commas in DETAIL never split.
+    local rows total
+    rows="$(_sf_csv -q "
+      SELECT TO_CHAR(LOGGED_AT,'HH24:MI:SS') || '  ' || COALESCE(ORG_ID || ' ', '')
+             || PHASE || COALESCE('  -  ' || DETAIL, '') AS LINE
+      FROM SIGMA_EXTRACT_LOG
+      WHERE LOGGED_AT >= '$start_ts'
+      ORDER BY LOGGED_AT, RUN_ID, PHASE;")"
+    total=$(printf '%s\n' "$rows" | grep -c . || true)
+    if (( total > seen )); then
+      [[ -t 1 ]] && printf '\r%*s\r' 56 ''
+      printf '%s\n' "$rows" | tail -n +"$((seen+1))" | sed 's/^"//; s/"$//; s/^/   /'
+      seen=$total
+    elif [[ -t 1 ]]; then
+      printf '\r   ... running (%ss elapsed)' "$(( $(date +%s) - t0 ))"
+    fi
+    sleep "$PROGRESS_INTERVAL"
+  done
+  [[ -t 1 ]] && printf '\r%*s\r' 56 ''
+
+  local rc=0; wait "$pid" || rc=$?
+  # Drain any rows written between the last poll and exit.
+  local final
+  final="$(_sf_csv -q "
+    SELECT TO_CHAR(LOGGED_AT,'HH24:MI:SS') || '  ' || COALESCE(ORG_ID || ' ', '')
+           || PHASE || COALESCE('  -  ' || DETAIL, '') AS LINE
+    FROM SIGMA_EXTRACT_LOG WHERE LOGGED_AT >= '$start_ts'
+    ORDER BY LOGGED_AT, RUN_ID, PHASE;")"
+  printf '%s\n' "$final" | tail -n +"$((seen+1))" | grep . | sed 's/^"//; s/"$//; s/^/   /' || true
+
+  if (( rc != 0 )); then
+    echo ">> CALL $label FAILED (exit $rc)" >&2
+    cat "$tmp" >&2
+    return "$rc"
+  fi
+}
 
 # Quiet by default: print ">> <file> ... ok" per file rather than the large
 # SQL / Python bodies snow echoes while compiling. On failure, the full snow
@@ -150,14 +244,16 @@ cmd_deploy_views() { run_files "${STAGE_FILES[@]}" "${MART_FILES[@]}"; }
 
 cmd_extract() {
   if [[ -n "$LABEL" ]]; then
-    echo ">> CALL sigma_org_extract_all (label=$LABEL)"
-    sf -q "CALL sigma_org_extract_all('$DB','$SCHEMA','RAW_SIGMA_OBJECTS','$LABEL');"
+    run_call_with_progress "CALL sigma_org_extract_all('$DB','$SCHEMA','RAW_SIGMA_OBJECTS','$LABEL');" \
+                           "sigma_org_extract_all (label=$LABEL)"
   else
-    echo ">> CALL sigma_org_extract_all (all enabled orgs)"
-    sf -q "CALL sigma_org_extract_all('$DB','$SCHEMA');"
+    run_call_with_progress "CALL sigma_org_extract_all('$DB','$SCHEMA');" \
+                           "sigma_org_extract_all (all enabled orgs)"
   fi
 }
-cmd_writeback() { echo ">> CALL sigma_writeback_scan"; sf -q "CALL sigma_writeback_scan('$DB','$SCHEMA');"; }
+cmd_writeback() {
+  run_call_with_progress "CALL sigma_writeback_scan('$DB','$SCHEMA');" "sigma_writeback_scan"
+}
 cmd_history() {
   echo ">> CALL sigma_scd2_apply x4"
   sf -q "
