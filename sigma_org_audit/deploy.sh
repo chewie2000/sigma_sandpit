@@ -27,8 +27,14 @@
 #   help
 #
 # Flags (defaults shown):
-#   --conn SUPPORT_SANDBOX  --db SIGMA_ORG_AUDIT  --schema AUDIT
+#   --conn <snow CLI default connection>   (omitted unless you pass --conn NAME)
+#   --db SIGMA_ORG_AUDIT  --schema AUDIT
 #   --role SYSADMIN  --warehouse COMPUTE_WH  --admin-role ACCOUNTADMIN
+#
+# Connection: if --conn is not given, the Snowflake CLI's own default connection
+# is used (set one with `snow connection set-default <name>`). A connection name
+# is local to ~/.snowflake/connections.toml, so there is no portable hardcoded
+# default -- pass --conn NAME to target a specific profile.
 #
 # Secrets are read from the environment (SIGMA_BASE_URL / SIGMA_CLIENT_ID /
 # SIGMA_CLIENT_SECRET) and injected via a 0600 temp file that is deleted after --
@@ -36,7 +42,7 @@
 # ==============================================================================
 set -euo pipefail
 
-CONN=SUPPORT_SANDBOX
+CONN=""   # empty => use the Snowflake CLI's default connection (no -c passed)
 DB=SIGMA_ORG_AUDIT
 SCHEMA=AUDIT
 ROLE=SYSADMIN
@@ -79,9 +85,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Only pass -c when a connection was given; otherwise snow uses its default.
+# (Guarded expansion so an empty array is safe under `set -u` on bash 3.2.)
+CONN_ARGS=(); [[ -n "$CONN" ]] && CONN_ARGS=(-c "$CONN")
+
 _filter() { grep -v -iE "bad owner|too wide|config_manager|UserWarning|chown|chmod|skip this|^ *warn\(|SF_SKIP" || true; }
-sf()  { snow sql -c "$CONN" --role "$ROLE"       --database "$DB" --schema "$SCHEMA" --warehouse "$WH" "$@" 2>&1 | _filter; }
-sfa() { snow sql -c "$CONN" --role "$ADMIN_ROLE" --database "$DB" --schema "$SCHEMA" --warehouse "$WH" "$@" 2>&1 | _filter; }
+sf()  { snow sql ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --role "$ROLE"       --database "$DB" --schema "$SCHEMA" --warehouse "$WH" "$@" 2>&1 | _filter; }
+sfa() { snow sql ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --role "$ADMIN_ROLE" --database "$DB" --schema "$SCHEMA" --warehouse "$WH" "$@" 2>&1 | _filter; }
 
 run_files() { local f; for f in "$@"; do echo ">> $f"; sf -f "$HERE/$f"; done; }
 
@@ -187,7 +197,7 @@ GRANT READ ON SECRET sigma_client_secret TO ROLE {grant_role};
 """)
 PY
   # No --database/--schema here: the script CREATEs and USEs them (they may not exist yet).
-  snow sql -c "$CONN" --warehouse "$WH" -f "$tmp" 2>&1 | _filter | _redact
+  snow sql ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --warehouse "$WH" -f "$tmp" 2>&1 | _filter | _redact
   rm -f "$tmp"; echo "== setup complete (db=$DB schema=$SCHEMA; temp file deleted) =="
 }
 

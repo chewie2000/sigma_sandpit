@@ -5,7 +5,9 @@ pipeline with one command instead of running the SQL files by hand. It encodes t
 dependency order and is idempotent.
 
 ## Prerequisites
-- `snow` (Snowflake CLI) configured with a connection (default: `SUPPORT_SANDBOX`).
+- `snow` (Snowflake CLI) configured with a connection. If you don't pass `--conn`,
+  the CLI's **default** connection is used — set one with
+  `snow connection set-default <name>`, or pass `--conn <name>` each time.
 - `SIGMA_BASE_URL`, `SIGMA_CLIENT_ID`, `SIGMA_CLIENT_SECRET` in the environment
   (used only by the privileged `setup` / `registry` commands; injected via a 0600
   temp file that is deleted after — never on the command line).
@@ -26,8 +28,10 @@ dependency order and is idempotent.
 ./deploy.sh reset              # drop procs/views/SCD2 (keeps secrets + RAW), then rebuild
 ```
 
-Flags (defaults): `--conn SUPPORT_SANDBOX --db SIGMA_ORG_AUDIT --schema AUDIT
---role SYSADMIN --warehouse COMPUTE_WH --admin-role ACCOUNTADMIN`.
+Flags (defaults): `--conn` *(your snow CLI default connection)* `--db SIGMA_ORG_AUDIT
+--schema AUDIT --role SYSADMIN --warehouse COMPUTE_WH --admin-role ACCOUNTADMIN`.
+A connection name is local to `~/.snowflake/connections.toml`, so `--conn` has no
+portable hardcoded default; omit it to use the CLI default, or pass `--conn <name>`.
 
 ## Why the order matters
 `bootstrap` runs procs → extract → **stage views** → writeback → **history**

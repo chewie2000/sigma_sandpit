@@ -104,7 +104,8 @@ data via the **`sigma-cli` sub-skill**.
 
 ### Prerequisites
 - The **Snowflake CLI** (`snow`) configured with a connection (a profile in
-  `~/.snowflake/connections.toml`).
+  `~/.snowflake/connections.toml`). Either set it as your default
+  (`snow connection set-default <name>`) or pass `--conn <name>` to every command.
 - One Sigma org's **admin** API credentials in your environment:
   `SIGMA_BASE_URL`, `SIGMA_CLIENT_ID`, `SIGMA_CLIENT_SECRET`
   (generate at *Administration → Developer Access*; pick the host for your cloud
@@ -154,15 +155,24 @@ Append to any command (e.g. `./deploy.sh bootstrap --db MY_DB --schema MY_SCHEMA
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--conn` | `SUPPORT_SANDBOX` | Snowflake CLI connection name |
+| `--conn` | *your snow CLI default connection* | Snowflake CLI connection name |
 | `--db` | `SIGMA_ORG_AUDIT` | target database (created by `setup`) |
 | `--schema` | `AUDIT` | target schema (created by `setup`) |
 | `--role` | `SYSADMIN` | build/execution role (owns the DB/schema, runs procs) |
 | `--warehouse` | `COMPUTE_WH` | warehouse for compute |
 | `--admin-role` | `ACCOUNTADMIN` | role for the privileged `setup` step |
 
+**Connection:** a connection name is local to your `~/.snowflake/connections.toml`,
+so there is no portable hardcoded default. If you don't pass `--conn`, the script
+omits `-c` and the **Snowflake CLI's own default connection** is used. Set one once:
+```bash
+snow connection set-default <your-connection-name>
+```
+or pass `--conn <name>` on every command to target a specific profile.
+
 > Pass the **same** `--conn/--db/--schema` to every command so all objects land in
-> one place. The defaults match the reference sandbox; override for your own.
+> one place. The non-connection defaults (`SIGMA_ORG_AUDIT.AUDIT`, `SYSADMIN`,
+> `COMPUTE_WH`) match the reference sandbox; override for your own.
 
 ### Manual install (no CLI / running SQL in Snowsight)
 `deploy.sh` just runs the SQL files in dependency order. To do it by hand:
