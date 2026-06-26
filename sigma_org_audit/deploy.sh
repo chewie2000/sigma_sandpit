@@ -31,6 +31,8 @@
 #   reset          drop procs/views/SCD2 tables (keeps secrets + raw), then redeploy
 #   reset --hard   reset + also drop RAW_SIGMA_OBJECTS + SIGMA_EXTRACT_LOG, for a
 #                  from-scratch rebuild reusing setup/secrets/registry (then bootstrap)
+#   reset --data   data-only: drop raw/log/SCD2 but KEEP procs + views, for a clean
+#                  dataset without redeploying code (then refresh)
 #   teardown       (ACCOUNTADMIN) DROP the audit DB + integration -- full clean-down.
 #                  Destructive; prompts to confirm unless --yes. Re-run setup after.
 #   help
@@ -87,6 +89,7 @@ LABEL=""              # org label: positional for `refresh`, or --label for `reg
 ORG_ROLE_VAL="child"  # role recorded for the single-org `registry` seed (--org-role)
 REG_FILE=""           # registry: load a JSON file of orgs instead of env (--file)
 RESET_HARD=0          # reset --hard: also drop RAW_SIGMA_OBJECTS + SIGMA_EXTRACT_LOG
+RESET_DATA=0          # reset --data: drop data only (raw/log/SCD2), keep procs + views
 ASSUME_YES=0          # teardown: skip the interactive confirmation (--yes)
 # capture an optional positional label for `refresh`
 if [[ "${CMD}" == "refresh" && "${1:-}" != "" && "${1:-}" != --* ]]; then LABEL="$1"; shift || true; fi
@@ -102,6 +105,7 @@ while [[ $# -gt 0 ]]; do
     --org-role) ORG_ROLE_VAL="$2"; shift 2;;
     --file) REG_FILE="$2"; shift 2;;
     --hard) RESET_HARD=1; shift;;
+    --data) RESET_DATA=1; shift;;
     --yes|-y) ASSUME_YES=1; shift;;
     *) echo "unknown flag: $1" >&2; exit 2;;
   esac
@@ -176,6 +180,21 @@ cmd_bootstrap() {
 cmd_refresh() { cmd_extract; cmd_writeback; cmd_history; echo "== refresh complete =="; }
 
 cmd_reset() {
+  if [[ "$RESET_DATA" == 1 && "$RESET_HARD" == 1 ]]; then
+    echo "use either --data or --hard, not both." >&2; exit 2
+  fi
+  if [[ "$RESET_DATA" == 1 ]]; then
+    # Data-only: wipe snapshots + progress log + SCD2 history, but KEEP the
+    # deployed procs and views. Lets you re-`refresh` for a clean dataset
+    # without redeploying code (no ACCOUNTADMIN). Views over RAW_SIGMA_OBJECTS
+    # are briefly invalid until refresh repopulates it.
+    sf -q "
+      DROP TABLE IF EXISTS RAW_SIGMA_OBJECTS; DROP TABLE IF EXISTS SIGMA_EXTRACT_LOG;
+      DROP TABLE IF EXISTS SCD2_WORKBOOKS; DROP TABLE IF EXISTS SCD2_DATASETS;
+      DROP TABLE IF EXISTS SCD2_CONNECTIONS; DROP TABLE IF EXISTS SCD2_WRITEBACK_TABLES;" >/dev/null || true
+    echo "== reset --data done (dropped raw/log/SCD2; procs + views + secrets kept). Run refresh (or bootstrap). =="
+    return
+  fi
   drop_procs
   sf -q "
     DROP VIEW IF EXISTS V_TENANCY_TOPOLOGY; DROP VIEW IF EXISTS V_WRITEBACK_SHARED_SCHEMAS;
