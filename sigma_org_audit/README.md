@@ -226,6 +226,20 @@ statically-declared secrets, so one registry secret — bound once — scales to
 number of orgs with no proc/integration change.) `./deploy.sh registry` writes that
 secret for you; you don't hand-write SQL.
 
+**Where do multiple orgs' credentials live?** The `SIGMA_*` env vars hold exactly
+**one** org. For several orgs you keep an **`orgs.json` file** as your source of
+truth — one object per org — and apply it with `./deploy.sh registry --file
+orgs.json`. That file is what you edit and re-apply whenever an org is added,
+removed, rotated, or enabled/disabled; keep it local (0600, git-ignored). The env
+vars are still needed **once** for `./deploy.sh setup` (which creates the base
+secrets + integration), but the per-org audit credentials for a fleet live in
+`orgs.json`, not the environment.
+
+| You have… | Keep credentials in | Apply with |
+|---|---|---|
+| one org | `SIGMA_*` env vars (`~/.zshenv`) | `./deploy.sh registry` |
+| many orgs / tenants | `orgs.json` (one object per org) | `./deploy.sh registry --file orgs.json` |
+
 **Each org needs:** `label` (your handle), `baseUrl` (the org's API host — see the
 table in `setup_prerequisites.sql`), `clientId` + `clientSecret` (generate in *that
 org's* Administration → Developer Access), `role` (`parent` / `child` / `standalone`
