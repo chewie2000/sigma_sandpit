@@ -116,7 +116,7 @@ GRANT READ   ON SECRET sigma_client_secret  TO ROLE <YOUR_ROLE>;
 
 
 -- ==============================================================================
--- 6. (Optional) Multi-org / multi-tenant registry (for sigma_org_extract_all)
+-- 5. (Optional) Multi-org / multi-tenant registry (for sigma_org_extract_all)
 --    To refresh many orgs (a parent + tenants, unrelated orgs, or any mix) from
 --    one trigger, create a single registry secret holding each org's credentials
 --    and bind it to the integration. sigma_org_extract_all loops over it.
@@ -133,7 +133,7 @@ GRANT READ   ON SECRET sigma_client_secret  TO ROLE <YOUR_ROLE>;
 -- ==============================================================================
 
 -- ==============================================================================
--- 5. Writeback scan reachability (for sigma_writeback_scan)
+-- 6. Writeback scan reachability (for sigma_writeback_scan)
 --    The writeback scan reads INFORMATION_SCHEMA metadata and the input-table
 --    write-ahead-log (WAL) tables in whatever databases/schemas your Sigma
 --    connections write back to. The procedure-execution role must be able to

@@ -33,13 +33,15 @@ stage/marts from raw.
 
 | File | Purpose |
 |---|---|
-| `setup_prerequisites.sql` | One-time ACCOUNTADMIN setup: network rule, secrets, external access integration, grants. |
+| `deploy.sh` / `DEPLOY.md` | One-command deploy/refresh wrapper around `snow`, and its guide. |
+| `setup_prerequisites.sql` | One-time ACCOUNTADMIN setup: network rule, secrets, external access integration, grants (+ optional tenant registry). |
 | `api_flow.md` | Endpoint catalog + what each call lands in `RAW_SIGMA_OBJECTS`. |
-| `procs/sigma_org_extract.sql` | Raw extraction proc — lands every API object type as VARIANT snapshots. |
+| `procs/sigma_org_extract.sql` | Raw extraction proc — lands every API object type (incl. tenancy + user attributes) as VARIANT snapshots; org-role detection. |
+| `procs/sigma_org_extract_all.sql` | Multi-org fan-out — reads the tenant-registry secret and runs the extract per org (refresh all, or one by label). |
 | `procs/sigma_writeback_scan.sql` | Writeback audit — discovers writeback/WAL schemas from connections, scans SIGDS tables + WAL activity. |
-| `stage/stage_views.sql` | `STG_*` views: typed latest-state flatten, incl. `STG_CONNECTIONS` and `STG_WRITEBACK_TABLES`. |
+| `stage/stage_views.sql` | `STG_*` views: typed latest-state flatten (workbooks, models, connections, writeback, members/teams, tenancy, user attributes). |
 | `marts/scd2_history.sql` | `sigma_scd2_apply` — generic type-2 history builder for any stage view. |
-| `marts/mart_views.sql` | Inventory, R/A/G migration scoring, writeback governance, ownership, drift. |
+| `marts/mart_views.sql` | Inventory + lifecycle (deletion), R/A/G migration scoring, writeback governance (cross-org attribution), ownership, drift, tenancy topology, data isolation. |
 | `audit_queries.sql` | Ready-to-run governance & migration-readiness queries. |
 
 A companion **`sigma-org-audit` Claude Code skill** (in `../sigma_skills/`) drives
@@ -48,27 +50,37 @@ data via the **`sigma-cli` sub-skill**.
 
 ## Setup
 
-> **One-command path:** `deploy.sh` automates everything below — `./deploy.sh setup`
-> then `./deploy.sh bootstrap`. See [DEPLOY.md](DEPLOY.md). The manual steps below
-> remain the reference for what it does (and for running pieces individually).
+> **One-command path (recommended):** `deploy.sh` automates everything below.
+> Requires `snow` (Snowflake CLI) configured and `SIGMA_BASE_URL` /
+> `SIGMA_CLIENT_ID` / `SIGMA_CLIENT_SECRET` in your environment. Run in order:
+> ```bash
+> ./deploy.sh setup       # ACCOUNTADMIN: network rule, secrets, integration, grants
+> ./deploy.sh registry    # ACCOUNTADMIN: seed the tenant registry (1 org from env)
+> ./deploy.sh bootstrap   # SYSADMIN: procs -> extract -> stage -> writeback -> history -> marts
+> ```
+> `bootstrap` calls `sigma_org_extract_all`, which reads the registry — so
+> `registry` must run **before** `bootstrap`. Override targets with
+> `--conn/--db/--schema/--role/--warehouse`. See [DEPLOY.md](DEPLOY.md). The manual
+> steps below are the reference for what it does (and for running pieces individually).
 
 1. **Prerequisites (once, as ACCOUNTADMIN):** edit and run `setup_prerequisites.sql`
    — set your Sigma API host and client credentials, and the execution role.
    Admin-scoped credentials are required for org-wide visibility
    (`skipPermissionCheck`).
-2. **Deploy the procedures:** run `procs/sigma_org_extract.sql` and
-   `procs/sigma_writeback_scan.sql`, then `marts/scd2_history.sql`.
+2. **Deploy the procedures:** run `procs/sigma_org_extract.sql`,
+   `procs/sigma_writeback_scan.sql`, `procs/sigma_org_extract_all.sql`, then
+   `marts/scd2_history.sql`.
    > Note: when a procedure's **parameter count changes** between versions,
    > `CREATE OR REPLACE` cannot replace it (Snowflake rejects the ambiguous
    > overload). `DROP PROCEDURE <name>(<old arg types>);` first, then re-create.
-3. **Extract:**
+3. **Extract** (set `USE DATABASE/SCHEMA` to where the raw table will live first):
    ```sql
-   CALL sigma_org_extract('MY_DB', 'MY_SCHEMA');     -- API objects
+   CALL sigma_org_extract('MY_DB', 'MY_SCHEMA');     -- API objects (single org, uses Secrets)
    CALL sigma_writeback_scan('MY_DB', 'MY_SCHEMA');  -- writeback schemas (run after extract)
    ```
-4. **Build views:** run `stage/stage_views.sql` then `marts/mart_views.sql`
-   (set `USE DATABASE/SCHEMA` to where the raw table lives first).
-5. **Build history (optional but recommended):**
+4. **Build stage views:** run `stage/stage_views.sql`.
+5. **Build history:** (the mart drift view depends on the SCD2 tables, so this runs
+   **before** the mart views)
    ```sql
    CALL sigma_scd2_apply('STG_WORKBOOKS',        'SCD2_WORKBOOKS',        'WORKBOOK_ID');
    CALL sigma_scd2_apply('STG_DATASETS',         'SCD2_DATASETS',         'DATASET_ID');
@@ -76,7 +88,12 @@ data via the **`sigma-cli` sub-skill**.
    CALL sigma_scd2_apply('STG_WRITEBACK_TABLES', 'SCD2_WRITEBACK_TABLES', 'SIGDS_TABLE');
    ```
    Re-run these after each new extract to accrue history and power the drift views.
-6. **Query:** use `audit_queries.sql`, or point a Sigma workbook at the views.
+6. **Build mart views:** run `marts/mart_views.sql`.
+7. **Query:** use `audit_queries.sql`, or point a Sigma workbook at the views.
+
+> **Order matters:** procs → extract → writeback → stage views → history → mart
+> views. `marts/mart_views.sql` will fail to create `V_WORKBOOK_DRIFT` if the
+> `SCD2_*` tables don't exist yet. `deploy.sh bootstrap` does this in the right order.
 
 ## Multiple orgs — one deployment, many orgs
 
