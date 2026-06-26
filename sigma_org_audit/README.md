@@ -40,7 +40,13 @@ stage/marts from raw.
 - **People & access:** members, teams, artifact grants (inode-level for
   workbooks / datasets / data models).
 - **Tenancy & deployment:** org role (parent / child / standalone), tenants,
-  deployment policies, source-swap policies.
+  deployment policies, source-swap policies. Two views: `V_TENANCY_TOPOLOGY`
+  (one row per org — role, parent, tenant count; a child's parent is backfilled
+  from a parent's tenant list when the child's own self-lookup is denied) and
+  `V_TENANT_RELATIONSHIPS` (the parent→tenant **edges** — every tenant a parent
+  enumerated, with `TENANT_EXTRACTED` flagging which were also audited). Note: a
+  404 on the self-lookup is benign ("not a tenant", expected for a parent) and is
+  **not** recorded as an error; only a 403 is a real can't-self-identify.
 - **Data isolation:** user attributes + their user/team/tenant bindings, with a
   heuristic "used in a data model" (RLS) signal.
 - **Writeback:** SIGDS input tables + WAL activity, archival scoring, and
@@ -93,7 +99,7 @@ coverage epic progresses.
 | `procs/sigma_writeback_scan.sql` | Writeback audit — discovers writeback/WAL schemas from connections, scans SIGDS tables + WAL activity. |
 | `stage/stage_views.sql` | `STG_*` views: typed latest-state flatten (workbooks, models, connections, writeback, members/teams, tenancy, user attributes). |
 | `marts/scd2_history.sql` | `sigma_scd2_apply` — generic type-2 history builder for any stage view. |
-| `marts/mart_views.sql` | Inventory + lifecycle (deletion), R/A/G migration scoring, writeback governance (cross-org attribution), ownership, drift, tenancy topology, data isolation. |
+| `marts/mart_views.sql` | Inventory + lifecycle (deletion), R/A/G migration scoring, writeback governance (cross-org attribution), ownership, drift, tenancy topology + tenant relationships, data isolation. |
 | `audit_queries.sql` | Ready-to-run governance & migration-readiness queries. |
 
 A companion **`sigma-org-audit` Claude Code skill** (in `../sigma_skills/`) drives

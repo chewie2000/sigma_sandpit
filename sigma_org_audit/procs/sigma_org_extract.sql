@@ -457,7 +457,14 @@ def main(session, target_database, target_schema, target_table,
     # this org IS a child tenant -- the only API way to confirm "child" from
     # inside. Requires tenant-scoped access; a child's own (child-scoped) creds
     # are typically denied (403), in which case the API cannot self-identify.
-    self_detail, self_err = _safe_get(f"/v2/tenants/{org_id}")
+    # A 404 here is BENIGN -- the org simply is not a tenant (expected for a
+    # parent/standalone), so it is NOT recorded as an error; only 403/other are.
+    self_detail, self_err = None, None
+    try:
+        self_detail = get_json(token_mgr, f"/v2/tenants/{org_id}")
+    except requests.HTTPError as e:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        self_err = None if code == 404 else str(e)
     parent_org_id = (self_detail or {}).get("parentOrganizationId")
     if self_detail is not None:
         collector.add("tenant_self", self_detail, object_id=org_id)
