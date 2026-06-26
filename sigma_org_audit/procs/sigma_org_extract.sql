@@ -252,11 +252,43 @@ def main(session, target_database, target_schema, target_table,
     max_workers  = int(max_workers or 10)
 
     fq_table = f'"{target_database}"."{target_schema}"."{target_table}"'
+    fq_log   = f'"{target_database}"."{target_schema}"."SIGMA_EXTRACT_LOG"'
+    org_id   = None   # set after /v2/whoami; referenced by log() below
+
+    # --- Progress log (best-effort) --------------------------------------------
+    # The extract is otherwise silent for minutes. Each phase writes a breadcrumb
+    # to SIGMA_EXTRACT_LOG, which a second session can tail live:
+    #   SELECT logged_at, org_id, phase, detail
+    #   FROM SIGMA_EXTRACT_LOG ORDER BY logged_at DESC LIMIT 30;
+    # Relies on autocommit so rows are visible while the proc runs. Logging must
+    # NEVER break the extract, so the table create and every insert swallow errors.
+    try:
+        session.sql(f"""
+            CREATE TABLE IF NOT EXISTS {fq_log} (
+                LOGGED_AT TIMESTAMP_NTZ, RUN_ID STRING, ORG_ID STRING,
+                PHASE STRING, DETAIL STRING)
+        """).collect()
+    except Exception:
+        pass
+
+    def log(phase, detail=None):
+        try:
+            session.sql(
+                f"INSERT INTO {fq_log} (LOGGED_AT, RUN_ID, ORG_ID, PHASE, DETAIL) "
+                f"VALUES (CURRENT_TIMESTAMP(), ?, ?, ?, ?)",
+                params=[snapshot_id, org_id, phase,
+                        None if detail is None else str(detail)],
+            ).collect()
+        except Exception:
+            pass
+
+    log("start", "extract beginning")
 
     # --- 0) Identify the org -- auto-detected, never a parameter ----------------
     # GET /v2/whoami returns {userId, organizationId}. Every landed row is stamped
     # with this ORG_ID so one raw table can hold many orgs side by side.
     org_id = get_json(token_mgr, "/v2/whoami").get("organizationId")
+    log("whoami", f"org_id={org_id}")
 
     # --- 1) Org-wide list endpoints --------------------------------------------
     # skipPermissionCheck=true needs admin credentials and gives org-wide visibility.
@@ -283,6 +315,10 @@ def main(session, target_database, target_schema, target_table,
         "team":       len(teams),
     }
     errors = {}
+    log("list endpoints",
+        f"workbooks={counts['workbook']}, datamodels={counts['datamodel']}, "
+        f"datasets={counts['dataset']}, connections={counts['connection']}, "
+        f"members={counts['member']}, teams={counts['team']}")
 
     # --- 2) Per-connection detail (writeback + WAL schema locations) -----------
     # The list endpoint omits writebackSchemas / inputTableAuditLogSchema; only
@@ -303,6 +339,7 @@ def main(session, target_database, target_schema, target_table,
                 collector.add("connection_detail", detail, object_id=cid)
                 detail_ok += 1
     counts["connection_detail"] = detail_ok
+    log("connection details", f"{detail_ok}/{len(conn_ids)}")
 
     # --- 3) Per-workbook sources -----------------------------------------------
     def fetch_workbook_sources(wb):
@@ -323,6 +360,7 @@ def main(session, target_database, target_schema, target_table,
                 collector.add("workbook_sources", payload, object_id=wb_id)
                 src_ok += 1
     counts["workbook_sources"] = src_ok
+    log("workbook sources", f"{src_ok}/{len(workbooks)}")
 
     # --- 4) Per-data-model detail (full spec/metadata) -------------------------
     def fetch_datamodel_detail(dm):
@@ -341,6 +379,7 @@ def main(session, target_database, target_schema, target_table,
                 collector.add("datamodel_detail", payload, object_id=dm_id)
                 dm_ok += 1
     counts["datamodel_detail"] = dm_ok
+    log("datamodel details", f"{dm_ok}/{len(datamodels)}")
 
     # --- 5) Per-artifact grants (optional) -------------------------------------
     if include_grants:
@@ -378,6 +417,7 @@ def main(session, target_database, target_schema, target_table,
                     collector.add("grant", payload, object_id=inode_id)
                     grant_ok += 1
         counts["grant"] = grant_ok
+        log("grants", f"{grant_ok}/{len(inodes)}")
 
     # --- 5b) Tenancy + deployment topology -------------------------------------
     # Multi-tenant migration objects. These are Beta / entitled features: a 403
@@ -462,6 +502,8 @@ def main(session, target_database, target_schema, target_table,
                        "sourceSwapPolicies": sws_err}.items():
         if err:
             errors[label] = err
+    log("tenancy", f"tenants={len(tenants)}, role={org_role}, "
+                   f"deploymentPolicies={len(deployment_policies)}")
 
     # --- 5c) Data-isolation model: user attributes + bindings ------------------
     # User attributes drive row-level security / per-user|team|tenant data scoping
@@ -483,8 +525,10 @@ def main(session, target_database, target_schema, target_table,
     counts["user_attribute"] = len(user_attributes)
     if ua_err:
         errors["userAttributes"] = ua_err
+    log("user attributes", f"{len(user_attributes)}")
 
     # --- 6) Land everything as raw VARIANT snapshots ---------------------------
+    log("landing", f"{len(collector.rows)} rows")
     session.sql(f"""
         CREATE TABLE IF NOT EXISTS {fq_table} (
             SNAPSHOT_ID   STRING,
@@ -523,6 +567,7 @@ def main(session, target_database, target_schema, target_table,
     final_df.write.mode("append").save_as_table(
         [target_database, target_schema, target_table]
     )
+    log("done", f"{len(collector.rows)} rows landed")
 
     return json.dumps({
         "snapshot_id": snapshot_id,

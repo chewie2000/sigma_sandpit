@@ -142,6 +142,26 @@ snow sql -c <conn> --role SYSADMIN --database SIGMA_ORG_AUDIT --schema AUDIT \
 Re-pull data anytime with `./deploy.sh refresh` (all orgs) or
 `./deploy.sh refresh <label>` (one org).
 
+#### Watching extract progress
+
+The extract is otherwise silent for minutes. `sigma_org_extract` writes a
+best-effort breadcrumb per phase to a `SIGMA_EXTRACT_LOG` table (auto-created in
+the audit schema), so you can tail it live from a **second** session while a
+`bootstrap`/`refresh` runs:
+
+```sql
+SELECT logged_at, org_id, phase, detail
+FROM   SIGMA_ORG_AUDIT.AUDIT.SIGMA_EXTRACT_LOG   -- adjust db/schema if not defaults
+ORDER  BY logged_at DESC
+LIMIT  30;
+```
+
+You'll see phases stream in: `start` → `whoami` → `list endpoints` →
+`connection details` → `workbook sources` → `datamodel details` → `grants` →
+`tenancy` → `user attributes` → `landing` → `done`, most with counts. Logging is
+best-effort — it never blocks or fails the extract. (It relies on autocommit so
+rows appear mid-run; confirm on your first run that they do.)
+
 **Where does it install?** Into a database + schema chosen by the `--db` / `--schema`
 flags (defaults `SIGMA_ORG_AUDIT.AUDIT`). `setup` **creates** them; every later
 command creates its objects there. See the command + flag tables below.
