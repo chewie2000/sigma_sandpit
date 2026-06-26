@@ -31,8 +31,8 @@
 #   reset          drop procs/views/SCD2 tables (keeps secrets + raw), then redeploy
 #   reset --hard   reset + also drop RAW_SIGMA_OBJECTS + SIGMA_EXTRACT_LOG, for a
 #                  from-scratch rebuild reusing setup/secrets/registry (then bootstrap)
-#   reset --data   data-only: drop raw/log/SCD2 but KEEP procs + views, for a clean
-#                  dataset without redeploying code (then refresh)
+#   reset --data   data-only: TRUNCATE raw/log/SCD2 (objects + views kept), for a
+#                  clean dataset without redeploying code (then refresh)
 #   teardown       (ACCOUNTADMIN) DROP the audit DB + integration -- full clean-down.
 #                  Destructive; prompts to confirm unless --yes. Re-run setup after.
 #   help
@@ -184,15 +184,15 @@ cmd_reset() {
     echo "use either --data or --hard, not both." >&2; exit 2
   fi
   if [[ "$RESET_DATA" == 1 ]]; then
-    # Data-only: wipe snapshots + progress log + SCD2 history, but KEEP the
-    # deployed procs and views. Lets you re-`refresh` for a clean dataset
-    # without redeploying code (no ACCOUNTADMIN). Views over RAW_SIGMA_OBJECTS
-    # are briefly invalid until refresh repopulates it.
+    # Data-only: EMPTY the data tables with TRUNCATE (not DROP) so the table
+    # objects, grants, and dependent views stay intact and valid -- only the
+    # rows go. Keeps procs + views + secrets; re-`refresh` for a clean dataset,
+    # no ACCOUNTADMIN. (Tables not yet created are skipped via IF EXISTS.)
     sf -q "
-      DROP TABLE IF EXISTS RAW_SIGMA_OBJECTS; DROP TABLE IF EXISTS SIGMA_EXTRACT_LOG;
-      DROP TABLE IF EXISTS SCD2_WORKBOOKS; DROP TABLE IF EXISTS SCD2_DATASETS;
-      DROP TABLE IF EXISTS SCD2_CONNECTIONS; DROP TABLE IF EXISTS SCD2_WRITEBACK_TABLES;" >/dev/null || true
-    echo "== reset --data done (dropped raw/log/SCD2; procs + views + secrets kept). Run refresh (or bootstrap). =="
+      TRUNCATE TABLE IF EXISTS RAW_SIGMA_OBJECTS; TRUNCATE TABLE IF EXISTS SIGMA_EXTRACT_LOG;
+      TRUNCATE TABLE IF EXISTS SCD2_WORKBOOKS; TRUNCATE TABLE IF EXISTS SCD2_DATASETS;
+      TRUNCATE TABLE IF EXISTS SCD2_CONNECTIONS; TRUNCATE TABLE IF EXISTS SCD2_WRITEBACK_TABLES;" >/dev/null || true
+    echo "== reset --data done (emptied raw/log/SCD2 via TRUNCATE; objects + procs + views + secrets kept). Run refresh. =="
     return
   fi
   drop_procs
