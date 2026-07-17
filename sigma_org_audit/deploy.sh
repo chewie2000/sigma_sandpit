@@ -23,6 +23,9 @@
 #                    registry --label acme --org-role child   -> name/role that org
 #                    registry --file orgs.json         -> many orgs from a JSON file
 #                  (orgs.json = JSON array; see orgs.example.json)
+#   check          verify local env vars + Snowflake secrets + integration are
+#                  set up correctly (no ACCOUNTADMIN needed; never prints secret
+#                  values)
 #   deploy-procs   (re)create the stored procedures
 #   deploy-views   (re)create stage + mart views (needs SCD2 tables to exist)
 #   bootstrap      full first-time install: procs -> extract -> stage -> writeback
@@ -242,6 +245,80 @@ drop_procs() {
 cmd_deploy_procs() { drop_procs; run_files "${PROC_FILES[@]}"; }
 cmd_deploy_views() { run_files "${STAGE_FILES[@]}" "${MART_FILES[@]}"; }
 
+# Pre-flight readiness check: local env vars, Snowflake secrets, integration.
+# Uses $ROLE (via _sf_csv) not $ADMIN_ROLE -- same privilege level as
+# extract/refresh, so `check` never needs ACCOUNTADMIN. Every secret's own
+# value is never queried or printed -- only existence/allow-list membership.
+cmd_check() {
+  local core_ok=1 v secrets desc allowed
+
+  echo "== sigma_org_audit: check =="
+
+  echo "-- local env vars (used by setup/registry, not required for check) --"
+  for v in SIGMA_BASE_URL SIGMA_CLIENT_ID SIGMA_CLIENT_SECRET; do
+    if [[ -n "${!v:-}" ]]; then
+      echo "  [ok]   $v is set"
+    else
+      echo "  [--]   $v not set"
+    fi
+  done
+
+  echo "-- Snowflake secrets ($DB.$SCHEMA) --"
+  secrets="$(_sf_csv -q "SHOW SECRETS LIKE 'sigma_%';")" || true
+  # SHOW SECRETS' "name" column (2nd CSV field) is unquoted -- match it exactly,
+  # not a substring, so e.g. sigma_base_url doesn't match sigma_base_url_old.
+  _has_secret() { printf '%s\n' "$secrets" | awk -F, -v v="$1" 'tolower($2)==tolower(v){f=1} END{exit !f}'; }
+  for v in sigma_base_url sigma_client_id sigma_client_secret; do
+    if _has_secret "$v"; then
+      echo "  [ok]   secret $v exists"
+    else
+      echo "  [FAIL] secret $v missing -- run ./deploy.sh setup"
+      core_ok=0
+    fi
+  done
+  if _has_secret sigma_tenant_registry; then
+    echo "  [ok]   secret sigma_tenant_registry exists (multi-tenant registry)"
+  else
+    echo "  [--]   secret sigma_tenant_registry not found (only needed for multi-tenant -- run ./deploy.sh registry)"
+  fi
+
+  echo "-- external access integration --"
+  desc="$(_sf_csv -q "DESC EXTERNAL ACCESS INTEGRATION sigma_api_access;")" || true
+  if [[ -z "$desc" ]]; then
+    echo "  [FAIL] integration sigma_api_access not found -- run ./deploy.sh setup"
+    core_ok=0
+  else
+    if printf '%s\n' "$desc" | grep -qi 'enabled.*true'; then
+      echo "  [ok]   integration sigma_api_access is enabled"
+    else
+      echo "  [FAIL] integration sigma_api_access is not enabled"
+      core_ok=0
+    fi
+    allowed="$(printf '%s\n' "$desc" | grep -i 'allowed_authentication_secrets' || true)"
+    for v in sigma_base_url sigma_client_id sigma_client_secret; do
+      if printf '%s\n' "$allowed" | grep -qi "$v"; then
+        echo "  [ok]   integration allows secret $v"
+      else
+        echo "  [FAIL] integration does not allow secret $v -- run ./deploy.sh setup"
+        core_ok=0
+      fi
+    done
+    if printf '%s\n' "$allowed" | grep -qi 'sigma_tenant_registry'; then
+      echo "  [ok]   integration allows secret sigma_tenant_registry (multi-tenant)"
+    else
+      echo "  [--]   integration does not allow sigma_tenant_registry (only needed for multi-tenant -- run ./deploy.sh registry)"
+    fi
+  fi
+
+  echo "=================="
+  if [[ "$core_ok" == 1 ]]; then
+    echo "== check passed: secrets + integration look ready =="
+  else
+    echo "== check FAILED: see [FAIL] lines above ==" >&2
+    return 1
+  fi
+}
+
 cmd_extract() {
   if [[ -n "$LABEL" ]]; then
     run_call_with_progress "CALL sigma_org_extract_all('$DB','$SCHEMA','RAW_SIGMA_OBJECTS','$LABEL');" \
@@ -432,6 +509,7 @@ PY
 case "$CMD" in
   setup)        cmd_setup;;
   registry)     cmd_registry;;
+  check)        cmd_check;;
   deploy-procs) cmd_deploy_procs;;
   deploy-views) cmd_deploy_views;;
   bootstrap|all) cmd_bootstrap;;

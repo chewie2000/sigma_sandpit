@@ -134,7 +134,8 @@ data via the **`sigma-cli` sub-skill**.
 cd sigma_org_audit
 ./deploy.sh setup       # 1. once, ACCOUNTADMIN — network rule, secrets, integration, grants
 ./deploy.sh registry    # 2. once, ACCOUNTADMIN — seed the org registry from your env vars
-./deploy.sh bootstrap   # 3. build + first load: procs -> extract -> views -> history -> marts
+./deploy.sh check       # 3. optional pre-flight — confirm secrets + integration are wired up
+./deploy.sh bootstrap   # 4. build + first load: procs -> extract -> views -> history -> marts
 ```
 Then verify and explore:
 ```bash
@@ -200,6 +201,7 @@ command creates its objects there. See the command + flag tables below.
 |---|---|
 | `setup` | (ACCOUNTADMIN) create the audit DB + schema, network rule, secrets, integration, grants |
 | `registry` | (ACCOUNTADMIN) seed the org-registry secret from your env vars (one org) |
+| `check` | verify local env vars + Snowflake secrets + the `sigma_api_access` integration are set up correctly — pass/fail per item, never prints secret values. No ACCOUNTADMIN needed |
 | `bootstrap` | full build + first load: procs → extract → stage → writeback → history → marts |
 | `refresh [label]` | re-pull data: all enabled orgs, or just `label` |
 | `deploy-procs` | (re)create the stored procedures only |
