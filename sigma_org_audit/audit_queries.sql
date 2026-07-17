@@ -21,8 +21,7 @@ ORDER BY OBJECTS DESC;
 
 -- 1) Org inventory at a glance -------------------------------------------------
 SELECT OBJECT_TYPE, COUNT(*) AS OBJECTS,
-       COUNT_IF(OWNER_MISSING)  AS OWNER_MISSING,
-       COUNT_IF(OWNER_ARCHIVED) AS OWNER_ARCHIVED
+       COUNT_IF(OWNER_MISSING)  AS OWNER_MISSING
 FROM V_INVENTORY
 GROUP BY OBJECT_TYPE
 ORDER BY OBJECTS DESC;
@@ -41,9 +40,11 @@ WHERE RAG = 'RED'
 ORDER BY DOWNSTREAM_WORKBOOK_COUNT DESC
 LIMIT 50;
 
--- 4) Ownership cleanup queue (archived / missing owners) ----------------------
-SELECT OBJECT_TYPE, OBJECT_ID, NAME, PATH, OWNER_EMAIL,
-       OWNER_MISSING, OWNER_ARCHIVED
+-- 4) Ownership cleanup queue (owner no longer an active member) ----------------
+--    OWNER_MISSING covers deleted + archived/deactivated owners (archived
+--    members are absent from /v2/members).
+SELECT OBJECT_TYPE, OBJECT_ID, NAME, PATH, OWNER_EMAIL, OWNER_ACCOUNT_TYPE,
+       OWNER_MISSING
 FROM V_OWNERSHIP_CLEANUP
 ORDER BY OBJECT_TYPE, NAME;
 

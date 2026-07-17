@@ -159,11 +159,17 @@ SELECT
     PAYLOAD:email::STRING                AS EMAIL,
     COALESCE(PAYLOAD:firstName::STRING || ' ' || PAYLOAD:lastName::STRING,
              PAYLOAD:memberName::STRING) AS DISPLAY_NAME,
+    -- memberType is Sigma's account-type / licence (Build, Build (No AI),
+    -- view, analyze, admin, ...). The /v2/members payload has no `accountType`
+    -- or `isArchived` key -- earlier mappings read those and always got NULL.
     PAYLOAD:memberType::STRING           AS MEMBER_TYPE,
-    PAYLOAD:accountType::STRING          AS ACCOUNT_TYPE,
-    PAYLOAD:isArchived::BOOLEAN          AS IS_ARCHIVED,
+    PAYLOAD:memberType::STRING           AS ACCOUNT_TYPE,  -- alias: memberType IS the account type
+    PAYLOAD:userKind::STRING             AS USER_KIND,     -- internal | embed
     SNAPSHOT_TS, SNAPSHOT_ID
 FROM latest WHERE rn = 1;
+-- Note: /v2/members returns only active members, so an archived/deactivated
+-- owner appears as OWNER_MISSING in V_INVENTORY (absent from STG_MEMBERS) --
+-- there is no per-member archived flag to expose here.
 
 CREATE OR REPLACE VIEW STG_TEAMS AS
 WITH latest AS (
@@ -190,9 +196,15 @@ SELECT
     l.ORG_ID,
     l.OBJECT_ID                          AS INODE_ID,
     l.PAYLOAD:artifactType::STRING       AS ARTIFACT_TYPE,
-    g.value:granteeId::STRING            AS GRANTEE_ID,
-    g.value:granteeType::STRING          AS GRANTEE_TYPE,
+    -- Each grant object identifies its grantee by memberId OR teamId (grantee
+    -- type is implied by which is non-null); there are no granteeId/granteeType
+    -- keys -- earlier mappings read those and always got NULL.
+    COALESCE(g.value:memberId::STRING, g.value:teamId::STRING) AS GRANTEE_ID,
+    IFF(g.value:memberId IS NOT NULL, 'member',
+        IFF(g.value:teamId IS NOT NULL, 'team', NULL))         AS GRANTEE_TYPE,
     g.value:permission::STRING           AS PERMISSION,
+    g.value:grantId::STRING              AS GRANT_ID,
+    g.value:inodeType::STRING            AS INODE_TYPE,
     l.SNAPSHOT_TS, l.SNAPSHOT_ID
 FROM latest l,
      LATERAL FLATTEN(input => COALESCE(l.PAYLOAD:grants, ARRAY_CONSTRUCT())) g

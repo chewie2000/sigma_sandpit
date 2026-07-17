@@ -62,19 +62,24 @@ CREATE OR REPLACE VIEW V_INVENTORY AS
 WITH inv AS (
     SELECT w.ORG_ID, 'workbook'  AS OBJECT_TYPE, w.WORKBOOK_ID AS OBJECT_ID, w.NAME, w.PATH,
            w.OWNER_ID, m.DISPLAY_NAME AS OWNER_NAME, m.EMAIL AS OWNER_EMAIL,
-           (m.MEMBER_ID IS NULL) AS OWNER_MISSING, COALESCE(m.IS_ARCHIVED, FALSE) AS OWNER_ARCHIVED,
+           m.ACCOUNT_TYPE AS OWNER_ACCOUNT_TYPE,
+           -- Archived/deactivated owners are absent from /v2/members, so they
+           -- surface as OWNER_MISSING; there is no separate archived flag.
+           (m.MEMBER_ID IS NULL) AS OWNER_MISSING,
            w.CREATED_AT, w.UPDATED_AT, w.SNAPSHOT_TS
     FROM STG_WORKBOOKS w LEFT JOIN STG_MEMBERS m ON m.ORG_ID = w.ORG_ID AND m.MEMBER_ID = w.OWNER_ID
     UNION ALL
     SELECT d.ORG_ID, 'datamodel', d.DATA_MODEL_ID, d.NAME, d.PATH,
            d.OWNER_ID, m.DISPLAY_NAME, m.EMAIL,
-           (m.MEMBER_ID IS NULL), COALESCE(m.IS_ARCHIVED, FALSE),
+           m.ACCOUNT_TYPE,
+           (m.MEMBER_ID IS NULL),
            d.CREATED_AT, d.UPDATED_AT, d.SNAPSHOT_TS
     FROM STG_DATAMODELS d LEFT JOIN STG_MEMBERS m ON m.ORG_ID = d.ORG_ID AND m.MEMBER_ID = d.OWNER_ID
     UNION ALL
     SELECT ds.ORG_ID, 'dataset', ds.DATASET_ID, ds.NAME, ds.PATH,
            ds.OWNER_ID, m.DISPLAY_NAME, m.EMAIL,
-           (m.MEMBER_ID IS NULL), COALESCE(m.IS_ARCHIVED, FALSE),
+           m.ACCOUNT_TYPE,
+           (m.MEMBER_ID IS NULL),
            ds.CREATED_AT, ds.UPDATED_AT, ds.SNAPSHOT_TS
     FROM STG_DATASETS ds LEFT JOIN STG_MEMBERS m ON m.ORG_ID = ds.ORG_ID AND m.MEMBER_ID = ds.OWNER_ID
 )
@@ -221,12 +226,14 @@ FROM STG_WRITEBACK_TABLES
 GROUP BY 1, 2, 3, 4, 5;
 
 -- ------------------------------------------------------------------------------
--- V_OWNERSHIP_CLEANUP -- objects owned by an archived or missing member.
+-- V_OWNERSHIP_CLEANUP -- objects whose owner is no longer an active member.
+-- OWNER_MISSING covers both deleted and archived/deactivated owners, since
+-- /v2/members returns only active members (an archived owner is simply absent).
 -- ------------------------------------------------------------------------------
 CREATE OR REPLACE VIEW V_OWNERSHIP_CLEANUP AS
 SELECT *
 FROM V_INVENTORY
-WHERE (OWNER_MISSING = TRUE OR OWNER_ARCHIVED = TRUE)
+WHERE OWNER_MISSING = TRUE
   AND IS_CURRENT = TRUE;   -- don't chase ownership on already-deleted objects
 
 -- ------------------------------------------------------------------------------
