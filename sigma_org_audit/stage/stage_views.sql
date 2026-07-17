@@ -283,6 +283,52 @@ LEFT JOIN STG_MEMBERS    m  ON m.ORG_ID = wb.ORG_ID AND LOWER(m.EMAIL) = LOWER(w
 WHERE t.rn = 1;
 
 -- ------------------------------------------------------------------------------
+-- STG_WRITEBACK_ACCESS
+-- Flattened, deduped query-history access rows (OBJECT_TYPE='writeback_access',
+-- landed by sigma_query_history_scan). One row per (query, object, access kind).
+-- Because raw is append-only and the scan re-scans an overlap window each run,
+-- the same (queryId, objectName, accessKind) can land more than once -- collapse
+-- latest-wins here. Parses the object into DB/SCHEMA/SIGDS_TABLE (the table part
+-- arrives quoted) and the Sigma workbook id + org slug out of the source URL, so
+-- it joins to STG_WRITEBACK_TABLES / STG_WORKBOOKS. This is ground-truth lineage
+-- that ENHANCES writeback governance; it never downgrades a table on its own.
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW STG_WRITEBACK_ACCESS AS
+WITH latest AS (
+    SELECT *,
+           ROW_NUMBER() OVER (
+               PARTITION BY PAYLOAD:queryId::STRING,
+                            PAYLOAD:objectName::STRING,
+                            PAYLOAD:accessKind::STRING
+               ORDER BY SNAPSHOT_TS DESC) AS rn
+    FROM RAW_SIGMA_OBJECTS WHERE OBJECT_TYPE = 'writeback_access'
+)
+SELECT
+    PAYLOAD:queryId::STRING                       AS QUERY_ID,
+    PAYLOAD:startTime::TIMESTAMP_NTZ              AS ACCESS_AT,
+    PAYLOAD:accessKind::STRING                    AS ACCESS_KIND,   -- READ | INSERT
+    PAYLOAD:queryType::STRING                     AS QUERY_TYPE,
+    PAYLOAD:userName::STRING                      AS DB_USER_NAME,
+    PAYLOAD:roleName::STRING                      AS DB_ROLE_NAME,
+    PAYLOAD:objectName::STRING                    AS OBJECT_NAME,
+    UPPER(SPLIT_PART(PAYLOAD:objectName::STRING, '.', 1)) AS WB_DATABASE,
+    UPPER(SPLIT_PART(PAYLOAD:objectName::STRING, '.', 2)) AS WB_SCHEMA,
+    -- 3rd part arrives double-quoted (mixed-case SIGDS name); strip the quotes.
+    REPLACE(SPLIT_PART(PAYLOAD:objectName::STRING, '.', 3), '"', '') AS SIGDS_TABLE,
+    PAYLOAD:sourceUrl::STRING                     AS WORKBOOK_URL,
+    -- workbook id = the last '-'-delimited token of the /workbook/<title>-<id> path
+    -- segment (ids carry no dash); org slug = first path segment after the host.
+    REGEXP_SUBSTR(
+        SPLIT_PART(SPLIT_PART(PAYLOAD:sourceUrl::STRING, '/workbook/', 2), '?', 1),
+        '[^-]+$')                                 AS WORKBOOK_ID,
+    SPLIT_PART(SPLIT_PART(PAYLOAD:sourceUrl::STRING, 'sigmacomputing.com/', 2), '/', 1)
+                                                  AS WORKBOOK_ORG_SLUG,
+    PAYLOAD:sigmaUserEmail::STRING               AS SIGMA_USER_EMAIL,
+    PAYLOAD:sigmaKind::STRING                     AS SIGMA_KIND,
+    SNAPSHOT_TS, SNAPSHOT_ID
+FROM latest WHERE rn = 1;
+
+-- ------------------------------------------------------------------------------
 -- TENANCY + DEPLOYMENT TOPOLOGY (multi-tenant migration)
 -- STG_ORGANIZATION carries the per-org role summary stamped by sigma_org_extract
 -- (role, tenant/policy counts, and any tenants-access error such as a 403 when

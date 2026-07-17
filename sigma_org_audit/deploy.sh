@@ -77,6 +77,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROC_FILES=(
   "procs/sigma_org_extract.sql"
   "procs/sigma_writeback_scan.sql"
+  "procs/sigma_query_history_scan.sql"
   "procs/sigma_org_extract_all.sql"
   "marts/scd2_history.sql"
 )
@@ -88,6 +89,7 @@ MART_FILES=("marts/mart_views.sql")
 PROC_SIGNATURES=(
   "SIGMA_ORG_EXTRACT(VARCHAR,VARCHAR,VARCHAR,BOOLEAN,NUMBER,VARCHAR,VARCHAR,VARCHAR,VARCHAR)"
   "SIGMA_WRITEBACK_SCAN(VARCHAR,VARCHAR,VARCHAR,VARCHAR,VARCHAR)"
+  "SIGMA_QUERY_HISTORY_SCAN(VARCHAR,VARCHAR,VARCHAR,NUMBER,NUMBER,VARCHAR)"
   "SIGMA_ORG_EXTRACT_ALL(VARCHAR,VARCHAR,VARCHAR,VARCHAR,BOOLEAN,NUMBER)"
   "SIGMA_SCD2_APPLY(VARCHAR,VARCHAR,VARCHAR)"
 )
@@ -335,6 +337,11 @@ cmd_extract() {
 cmd_writeback() {
   run_call_with_progress "CALL sigma_writeback_scan('$DB','$SCHEMA');" "sigma_writeback_scan"
 }
+cmd_query_history() {
+  # Query-history enrichment (needs IMPORTED PRIVILEGES on SNOWFLAKE + Enterprise
+  # edition for ACCESS_HISTORY). Degrades loudly and returns skipped if absent.
+  run_call_with_progress "CALL sigma_query_history_scan('$DB','$SCHEMA');" "sigma_query_history_scan"
+}
 cmd_history() {
   echo ">> CALL sigma_scd2_apply x5"
   sf -q "
@@ -350,12 +357,13 @@ cmd_bootstrap() {
   cmd_extract
   run_files "${STAGE_FILES[@]}"
   cmd_writeback
+  cmd_query_history
   cmd_history
   run_files "${MART_FILES[@]}"
   echo "== bootstrap complete =="
 }
 
-cmd_refresh() { cmd_extract; cmd_writeback; cmd_history; echo "== refresh complete =="; }
+cmd_refresh() { cmd_extract; cmd_writeback; cmd_query_history; cmd_history; echo "== refresh complete =="; }
 
 cmd_reset() {
   if [[ "$RESET_DATA" == 1 && "$RESET_HARD" == 1 ]]; then
@@ -460,6 +468,10 @@ GRANT USAGE ON INTEGRATION sigma_api_access TO ROLE {grant_role};
 GRANT READ ON SECRET sigma_base_url      TO ROLE {grant_role};
 GRANT READ ON SECRET sigma_client_id     TO ROLE {grant_role};
 GRANT READ ON SECRET sigma_client_secret TO ROLE {grant_role};
+-- Query-history enrichment (sigma_query_history_scan) reads ACCOUNT_USAGE.
+-- Best-effort: needs ACCOUNTADMIN to grant; if it fails the rest of setup still
+-- succeeds and the query-history step simply degrades to skipped.
+GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE {grant_role};
 """)
 PY
   # No --database/--schema here: the script CREATEs and USEs them (they may not exist yet).

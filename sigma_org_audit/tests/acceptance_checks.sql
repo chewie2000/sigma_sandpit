@@ -15,10 +15,14 @@ SELECT 1 AS ORD, 'raw: rows present' AS CHECK_NAME,
        IFF(COUNT(*) > 0, 'PASS', 'FAIL') AS STATUS
 FROM RAW_SIGMA_OBJECTS
 UNION ALL
+-- writeback_access rows are intentionally landed with NULL ORG_ID: their org is
+-- resolved downstream (STG_WRITEBACK_ACCESS) from the workbook URL, and access
+-- can be cross-org. Every other object type is org-stamped at land time.
 SELECT 2, 'raw: ORG_ID stamped on every row (0 null)',
        TO_VARCHAR(COUNT_IF(ORG_ID IS NULL)),
        IFF(COUNT_IF(ORG_ID IS NULL) = 0, 'PASS', 'FAIL')
 FROM RAW_SIGMA_OBJECTS
+WHERE OBJECT_TYPE <> 'writeback_access'
 UNION ALL
 SELECT 3, 'raw: distinct orgs', TO_VARCHAR(COUNT(DISTINCT ORG_ID)),
        IFF(COUNT(DISTINCT ORG_ID) >= 1, 'PASS', 'FAIL')
@@ -45,6 +49,9 @@ UNION ALL SELECT 13,'stage: STG_MEMBERS',           TO_VARCHAR(COUNT(*)), IFF(CO
 UNION ALL SELECT 14,'stage: STG_WRITEBACK_TABLES',  TO_VARCHAR(COUNT(*)), IFF(COUNT(*)>0,'PASS','FAIL') FROM STG_WRITEBACK_TABLES
 UNION ALL SELECT 15,'stage: STG_USER_ATTRIBUTES',   TO_VARCHAR(COUNT(*)), IFF(COUNT(*)>0,'PASS','FAIL') FROM STG_USER_ATTRIBUTES
 UNION ALL SELECT 16,'stage: STG_ORGANIZATION',      TO_VARCHAR(COUNT(*)), IFF(COUNT(*)>0,'PASS','FAIL') FROM STG_ORGANIZATION
+-- STG_WRITEBACK_ACCESS is optional (needs IMPORTED PRIVILEGES + Enterprise
+-- edition); 0 rows is INFO, not a failure -- the feature simply wasn't run.
+UNION ALL SELECT 17,'stage: STG_WRITEBACK_ACCESS (optional)', TO_VARCHAR(COUNT(*)), IFF(COUNT(*)>=0,'PASS','FAIL') FROM STG_WRITEBACK_ACCESS
 
 -- MART layer --------------------------------------------------------------------
 UNION ALL SELECT 20,'mart: V_INVENTORY rows',       TO_VARCHAR(COUNT(*)), IFF(COUNT(*)>0,'PASS','FAIL') FROM V_INVENTORY
@@ -56,6 +63,12 @@ UNION ALL SELECT 23,'mart: V_WRITEBACK_GOVERNANCE rows', TO_VARCHAR(COUNT(*)), I
 UNION ALL SELECT 24,'mart: writeback reclaimable only on ORPHANED',
        'bad=' || TO_VARCHAR(COUNT_IF(ATTRIBUTION <> 'ORPHANED' AND RECLAIMABLE_BYTES > 0)),
        IFF(COUNT_IF(ATTRIBUTION <> 'ORPHANED' AND RECLAIMABLE_BYTES > 0) = 0, 'PASS','FAIL')
+FROM V_WRITEBACK_GOVERNANCE
+-- invariant: access-history attribution can only ever land on OWNED tables
+-- (it promotes ownership, never demotes) -- 0 violations expected.
+UNION ALL SELECT 24.1,'mart: access-history attribution implies OWNED',
+       'bad=' || TO_VARCHAR(COUNT_IF(ATTRIBUTION_SOURCE IN ('access_history','both') AND ATTRIBUTION <> 'OWNED')),
+       IFF(COUNT_IF(ATTRIBUTION_SOURCE IN ('access_history','both') AND ATTRIBUTION <> 'OWNED') = 0, 'PASS','FAIL')
 FROM V_WRITEBACK_GOVERNANCE
 UNION ALL SELECT 25,'mart: V_WRITEBACK_SHARED_SCHEMAS rows', TO_VARCHAR(COUNT(*)), IFF(COUNT(*)>=0,'PASS','FAIL') FROM V_WRITEBACK_SHARED_SCHEMAS
 UNION ALL SELECT 26,'mart: V_TENANCY_TOPOLOGY one row per org, role set',

@@ -95,6 +95,20 @@ WHERE CONNECTION_ID NOT IN (
 )
 ORDER BY NAME;
 
+-- 7a) Query-history ground-truth: tables the WAL heuristic would flag but real
+--     workbook access proves are live (the sigma_query_history_scan enrichment).
+--     ATTRIBUTION_SOURCE = 'access_history' => rescued from ORPHANED/UNATTRIBUTED
+--     purely by observed reads/writes; 'both' => corroborated. Requires the
+--     query-history scan to have run (IMPORTED PRIVILEGES + Enterprise edition).
+SELECT WB_DATABASE, WB_SCHEMA, SIGDS_TABLE, ATTRIBUTION, ATTRIBUTION_SOURCE,
+       ACCESS_WORKBOOK_ID, ACCESS_DISTINCT_WORKBOOKS, ACCESS_DISTINCT_USERS,
+       ACCESS_READ_COUNT, ACCESS_WRITE_COUNT,
+       ACCESS_LAST_READ_AT, ACCESS_LAST_WRITE_AT, HAS_RECENT_ACCESS
+FROM V_WRITEBACK_GOVERNANCE
+WHERE ATTRIBUTION_SOURCE IN ('access_history', 'both')
+ORDER BY ACCESS_READ_COUNT + ACCESS_WRITE_COUNT DESC
+LIMIT 100;
+
 -- 8) Recent workbook drift (changes captured between snapshots) ----------------
 --    Requires SCD2_WORKBOOKS (CALL sigma_scd2_apply('STG_WORKBOOKS',...)).
 SELECT WORKBOOK_ID, NAME, PATH, CHANGED_FROM, CHANGED_TO

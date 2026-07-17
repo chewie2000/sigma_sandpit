@@ -163,3 +163,20 @@ GRANT READ   ON SECRET sigma_client_secret  TO ROLE <YOUR_ROLE>;
 -- GRANT USAGE  ON SCHEMA   <WRITEBACK_DB>.<WRITEBACK_SCHEMA> TO ROLE <YOUR_ROLE>;
 -- GRANT SELECT ON ALL TABLES    IN SCHEMA <WRITEBACK_DB>.<WRITEBACK_SCHEMA> TO ROLE <YOUR_ROLE>;
 -- GRANT SELECT ON FUTURE TABLES IN SCHEMA <WRITEBACK_DB>.<WRITEBACK_SCHEMA> TO ROLE <YOUR_ROLE>;
+
+
+-- ==============================================================================
+-- 7. Query-history enrichment (for sigma_query_history_scan)
+--    The query-history scan reads SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY and
+--    ACCESS_HISTORY to trace which Sigma workbook/user actually reads or writes
+--    each writeback table (ground-truth ownership that enriches the writeback
+--    governance scoring). The execution role needs IMPORTED PRIVILEGES on the
+--    shared SNOWFLAKE database to read ACCOUNT_USAGE.
+--
+--    NOTE: ACCESS_HISTORY is a Snowflake Enterprise Edition (or higher) feature.
+--    Without this grant (or on Standard edition) sigma_query_history_scan
+--    degrades loudly -- it logs a WARN, lands nothing, and returns skipped=true;
+--    the rest of the audit is unaffected.
+-- ==============================================================================
+
+GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE <YOUR_ROLE>;

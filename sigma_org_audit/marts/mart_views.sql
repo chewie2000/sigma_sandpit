@@ -155,16 +155,58 @@ WITH org_slug AS (
            MAX(SPLIT_PART(SPLIT_PART(URL, 'sigmacomputing.com/', 2), '/', 1)) AS ORG_SLUG
     FROM STG_WORKBOOKS WHERE URL IS NOT NULL GROUP BY ORG_ID
 ),
+-- Ground-truth access from query history (sigma_query_history_scan), aggregated
+-- per writeback table. ACCESS_WORKBOOK_LIVE = at least one accessing workbook is
+-- still live. This ENHANCES attribution/staleness; it only ever helps a table.
+-- live workbooks keyed by their URL-safe id (the form embedded in query-comment
+-- source URLs), since STG_WORKBOOKS.WORKBOOK_ID is the API UUID, a different form.
+wb_url AS (
+    SELECT WORKBOOK_ID,
+           REGEXP_SUBSTR(SPLIT_PART(SPLIT_PART(URL, '/workbook/', 2), '?', 1),
+                         '[^-/]+$') AS URL_ID
+    FROM STG_WORKBOOKS WHERE URL IS NOT NULL
+),
+access AS (
+    SELECT
+        a.WB_DATABASE, a.WB_SCHEMA, a.SIGDS_TABLE,
+        MAX(IFF(a.ACCESS_KIND = 'READ',   a.ACCESS_AT, NULL)) AS ACCESS_LAST_READ_AT,
+        MAX(IFF(a.ACCESS_KIND = 'INSERT', a.ACCESS_AT, NULL)) AS ACCESS_LAST_WRITE_AT,
+        COUNT_IF(a.ACCESS_KIND = 'READ')                      AS ACCESS_READ_COUNT,
+        COUNT_IF(a.ACCESS_KIND = 'INSERT')                    AS ACCESS_WRITE_COUNT,
+        COUNT(DISTINCT a.WORKBOOK_ID)                         AS ACCESS_DISTINCT_WORKBOOKS,
+        COUNT(DISTINCT a.SIGMA_USER_EMAIL)                    AS ACCESS_DISTINCT_USERS,
+        MAX(a.WORKBOOK_ID)                                    AS ACCESS_WORKBOOK_ID,
+        BOOLOR_AGG(wb.WORKBOOK_ID IS NOT NULL)                AS ACCESS_WORKBOOK_LIVE
+    FROM STG_WRITEBACK_ACCESS a
+    LEFT JOIN wb_url wb ON wb.URL_ID = a.WORKBOOK_ID
+    GROUP BY 1, 2, 3
+),
 base AS (
     SELECT
         wt.*,
         os.ORG_SLUG                                               AS DISCOVERED_BY_ORG_SLUG,
         DATEDIFF('day', wt.WAL_LAST_EDIT_AT, CURRENT_TIMESTAMP())  AS DAYS_SINCE_EDIT,
         DATEDIFF('day', wt.LAST_ALTERED,     CURRENT_TIMESTAMP())  AS DAYS_SINCE_ALTERED,
+        ac.ACCESS_LAST_READ_AT,
+        ac.ACCESS_LAST_WRITE_AT,
+        COALESCE(ac.ACCESS_READ_COUNT, 0)                         AS ACCESS_READ_COUNT,
+        COALESCE(ac.ACCESS_WRITE_COUNT, 0)                        AS ACCESS_WRITE_COUNT,
+        COALESCE(ac.ACCESS_DISTINCT_WORKBOOKS, 0)                 AS ACCESS_DISTINCT_WORKBOOKS,
+        COALESCE(ac.ACCESS_DISTINCT_USERS, 0)                     AS ACCESS_DISTINCT_USERS,
+        ac.ACCESS_WORKBOOK_ID,
+        COALESCE(ac.ACCESS_WORKBOOK_LIVE, FALSE)                  AS ACCESS_WORKBOOK_LIVE,
+        -- most recent activity of any kind from query history
+        GREATEST(COALESCE(ac.ACCESS_LAST_READ_AT,  '1900-01-01'::TIMESTAMP_NTZ),
+                 COALESCE(ac.ACCESS_LAST_WRITE_AT, '1900-01-01'::TIMESTAMP_NTZ)) AS ACCESS_LAST_AT_RAW,
+        (ac.WB_DATABASE IS NOT NULL)                              AS HAS_ANY_ACCESS,
+        -- recent = within the same 90-day staleness horizon
+        (GREATEST(COALESCE(ac.ACCESS_LAST_READ_AT,  '1900-01-01'::TIMESTAMP_NTZ),
+                  COALESCE(ac.ACCESS_LAST_WRITE_AT, '1900-01-01'::TIMESTAMP_NTZ))
+             >= DATEADD('day', -90, CURRENT_TIMESTAMP()))         AS HAS_RECENT_ACCESS,
+        -- WAL-only staleness kept for provenance/back-compat
         (wt.WAL_LAST_EDIT_AT IS NULL
-         OR DATEDIFF('day', wt.WAL_LAST_EDIT_AT, CURRENT_TIMESTAMP()) > 90) AS IS_STALE,
+         OR DATEDIFF('day', wt.WAL_LAST_EDIT_AT, CURRENT_TIMESTAMP()) > 90) AS WAL_IS_STALE,
         (COALESCE(wt.ROW_COUNT, 0) = 0)                            AS IS_EMPTY,
-        -- foreign = owned by a different org than the one that discovered it
         CASE
             WHEN wt.OWNING_ORG_ID IS NOT NULL AND wt.OWNING_ORG_ID <> wt.ORG_ID THEN TRUE
             WHEN wt.OWNING_ORG_ID IS NULL AND wt.WAL_ORG_SLUG IS NOT NULL
@@ -173,30 +215,54 @@ base AS (
         END                                                       AS IS_FOREIGN
     FROM STG_WRITEBACK_TABLES wt
     LEFT JOIN org_slug os ON os.ORG_ID = wt.ORG_ID
+    LEFT JOIN access ac
+           ON ac.WB_DATABASE = UPPER(wt.WB_DATABASE)
+          AND ac.WB_SCHEMA   = UPPER(wt.WB_SCHEMA)
+          AND ac.SIGDS_TABLE = wt.SIGDS_TABLE
     WHERE COALESCE(wt.SCAN_REACHABLE, FALSE) = TRUE
 ),
-classified AS (
+enriched AS (
     SELECT base.*,
+        -- staleness now factors query history: recent access is NOT stale, even
+        -- with no WAL row (the su8 fix -- WAL absence no longer implies stale).
+        (WAL_IS_STALE AND NOT HAS_RECENT_ACCESS)                  AS IS_STALE,
+        -- provenance of the ownership signal
+        CASE
+            WHEN COALESCE(WORKBOOK_EXISTS, FALSE) AND ACCESS_WORKBOOK_LIVE THEN 'both'
+            WHEN COALESCE(WORKBOOK_EXISTS, FALSE)                          THEN 'wal'
+            WHEN ACCESS_WORKBOOK_LIVE                                      THEN 'access_history'
+            ELSE 'none'
+        END                                                       AS ATTRIBUTION_SOURCE
+    FROM base
+),
+classified AS (
+    SELECT enriched.*,
         CASE
             WHEN IS_FOREIGN                                        THEN 'CROSS_ORG'
-            WHEN COALESCE(WORKBOOK_EXISTS, FALSE)                  THEN 'OWNED'
+            -- HIGH-WEIGHT marker: a live workbook actually reading/writing the
+            -- table (query history) attributes ownership even when WAL is silent.
+            WHEN COALESCE(WORKBOOK_EXISTS, FALSE)
+              OR ACCESS_WORKBOOK_LIVE                              THEN 'OWNED'
             WHEN WAL_ORG_SLUG IS NOT NULL
                  AND WAL_ORG_SLUG = DISCOVERED_BY_ORG_SLUG         THEN 'ORPHANED'
             WHEN WAL_ORG_SLUG IS NULL                              THEN 'UNATTRIBUTED'
             ELSE 'ORPHANED'
         END AS ATTRIBUTION
-    FROM base
+    FROM enriched
 )
 SELECT
     classified.*,
     (ATTRIBUTION = 'ORPHANED') AS IS_ORPHANED,
-    -- archival score only applies to tables confidently owned by THIS org and orphaned
+    -- archival score only for tables orphaned to THIS org. Recent access (even if
+    -- the workbook is gone) still lowers the score -- it may be in live use.
     IFF(ATTRIBUTION = 'ORPHANED',
-        LEAST(100,
-              40
-            + IFF(IS_STALE, 30, 0)
-            + IFF(IS_EMPTY, 15, 0)
-            + IFF(DAYS_SINCE_EDIT > 365, 15, IFF(DAYS_SINCE_EDIT > 180, 8, 0))),
+        GREATEST(0,
+            LEAST(100,
+                  40
+                + IFF(IS_STALE, 30, 0)
+                + IFF(IS_EMPTY, 15, 0)
+                + IFF(DAYS_SINCE_EDIT > 365, 15, IFF(DAYS_SINCE_EDIT > 180, 8, 0))
+                - IFF(HAS_RECENT_ACCESS, 30, 0))),
         0) AS ARCHIVAL_SCORE,
     CASE ATTRIBUTION
         WHEN 'ORPHANED'     THEN IFF(IS_STALE, 'HIGH', 'MEDIUM')

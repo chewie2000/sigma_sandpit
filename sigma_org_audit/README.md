@@ -50,7 +50,14 @@ stage/marts from raw.
 - **Data isolation:** user attributes + their user/team/tenant bindings, with a
   heuristic "used in a data model" (RLS) signal.
 - **Writeback:** SIGDS input tables + WAL activity, archival scoring, and
-  cross-org attribution for shared writeback schemas.
+  cross-org attribution for shared writeback schemas. **Query-history
+  enrichment** (Snowflake `ACCOUNT_USAGE`): Sigma tags every generated query
+  with a comment carrying the source workbook + user, so a join of
+  `QUERY_HISTORY` × `ACCESS_HISTORY` gives ground-truth "which workbook actually
+  reads/writes this table" — a strong ownership signal that sharpens the
+  governance scoring (a table with no WAL rows but real recent workbook access
+  is *not* orphaned). Enhancement only: it can raise confidence in ownership /
+  liveness, never mark a table more orphaned.
 - **Derived:** inventory, ownership cleanup, object lifecycle (deletion
   detection), R/A/G migration scoring (dataset→model), SCD2 history + drift,
   tenancy topology, data-isolation posture.
@@ -79,6 +86,15 @@ stage/marts from raw.
   per-object detail fan-out haven't been exercised at large scale.
 - **Child org-role is operator-asserted** — a child can't self-identify via the
   tenants API (403 from inside), so `role` comes from the registry, not the API.
+- **Query-history enrichment is conditional** — `ACCESS_HISTORY` is a Snowflake
+  **Enterprise Edition** (or higher) feature and needs `GRANT IMPORTED
+  PRIVILEGES ON DATABASE SNOWFLAKE` (setup section 7). Without either,
+  `sigma_query_history_scan` degrades loudly (logs a WARN, lands nothing) and
+  the rest of the audit is unaffected. `ACCOUNT_USAGE` has latency
+  (`QUERY_HISTORY` ~45 min, `ACCESS_HISTORY` ~3 h) and 365-day retention
+  (landing to raw accumulates history beyond that); it is **per-account**, so
+  writeback into a *different* Snowflake account isn't seen. First run backfills
+  90 days; later runs incrementally fill the gap.
 - **Snowflake-only writeback** — connections to other accounts or Databricks are
   inventoried but their writeback contents are skipped (`SCAN_REACHABLE = FALSE`).
 - **RLS signal is heuristic** — a string match of the attribute in a model spec,
@@ -97,6 +113,7 @@ coverage epic progresses.
 | `procs/sigma_org_extract.sql` | Raw extraction proc — lands every API object type (incl. tenancy + user attributes) as VARIANT snapshots; org-role detection. |
 | `procs/sigma_org_extract_all.sql` | Multi-org fan-out — reads the tenant-registry secret and runs the extract per org (refresh all, or one by label). |
 | `procs/sigma_writeback_scan.sql` | Writeback audit — discovers writeback/WAL schemas from connections, scans SIGDS tables + WAL activity. |
+| `procs/sigma_query_history_scan.sql` | Query-history enrichment — joins `ACCOUNT_USAGE` `QUERY_HISTORY` × `ACCESS_HISTORY`, parses Sigma's query comment for ground-truth workbook↔writeback-table access; incremental (90-day backfill then gap-fill). |
 | `stage/stage_views.sql` | `STG_*` views: typed latest-state flatten (workbooks, models, connections, writeback, members/teams, tenancy, user attributes). |
 | `marts/scd2_history.sql` | `sigma_scd2_apply` — generic type-2 history builder for any stage view. |
 | `marts/mart_views.sql` | Inventory + lifecycle (deletion), R/A/G migration scoring, writeback governance (cross-org attribution), ownership, drift, tenancy topology + tenant relationships, data isolation. |
@@ -242,7 +259,8 @@ or pass `--conn <name>` on every command to target a specific profile.
 
 1. **Setup (ACCOUNTADMIN):** fill the placeholders in `setup_prerequisites.sql` and run it.
 2. **Procedures:** run `procs/sigma_org_extract.sql`, `procs/sigma_writeback_scan.sql`,
-   `procs/sigma_org_extract_all.sql`, `marts/scd2_history.sql`.
+   `procs/sigma_query_history_scan.sql`, `procs/sigma_org_extract_all.sql`,
+   `marts/scd2_history.sql`.
 3. **Extract** (set `USE DATABASE`/`USE SCHEMA` first):
    `CALL sigma_org_extract('DB','SCHEMA');` then `CALL sigma_writeback_scan('DB','SCHEMA');`
 4. **Stage views:** run `stage/stage_views.sql`.
