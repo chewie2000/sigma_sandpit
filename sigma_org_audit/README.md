@@ -246,14 +246,15 @@ or pass `--conn <name>` on every command to target a specific profile.
 3. **Extract** (set `USE DATABASE`/`USE SCHEMA` first):
    `CALL sigma_org_extract('DB','SCHEMA');` then `CALL sigma_writeback_scan('DB','SCHEMA');`
 4. **Stage views:** run `stage/stage_views.sql`.
-5. **History:** the four `CALL sigma_scd2_apply(...)` statements (see `audit_queries.sql`
+5. **History:** the five `CALL sigma_scd2_apply(...)` statements (see `audit_queries.sql`
    / the worked example below).
 6. **Mart views:** run `marts/mart_views.sql`.
 7. **Query:** `audit_queries.sql`.
 
 > **Order matters** (the reason `deploy.sh` exists): procs → extract → writeback →
-> stage → **history → marts**. `marts/mart_views.sql` creates `V_WORKBOOK_DRIFT`,
-> which needs the `SCD2_*` tables, so history must run first. Also: if a procedure's
+> stage → **history → marts**. `marts/mart_views.sql` creates `V_WORKBOOK_DRIFT`
+> and `V_DATAMODEL_DRIFT`, which need the `SCD2_*` tables, so history must run
+> first. Also: if a procedure's
 > **parameter count** changes between versions, `DROP PROCEDURE <name>(<types>)`
 > before re-creating (Snowflake rejects the ambiguous overload).
 

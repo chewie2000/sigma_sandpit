@@ -249,6 +249,25 @@ WHERE SCD_VALID_TO IS NOT NULL          -- only versions that were superseded
 ORDER BY SCD_VALID_TO DESC;
 
 -- ------------------------------------------------------------------------------
+-- V_DATAMODEL_DRIFT -- changes to data models between snapshots, from SCD2 history.
+-- Requires: CALL sigma_scd2_apply('STG_DATAMODELS','SCD2_DATAMODELS','DATA_MODEL_ID');
+-- A closed version (SCD_VALID_TO not null) means the object changed at that time.
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW V_DATAMODEL_DRIFT AS
+SELECT
+    ORG_ID,
+    DATA_MODEL_ID,
+    NAME,
+    PATH,
+    SCD_VALID_FROM AS CHANGED_FROM,
+    SCD_VALID_TO   AS CHANGED_TO,
+    SCD_IS_CURRENT,
+    UPDATED_AT
+FROM SCD2_DATAMODELS
+WHERE SCD_VALID_TO IS NOT NULL          -- only versions that were superseded
+ORDER BY SCD_VALID_TO DESC;
+
+-- ------------------------------------------------------------------------------
 -- V_TENANCY_TOPOLOGY -- per-org multi-tenant posture for migration planning.
 -- ORG_ROLE: parent (can enumerate tenants and has them), standalone (reachable,
 -- none), or unknown (tenant enumeration denied -- e.g. 403, not entitled/parent).

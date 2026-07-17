@@ -100,6 +100,12 @@ SELECT WORKBOOK_ID, NAME, PATH, CHANGED_FROM, CHANGED_TO
 FROM V_WORKBOOK_DRIFT
 LIMIT 100;
 
+-- 8b) Recent data model drift (changes captured between snapshots) -------------
+--    Requires SCD2_DATAMODELS (CALL sigma_scd2_apply('STG_DATAMODELS',...)).
+SELECT DATA_MODEL_ID, NAME, PATH, CHANGED_FROM, CHANGED_TO
+FROM V_DATAMODEL_DRIFT
+LIMIT 100;
+
 -- 9) Snapshot coverage -- what was captured, and when --------------------------
 SELECT OBJECT_TYPE, COUNT(*) AS ROWS_LANDED,
        COUNT(DISTINCT SNAPSHOT_ID) AS SNAPSHOTS,

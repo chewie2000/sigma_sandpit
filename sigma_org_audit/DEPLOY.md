@@ -52,9 +52,10 @@ portable hardcoded default; omit it to use the CLI default, or pass `--conn <nam
 
 ## Why the order matters
 `bootstrap` runs procs → extract → **stage views** → writeback → **history**
-(SCD2 tables) → **mart views**, because the drift mart (`V_WORKBOOK_DRIFT`)
-references the `SCD2_*` tables and won't compile until `sigma_scd2_apply` has
-created them. `deploy.sh` also `DROP`s the current proc signatures before
+(SCD2 tables) → **mart views**, because the drift marts (`V_WORKBOOK_DRIFT`,
+`V_DATAMODEL_DRIFT`) reference the `SCD2_*` tables and won't compile until
+`sigma_scd2_apply` has created them. `deploy.sh` also `DROP`s the current proc
+signatures before
 recreating, so an argument-count change never trips Snowflake's ambiguous-overload
 error.
 

@@ -27,6 +27,7 @@
 --
 -- Example
 --   CALL sigma_scd2_apply('STG_WORKBOOKS',   'SCD2_WORKBOOKS',   'WORKBOOK_ID');
+--   CALL sigma_scd2_apply('STG_DATAMODELS',  'SCD2_DATAMODELS',  'DATA_MODEL_ID');
 --   CALL sigma_scd2_apply('STG_DATASETS',    'SCD2_DATASETS',    'DATASET_ID');
 --   CALL sigma_scd2_apply('STG_CONNECTIONS', 'SCD2_CONNECTIONS', 'CONNECTION_ID');
 --   CALL sigma_scd2_apply('STG_WRITEBACK_TABLES', 'SCD2_WRITEBACK_TABLES', 'SIGDS_TABLE');
