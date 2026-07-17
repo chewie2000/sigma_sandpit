@@ -172,7 +172,11 @@ run_call_with_progress() {
 
   echo ">> CALL $label (live; poll ${PROGRESS_INTERVAL}s)"
   local tmp; tmp="$(mktemp -t soa_call.XXXXXX)"
-  trap 'rm -f "$tmp"' RETURN
+  # Self-clearing: a RETURN trap set here isn't scoped to this function -- left
+  # alone it would re-fire on every later function return up the call stack
+  # (cmd_extract, cmd_refresh, ...), by which point $tmp is out of scope and
+  # trips `set -u`. Clearing it as part of its own firing keeps it to one shot.
+  trap 'rm -f "$tmp" 2>/dev/null; trap - RETURN' RETURN
   # CALL in the background via snow directly (no _filter pipe) so we keep its exit code.
   snow sql ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --role "$ROLE" \
     --database "$DB" --schema "$SCHEMA" --warehouse "$WH" -q "$sql" >"$tmp" 2>&1 &
