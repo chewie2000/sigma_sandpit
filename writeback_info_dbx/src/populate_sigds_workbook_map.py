@@ -35,6 +35,16 @@ Run logic per execution
    keyed on SIGDS_TABLE.  Flag records whose WAL table has disappeared as
    IS_DELETED=TRUE with a DELETED_AT timestamp; clear the flag if the WAL
    table reappears.
+8. Optional — query-history lineage enrichment (enable_query_lineage=true).
+   Joins system.access.table_lineage to system.query.history to recover the
+   Sigma-tagged workbook/data-model that actually SELECTed each SIGDS table
+   in the last lineage_lookback_days, and MERGEs a LINEAGE_* column set into
+   SIGDS_WORKBOOK_MAP. Ground truth from live query activity, independent of
+   the WAL-write heuristic above — see sql/query_history_lineage.sql for the
+   standalone reference version and design rationale. Off by default because
+   it needs an extra grant (SELECT on the system.access / system.query
+   schemas) most existing deployments won't have yet; degrades loudly (WARN,
+   skip) rather than failing the run if that grant is missing.
 
 Design notes
 ------------
@@ -104,6 +114,12 @@ dbutils.widgets.text("max_wal_tables",  "0",  "0 = all; > 0 caps WAL tables for 
 dbutils.widgets.text("describe_workers", "16", "Thread-pool size for parallel DESCRIBE DETAIL")
 dbutils.widgets.text("wal_batch_size",  "100", "Max WAL tables per UNION ALL query")
 dbutils.widgets.text("use_tqdm",        "false", "Render tqdm progress bars in notebook output (UI)")
+dbutils.widgets.text("enable_query_lineage", "false",
+                      "Enable Phase 8 query-history lineage enrichment (needs system.access/system.query grants)")
+dbutils.widgets.text("lineage_lookback_days", "90",
+                      "Rolling window (days) reported in LINEAGE_* columns; also the first-run backfill depth")
+dbutils.widgets.text("lineage_overlap_hours", "6",
+                      "Re-scan buffer (hours) before the lineage watermark, to cover system-table landing latency")
 
 CATALOG        = dbutils.widgets.get("catalog").strip()
 SCAN_SCHEMA    = dbutils.widgets.get("scan_schema").strip()
@@ -116,6 +132,10 @@ MAX_WAL_TABLE_FQNS = int(dbutils.widgets.get("max_wal_tables"))
 DESCRIBE_WORKERS   = int(dbutils.widgets.get("describe_workers"))
 WAL_BATCH_SIZE     = int(dbutils.widgets.get("wal_batch_size"))
 USE_TQDM           = dbutils.widgets.get("use_tqdm").strip().lower() in ("1", "true", "yes")
+ENABLE_QUERY_LINEAGE  = dbutils.widgets.get("enable_query_lineage").strip().lower() in ("1", "true", "yes")
+LINEAGE_LOOKBACK_DAYS = int(dbutils.widgets.get("lineage_lookback_days"))
+LINEAGE_OVERLAP_HOURS = int(dbutils.widgets.get("lineage_overlap_hours"))
+LINEAGE_RAW_TABLE      = f"{CATALOG}.{MAP_SCHEMA}.SIGMA_QUERY_LINEAGE_RAW"
 
 _required = [
     ("catalog", CATALOG), ("scan_schema", SCAN_SCHEMA),
@@ -147,7 +167,7 @@ SIGMA_CLIENT_SECRET = dbutils.secrets.get(SECRET_SCOPE, "client_secret")
 # ===========================================================================
 # Progress reporting
 # ===========================================================================
-# The run has 7 phases. Each phase's log lines are prefixed "[Phase n/7] ...".
+# The run has 7 phases. Each phase's log lines are prefixed "[Phase n/8] ...".
 # Long-running steps (WAL batch extraction, parallel DESCRIBE DETAIL) also emit
 # an ASCII progress bar. These print() lines appear both in the CLI run logs and
 # in the notebook output. Set use_tqdm=true to additionally render tqdm bars in
@@ -338,6 +358,46 @@ MERGE_SCHEMA = StructType([
     StructField("API_OWNER_LAST_NAME",  StringType(),    True),
 ])
 
+# Query-history lineage enrichment columns (Phase 8, optional — see
+# enable_query_lineage). Kept out of MERGE_SCHEMA deliberately: they are
+# populated by a separate MERGE keyed the same way (SIGDS_TABLE + SCAN_SCHEMA),
+# recomputed from SIGMA_QUERY_LINEAGE_RAW (below) rather than from the per-run
+# WAL records assembled in Step 7, so folding them into MERGE_SCHEMA would
+# force every WAL record dict to also carry lineage keys it has no way to
+# produce yet.
+LINEAGE_COLUMNS = [
+    ("LINEAGE_SELECT_COUNT",            "BIGINT"),
+    ("LINEAGE_DISTINCT_QUERY_COUNT",     "BIGINT"),
+    ("LINEAGE_LAST_QUERIED_AT",          "TIMESTAMP"),
+    ("LINEAGE_LAST_QUERIED_OBJECT_URL",  "STRING"),
+    ("LINEAGE_LAST_QUERIED_OBJECT_KIND", "STRING"),
+    ("LINEAGE_LAST_QUERIED_OBJECT_ID",   "STRING"),
+    ("LINEAGE_LAST_QUERIED_BY_EMAIL",    "STRING"),
+    ("LINEAGE_TAG_STATUS",               "STRING"),
+    ("LINEAGE_REFRESHED_AT",             "TIMESTAMP"),
+]
+
+# SIGMA_QUERY_LINEAGE_RAW is the landing table for individual parsed lineage
+# rows (one per statement x source table), keyed by (SCAN_SCHEMA, SIGDS_TABLE,
+# STATEMENT_ID). It exists so Phase 8 only has to SCAN system.access.
+# table_lineage / system.query.history incrementally (from the watermark
+# below) rather than re-reading the whole lineage_lookback_days window from
+# those (potentially huge, metastore-wide) system tables on every run. The
+# LINEAGE_* summary columns on SIGDS_WORKBOOK_MAP are then recomputed from
+# this much smaller local table, which is cheap to re-scan in full every run.
+LINEAGE_RAW_COLUMNS = [
+    ("SCAN_SCHEMA",         "STRING"),
+    ("SIGDS_TABLE",         "STRING"),
+    ("STATEMENT_ID",        "STRING"),
+    ("EVENT_TIME",          "TIMESTAMP"),
+    ("SOURCE_URL",          "STRING"),
+    ("SOURCE_OBJECT_KIND",  "STRING"),
+    ("SOURCE_OBJECT_ID",    "STRING"),
+    ("SIGMA_USER_EMAIL",    "STRING"),
+    ("IS_TAGGED",           "BOOLEAN"),
+    ("LANDED_AT",           "TIMESTAMP"),
+]
+
 
 def ensure_target_table() -> bool:
     """
@@ -354,6 +414,19 @@ def ensure_target_table() -> bool:
     return not existed
 
 
+def ensure_lineage_raw_table() -> bool:
+    """
+    Create SIGMA_QUERY_LINEAGE_RAW (Phase 8's landing table) if it does not
+    already exist. Only called when enable_query_lineage=true. Idempotent —
+    a no-op when the table is already present. Returns True if it created it.
+    """
+    existed = spark.catalog.tableExists(LINEAGE_RAW_TABLE)
+    if not existed:
+        cols = ",\n  ".join(f"{n} {t}" for n, t in LINEAGE_RAW_COLUMNS)
+        spark.sql(f"CREATE TABLE IF NOT EXISTS {LINEAGE_RAW_TABLE} (\n  {cols}\n) USING DELTA")
+    return not existed
+
+
 # ===========================================================================
 # Main
 # ===========================================================================
@@ -362,16 +435,16 @@ def ensure_target_table() -> bool:
 # Step 1 — Authenticate with Sigma
 # ---------------------------------------------------------------------------
 sigma_token = get_sigma_token(SESSION, SIGMA_API_BASE, SIGMA_CLIENT_ID, SIGMA_CLIENT_SECRET)
-print("[Phase 1/7] Sigma token obtained.")
+print("[Phase 1/8] Sigma token obtained.")
 
 # Ensure the target table exists before we read from it. Idempotent — created
 # from MERGE_SCHEMA on first run, a no-op thereafter. Removes the need to run
 # sql/create_sigds_workbook_map.sql by hand. (Keep for_each concurrency at 1 on
 # the very first run so iterations don't race to create the same table.)
 if ensure_target_table():
-    print(f"[Phase 1/7] Created {TARGET_TABLE} (first run).")
+    print(f"[Phase 1/8] Created {TARGET_TABLE} (first run).")
 else:
-    print(f"[Phase 1/7] Target table {TARGET_TABLE} already exists.")
+    print(f"[Phase 1/8] Target table {TARGET_TABLE} already exists.")
 
 # ---------------------------------------------------------------------------
 # Step 2 — Load stored watermarks, known WORKBOOK_IDs, and enrichment cache
@@ -432,7 +505,7 @@ for row in stored_rows:
             known_non_orphaned_sigds.add(st)
 
 print(
-    f"[Phase 2/7] Loaded watermarks for {len(watermarks)} WAL tables (schema={SCAN_SCHEMA}); "
+    f"[Phase 2/8] Loaded watermarks for {len(watermarks)} WAL tables (schema={SCAN_SCHEMA}); "
     f"{len(known_wb_ids)} WORKBOOK_IDs already enriched (all schemas); "
     f"{len(previously_deleted_wals)} previously flagged as deleted; "
     f"{len(known_orphaned_sigds)} previously flagged as orphaned."
@@ -462,18 +535,18 @@ if MAX_WAL_TABLE_FQNS == 0:
     newly_deleted_wals = known_wal_tables - all_wal_set        # in map, gone from schema
     reappeared_wals    = previously_deleted_wals & all_wal_set # was deleted, now back
     if newly_deleted_wals:
-        print(f"[Phase 3/7] {len(newly_deleted_wals)} WAL table(s) no longer in schema — will be flagged as deleted:")
+        print(f"[Phase 3/8] {len(newly_deleted_wals)} WAL table(s) no longer in schema — will be flagged as deleted:")
         for w in sorted(newly_deleted_wals):
             print(f"  {w}")
     if reappeared_wals:
-        print(f"[Phase 3/7] {len(reappeared_wals)} previously deleted WAL table(s) have reappeared — deletion flag will be cleared.")
+        print(f"[Phase 3/8] {len(reappeared_wals)} previously deleted WAL table(s) have reappeared — deletion flag will be cleared.")
 else:
     newly_deleted_wals = set()
     reappeared_wals    = set()
-    print("[Phase 3/7] Deletion detection skipped (MAX_WAL_TABLE_FQNS is set — full WAL list not available).")
+    print("[Phase 3/8] Deletion detection skipped (MAX_WAL_TABLE_FQNS is set — full WAL list not available).")
 
 print(
-    f"[Phase 3/7] Discovered {len(all_wal_names)} WAL tables. "
+    f"[Phase 3/8] Discovered {len(all_wal_names)} WAL tables. "
     f"Running parallel DESCRIBE DETAIL to check for changes..."
 )
 wal_modified = parallel_wal_last_modified(all_wal_names)
@@ -486,7 +559,7 @@ to_process = [
 ]
 
 print(
-    f"[Phase 3/7] {len(to_process)} WAL tables require reprocessing; "
+    f"[Phase 3/8] {len(to_process)} WAL tables require reprocessing; "
     f"{len(all_wal_names) - len(to_process)} unchanged and skipped."
 )
 
@@ -495,7 +568,7 @@ if not to_process and not newly_deleted_wals and not reappeared_wals:
         # Capped run — orphan checks on existing records are unreliable, so exit.
         print("SIGDS_WORKBOOK_MAP is already up to date. Nothing to do.")
         raise SystemExit(0)
-    print("[Phase 3/7] No WAL changes — proceeding to check existing records for orphan status changes.")
+    print("[Phase 3/8] No WAL changes — proceeding to check existing records for orphan status changes.")
 
 # ---------------------------------------------------------------------------
 # Step 4 — Extract latest WAL records for changed tables (batched UNION ALL)
@@ -512,12 +585,12 @@ for idx, batch in enumerate(batches, start=1):
     print(f"  Extracting WAL batches {bar(idx, len(batches))} (this batch: {len(batch)} tables)")
     new_records.extend(extract_wal_records_batch(batch))
 
-print(f"[Phase 4/7] Extracted {len(new_records)} new/updated SIGDS table records.")
+print(f"[Phase 4/8] Extracted {len(new_records)} new/updated SIGDS table records.")
 
 # Deduplicate by SIGDS_TABLE (the MERGE key), keeping the highest WAL_MAX_EDIT_NUM
 # (see core.dedup_latest_by_edit_num for the why — old vs DS_ID WAL naming).
 new_records = dedup_latest_by_edit_num(new_records)
-print(f"[Phase 4/7] {len(new_records)} unique SIGDS tables after deduplication.")
+print(f"[Phase 4/8] {len(new_records)} unique SIGDS tables after deduplication.")
 
 # ---------------------------------------------------------------------------
 # Step 5 — DESCRIBE DETAIL (parallel) for each new/updated SIGDS table
@@ -535,16 +608,16 @@ orphaned_tables  = {t for t in all_sigds_names if t.lower() not in existing_tabl
 sigds_bare_names = [t for t in all_sigds_names if t.lower() in existing_tables]
 
 if orphaned_tables:
-    print(f"[Phase 5/7] {len(orphaned_tables)} orphaned WAL record(s) — SIGDS table not found in schema:")
+    print(f"[Phase 5/8] {len(orphaned_tables)} orphaned WAL record(s) — SIGDS table not found in schema:")
     for t in sorted(orphaned_tables):
         print(f"  {t}")
 
 print(
-    f"[Phase 5/7] Running DESCRIBE DETAIL on {len(sigds_bare_names)} SIGDS tables "
+    f"[Phase 5/8] Running DESCRIBE DETAIL on {len(sigds_bare_names)} SIGDS tables "
     f"using {DESCRIBE_WORKERS} workers..."
 )
 detail_map = parallel_describe_sigds(sigds_bare_names)
-print(f"[Phase 5/7] DESCRIBE DETAIL complete. {len(sigds_bare_names)} valid, {len(orphaned_tables)} orphaned.")
+print(f"[Phase 5/8] DESCRIBE DETAIL complete. {len(sigds_bare_names)} valid, {len(orphaned_tables)} orphaned.")
 
 # When running a full scan (MAX_WAL_TABLE_FQNS == 0), also check existing records
 # in the map that were not part of this run's WAL changes.
@@ -559,15 +632,15 @@ if MAX_WAL_TABLE_FQNS == 0:
         if t.lower() in existing_tables and t not in new_record_sigds
     }
     if newly_orphaned_existing:
-        print(f"[Phase 5/7] {len(newly_orphaned_existing)} existing record(s) newly orphaned:")
+        print(f"[Phase 5/8] {len(newly_orphaned_existing)} existing record(s) newly orphaned:")
         for t in sorted(newly_orphaned_existing):
             print(f"  {t}")
     if recovered_existing:
-        print(f"[Phase 5/7] {len(recovered_existing)} previously orphaned record(s) have recovered.")
+        print(f"[Phase 5/8] {len(recovered_existing)} previously orphaned record(s) have recovered.")
 else:
     newly_orphaned_existing = set()
     recovered_existing      = set()
-    print("[Phase 5/7] Orphan check for existing records skipped (MAX_WAL_TABLE_FQNS is set).")
+    print("[Phase 5/8] Orphan check for existing records skipped (MAX_WAL_TABLE_FQNS is set).")
 
 # ---------------------------------------------------------------------------
 # Step 6 — Sigma API enrichment (new IDs) + archive status refresh (all IDs)
@@ -588,12 +661,12 @@ all_wb_ids_to_check = new_wb_ids | known_wb_ids
 
 if all_wb_ids_to_check:
     print(
-        f"[Phase 6/7] Fetching Sigma workbook/data-model list "
+        f"[Phase 6/8] Fetching Sigma workbook/data-model list "
         f"({len(new_wb_ids)} new enrichment, {len(known_wb_ids)} archive re-check)..."
     )
     workbooks  = sigma_paginate(SESSION, SIGMA_API_BASE, sigma_token,"workbooks")
     datamodels = sigma_paginate(SESSION, SIGMA_API_BASE, sigma_token,"dataModels")
-    print(f"[Phase 6/7] Sigma API returned {len(workbooks)} workbook(s), {len(datamodels)} data model(s).")
+    print(f"[Phase 6/8] Sigma API returned {len(workbooks)} workbook(s), {len(datamodels)} data model(s).")
     wb_index = build_id_index(workbooks,  all_wb_ids_to_check)
     dm_index = build_id_index(datamodels, all_wb_ids_to_check)
 
@@ -601,7 +674,7 @@ if all_wb_ids_to_check:
     # taggedWorkbookId values found in WAL records can be resolved
     # back to their parent workbook metadata.
     all_tags = sigma_paginate(SESSION, SIGMA_API_BASE, sigma_token,"tags")
-    print(f"[Phase 6/7] Sigma API returned {len(all_tags)} version tag(s).")
+    print(f"[Phase 6/8] Sigma API returned {len(all_tags)} version tag(s).")
     tagged_wb_index = {}   # {taggedWorkbookId.lower() -> parent/tag info}
     for tag in all_tags:
         tag_id   = tag.get("versionTagId")
@@ -621,7 +694,7 @@ if all_wb_ids_to_check:
                         "workbook_url":       wb.get("url"),
                         "ownerId":            wb.get("ownerId"),
                     }
-    print(f"[Phase 6/7] Built tagged workbook index with {len(tagged_wb_index)} entry(ies).")
+    print(f"[Phase 6/8] Built tagged workbook index with {len(tagged_wb_index)} entry(ies).")
 
     # Full enrichment for newly-seen WORKBOOK_IDs.
     for wid in new_wb_ids:
@@ -666,9 +739,9 @@ if all_wb_ids_to_check:
     # Resolve owner display names for new IDs via /v2/members.
     owner_ids = {m["API_OWNER_ID"] for m in wb_meta.values() if m.get("API_OWNER_ID")}
     if owner_ids:
-        print(f"[Phase 6/7] Fetching Sigma members to resolve {len(owner_ids)} owner ID(s)...")
+        print(f"[Phase 6/8] Fetching Sigma members to resolve {len(owner_ids)} owner ID(s)...")
         all_members  = sigma_paginate(SESSION, SIGMA_API_BASE, sigma_token,"members")
-        print(f"[Phase 6/7] Sigma API returned {len(all_members)} member(s).")
+        print(f"[Phase 6/8] Sigma API returned {len(all_members)} member(s).")
         member_index = {
             m["memberId"].strip().lower(): m
             for m in all_members
@@ -682,7 +755,7 @@ if all_wb_ids_to_check:
                 meta["API_OWNER_LAST_NAME"]  = member.get("lastName")
 
     if new_wb_ids:
-        print(f"[Phase 6/7] Resolved {len(wb_meta)} of {len(new_wb_ids)} new WORKBOOK_IDs.")
+        print(f"[Phase 6/8] Resolved {len(wb_meta)} of {len(new_wb_ids)} new WORKBOOK_IDs.")
 
     # Archive status re-check for all existing WORKBOOK_IDs.
     # Only update when the API explicitly provides an archived state:
@@ -716,11 +789,11 @@ if all_wb_ids_to_check:
             archive_updates[wid] = current_archived
 
     if archive_updates:
-        print(f"[Phase 6/7] Archive status changed for {len(archive_updates)} existing WORKBOOK_ID(s).")
+        print(f"[Phase 6/8] Archive status changed for {len(archive_updates)} existing WORKBOOK_ID(s).")
     else:
-        print("[Phase 6/7] No archive status changes detected.")
+        print("[Phase 6/8] No archive status changes detected.")
 else:
-    print("[Phase 6/7] No WORKBOOK_IDs to process — Sigma API fetch skipped.")
+    print("[Phase 6/8] No WORKBOOK_IDs to process — Sigma API fetch skipped.")
 
 # ---------------------------------------------------------------------------
 # Step 7 — Assemble rows and MERGE into SIGDS_WORKBOOK_MAP
@@ -785,19 +858,30 @@ if records_out:
     rows = [tuple(d[name] for name in field_names) for d in records_out]
     updates_df = spark.createDataFrame(rows, MERGE_SCHEMA)
     updates_df.createOrReplaceTempView("_SIGDS_UPDATES")
+    # Explicit column lists, not UPDATE SET * / INSERT *: Delta's star-merge
+    # requires every TARGET column to be resolvable from the source, so it
+    # breaks the moment TARGET_TABLE gains a column this MERGE doesn't supply
+    # (e.g. Phase 8's LINEAGE_* columns, added via ALTER TABLE ADD COLUMNS).
+    # Listing columns explicitly from field_names (MERGE_SCHEMA, the single
+    # source of truth) leaves any such extra column untouched on UPDATE and
+    # NULL on INSERT — exactly what should happen for a column a later phase
+    # owns.
+    update_set_clause = ", ".join(f"t.{name} = s.{name}" for name in field_names)
+    insert_cols        = ", ".join(field_names)
+    insert_vals        = ", ".join(f"s.{name}" for name in field_names)
     spark.sql(f"""
         MERGE INTO {TARGET_TABLE} AS t
         USING _SIGDS_UPDATES AS s
           ON  t.SIGDS_TABLE    = s.SIGDS_TABLE
           AND t.SCAN_SCHEMA    = s.SCAN_SCHEMA
         WHEN MATCHED THEN
-            UPDATE SET *
+            UPDATE SET {update_set_clause}
         WHEN NOT MATCHED THEN
-            INSERT *
+            INSERT ({insert_cols}) VALUES ({insert_vals})
     """)
-    print(f"[Phase 7/7] MERGE complete — {len(rows)} rows upserted into {TARGET_TABLE}.")
+    print(f"[Phase 7/8] MERGE complete — {len(rows)} rows upserted into {TARGET_TABLE}.")
 else:
-    print("[Phase 7/7] No WAL changes — MERGE skipped.")
+    print("[Phase 7/8] No WAL changes — MERGE skipped.")
 
 # Flag records whose WAL table has disappeared since the last run.
 if newly_deleted_wals:
@@ -810,7 +894,7 @@ if newly_deleted_wals:
           AND  WAL_TABLE_FQN IN ({wal_csv})
           AND  (IS_DELETED IS NULL OR IS_DELETED = FALSE)
     """)
-    print(f"[Phase 7/7] Flagged {len(newly_deleted_wals)} record(s) as deleted.")
+    print(f"[Phase 7/8] Flagged {len(newly_deleted_wals)} record(s) as deleted.")
 
 # Apply archive status changes for existing WORKBOOK_IDs.
 if archive_updates:
@@ -819,11 +903,11 @@ if archive_updates:
     if newly_archived:
         wid_csv = ", ".join(f"'{w}'" for w in newly_archived)
         spark.sql(f"UPDATE {TARGET_TABLE} SET API_IS_ARCHIVED = TRUE  WHERE WORKBOOK_ID IN ({wid_csv})")
-        print(f"[Phase 7/7] Marked {len(newly_archived)} workbook(s) as archived.")
+        print(f"[Phase 7/8] Marked {len(newly_archived)} workbook(s) as archived.")
     if newly_unarchived:
         wid_csv = ", ".join(f"'{w}'" for w in newly_unarchived)
         spark.sql(f"UPDATE {TARGET_TABLE} SET API_IS_ARCHIVED = FALSE WHERE WORKBOOK_ID IN ({wid_csv})")
-        print(f"[Phase 7/7] Marked {len(newly_unarchived)} workbook(s) as unarchived.")
+        print(f"[Phase 7/8] Marked {len(newly_unarchived)} workbook(s) as unarchived.")
 
 # Update IS_ORPHANED for existing records not covered by the MERGE.
 if newly_orphaned_existing:
@@ -834,7 +918,7 @@ if newly_orphaned_existing:
         WHERE  SCAN_SCHEMA = '{SCAN_SCHEMA}'
           AND  SIGDS_TABLE IN ({sigds_csv})
     """)
-    print(f"[Phase 7/7] Marked {len(newly_orphaned_existing)} existing record(s) as orphaned.")
+    print(f"[Phase 7/8] Marked {len(newly_orphaned_existing)} existing record(s) as orphaned.")
 
 if recovered_existing:
     sigds_csv = ", ".join(f"'{t}'" for t in recovered_existing)
@@ -844,7 +928,7 @@ if recovered_existing:
         WHERE  SCAN_SCHEMA = '{SCAN_SCHEMA}'
           AND  SIGDS_TABLE IN ({sigds_csv})
     """)
-    print(f"[Phase 7/7] Cleared orphan flag for {len(recovered_existing)} recovered record(s).")
+    print(f"[Phase 7/8] Cleared orphan flag for {len(recovered_existing)} recovered record(s).")
 
 # Clear the deletion flag for WAL tables that have reappeared.
 if reappeared_wals:
@@ -856,7 +940,223 @@ if reappeared_wals:
         WHERE  SCAN_SCHEMA    = '{SCAN_SCHEMA}'
           AND  WAL_TABLE_FQN IN ({wal_csv})
     """)
-    print(f"[Phase 7/7] Cleared deletion flag for {len(reappeared_wals)} reappeared record(s).")
+    print(f"[Phase 7/8] Cleared deletion flag for {len(reappeared_wals)} reappeared record(s).")
+
+# ---------------------------------------------------------------------------
+# Step 8 (optional) — query-history lineage enrichment
+# ---------------------------------------------------------------------------
+# Ground-truth signal from Unity Catalog system tables: joins
+# system.access.table_lineage to system.query.history on statement_id and
+# parses the Sigma-issued "-- Sigma Σ {...}" comment tag out of the recovered
+# statement text, to find which workbook/data model actually SELECTed each
+# SIGDS table in the lookback window. This is independent of (and can
+# disagree with) the WAL-write heuristic the rest of this notebook relies on
+# — see sql/query_history_lineage.sql for the standalone reference version,
+# design rationale, and caveats (retention, tagging coverage, per-metastore
+# scope). Off by default: it needs SELECT granted on the system.access/
+# system.query schemas, an extra grant most existing deployments won't have.
+#
+# Incremental, watermarked scan (mirrors sigma_org_audit's
+# sigma_query_history_scan proc): the first run per SCAN_SCHEMA backfills
+# lineage_lookback_days; every later run resumes only from the latest
+# EVENT_TIME already landed for that schema, minus lineage_overlap_hours to
+# cover system-table landing latency — so it never re-reads the whole window
+# from system.access.table_lineage / system.query.history on every run. Raw
+# per-statement rows land in SIGMA_QUERY_LINEAGE_RAW (deduped by
+# (SCAN_SCHEMA, SIGDS_TABLE, STATEMENT_ID) so the overlap re-scan doesn't
+# double-land); the LINEAGE_* summary on SIGDS_WORKBOOK_MAP is then recomputed
+# from that much smaller local table, filtered back down to
+# lineage_lookback_days, which is cheap to fully re-scan every run.
+if ENABLE_QUERY_LINEAGE:
+    try:
+        print(f"[Phase 8/8] Query-history lineage enrichment enabled "
+              f"(window={LINEAGE_LOOKBACK_DAYS}d, overlap={LINEAGE_OVERLAP_HOURS}h). "
+              f"Checking system table access...")
+        spark.sql("SELECT 1 FROM system.access.table_lineage LIMIT 1").collect()
+        spark.sql("SELECT 1 FROM system.query.history LIMIT 1").collect()
+
+        # Add enrichment columns to SIGDS_WORKBOOK_MAP if this table predates
+        # Phase 8 (metadata-only, safe to repeat every run).
+        existing_cols = {f.name for f in spark.table(TARGET_TABLE).schema.fields}
+        missing_cols = [(n, t) for n, t in LINEAGE_COLUMNS if n not in existing_cols]
+        if missing_cols:
+            cols_ddl = ", ".join(f"{n} {t}" for n, t in missing_cols)
+            spark.sql(f"ALTER TABLE {TARGET_TABLE} ADD COLUMNS ({cols_ddl})")
+            print(f"[Phase 8/8] Added {len(missing_cols)} lineage column(s) to {TARGET_TABLE}.")
+        if ensure_lineage_raw_table():
+            print(f"[Phase 8/8] Created {LINEAGE_RAW_TABLE} (first run).")
+
+        # --- Watermark: resume from the latest EVENT_TIME already landed for
+        #     THIS scan schema; first run for a schema backfills the full
+        #     lookback window. Scoped per SCAN_SCHEMA, same convention as the
+        #     WAL/orphan tracking above, so scanning one schema never assumes
+        #     another schema's watermark. -------------------------------------
+        watermark_row = spark.sql(f"""
+            SELECT MAX(EVENT_TIME) AS WM FROM {LINEAGE_RAW_TABLE}
+            WHERE SCAN_SCHEMA = '{SCAN_SCHEMA}'
+        """).collect()
+        watermark = watermark_row[0]["WM"] if watermark_row else None
+        if watermark is None:
+            since_sql = f"(CURRENT_TIMESTAMP() - INTERVAL {LINEAGE_LOOKBACK_DAYS} DAYS)"
+            print(f"[Phase 8/8] No prior lineage watermark for schema={SCAN_SCHEMA} — "
+                  f"backfilling {LINEAGE_LOOKBACK_DAYS}d.")
+        else:
+            since_sql = f"(TIMESTAMP('{watermark.isoformat()}') - INTERVAL {LINEAGE_OVERLAP_HOURS} HOURS)"
+            print(f"[Phase 8/8] Resuming lineage scan for schema={SCAN_SCHEMA} from "
+                  f"{watermark.isoformat()} (-{LINEAGE_OVERLAP_HOURS}h overlap).")
+
+        # --- Land: parse the incremental delta only, then MERGE into the raw
+        #     table so overlap-rescanned rows (same STATEMENT_ID + SIGDS_TABLE)
+        #     don't double-land. --------------------------------------------
+        landing_sql = rf"""
+            WITH tagged AS (
+                SELECT
+                    tl.event_time, tl.statement_id, tl.source_table_schema,
+                    -- NOT upper()'d: SIGDS_WORKBOOK_MAP.SIGDS_TABLE keeps its
+                    -- original mixed case (as Sigma named the Delta table),
+                    -- and Delta string comparison is case-sensitive -- the
+                    -- MERGE join below silently matches zero rows otherwise.
+                    tl.source_table_name AS SIGDS_TABLE,
+                    -- NULLIF: regexp_extract returns '' (not NULL) on no match,
+                    -- which would otherwise make every downstream NULL-check
+                    -- (IS_TAGGED, get_json_object, the split below) silently
+                    -- wrong for untagged rows.
+                    NULLIF(regexp_extract(qh.statement_text, 'Sigma\\s+Σ\\s+(\\{{.*\\}})', 1), '') AS sigma_tag_json
+                FROM system.access.table_lineage tl
+                LEFT JOIN system.query.history qh
+                  ON tl.statement_id = qh.statement_id
+                WHERE tl.event_date >= to_date({since_sql})
+                  AND tl.event_time >= {since_sql}
+                  -- lower(): system.access.table_lineage reports Unity
+                  -- Catalog identifiers in lowercase regardless of the case
+                  -- used at creation; SCAN_SCHEMA is a free-typed job param.
+                  AND lower(tl.source_table_schema) = lower('{SCAN_SCHEMA}')
+                  AND tl.source_type = 'TABLE'
+                  AND qh.statement_type = 'SELECT'
+            ),
+            parsed AS (
+                SELECT *,
+                    get_json_object(sigma_tag_json, '$.sourceUrl') AS source_url,
+                    get_json_object(sigma_tag_json, '$.email')     AS sigma_user_email
+                FROM tagged
+            ),
+            with_path AS (
+                SELECT *,
+                    -- get(array, idx), not array[idx]: under ANSI SQL mode,
+                    -- [idx] THROWS on out-of-bounds access (e.g. splitting a
+                    -- /workbook/ URL on '/data-model/' yields a 1-element
+                    -- array, and [1] on that errors) rather than returning
+                    -- NULL. get() stays NULL-safe regardless of ANSI mode.
+                    get(split(
+                        coalesce(get(split(source_url, '/data-model/'), 1),
+                                 get(split(source_url, '/workbook/'), 1)),
+                        '\\?'
+                    ), 0) AS source_path_segment,
+                    CASE WHEN source_url LIKE '%/data-model/%' THEN 'DATA_MODEL'
+                         WHEN source_url LIKE '%/workbook/%'    THEN 'WORKBOOK'
+                         ELSE NULL END AS source_object_kind
+                FROM parsed
+            )
+            SELECT
+                source_table_schema                                    AS SCAN_SCHEMA,
+                SIGDS_TABLE,
+                statement_id                                           AS STATEMENT_ID,
+                event_time                                             AS EVENT_TIME,
+                source_url                                             AS SOURCE_URL,
+                source_object_kind                                     AS SOURCE_OBJECT_KIND,
+                -- Explicit capture group + idx=1: regexp_extract's default
+                -- idx is 1 (expects a capturing group to exist), unlike
+                -- Snowflake's REGEXP_SUBSTR this was ported from.
+                regexp_extract(source_path_segment, '([^-]+)$', 1)     AS SOURCE_OBJECT_ID,
+                sigma_user_email                                       AS SIGMA_USER_EMAIL,
+                sigma_tag_json IS NOT NULL                             AS IS_TAGGED,
+                current_timestamp()                                    AS LANDED_AT
+            FROM with_path
+        """
+        landing_df = spark.sql(landing_sql)
+        landing_df.createOrReplaceTempView("_SIGMA_LINEAGE_DELTA")
+        n_delta = landing_df.count()
+        spark.sql(f"""
+            MERGE INTO {LINEAGE_RAW_TABLE} AS t
+            USING _SIGMA_LINEAGE_DELTA AS s
+              ON  t.SCAN_SCHEMA  = s.SCAN_SCHEMA
+              AND t.SIGDS_TABLE  = s.SIGDS_TABLE
+              AND t.STATEMENT_ID = s.STATEMENT_ID
+            WHEN NOT MATCHED THEN INSERT *
+        """)
+        print(f"[Phase 8/8] Landed {n_delta} lineage row(s) from the incremental scan "
+              f"(overlap-duplicate rows are ignored by the MERGE).")
+
+        # Bound SIGMA_QUERY_LINEAGE_RAW's growth — nothing older than the
+        # lookback + overlap window is ever read by the summary recompute
+        # below, so prune it rather than retaining it indefinitely.
+        spark.sql(f"""
+            DELETE FROM {LINEAGE_RAW_TABLE}
+            WHERE SCAN_SCHEMA = '{SCAN_SCHEMA}'
+              AND EVENT_TIME < CURRENT_TIMESTAMP()
+                               - INTERVAL {LINEAGE_LOOKBACK_DAYS} DAYS
+                               - INTERVAL {LINEAGE_OVERLAP_HOURS} HOURS
+        """)
+
+        # --- Recompute the rolling lineage_lookback_days summary from the raw
+        #     landing table (small/local — cheap to fully re-scan every run)
+        #     and MERGE it into SIGDS_WORKBOOK_MAP. ----------------------------
+        summary_sql = f"""
+            SELECT
+                SCAN_SCHEMA,
+                SIGDS_TABLE,
+                COUNT(*)                                                     AS LINEAGE_SELECT_COUNT,
+                COUNT(DISTINCT STATEMENT_ID)                                 AS LINEAGE_DISTINCT_QUERY_COUNT,
+                MAX(EVENT_TIME)                                              AS LINEAGE_LAST_QUERIED_AT,
+                max_by(SOURCE_URL, EVENT_TIME)                               AS LINEAGE_LAST_QUERIED_OBJECT_URL,
+                max_by(SOURCE_OBJECT_KIND, EVENT_TIME)                       AS LINEAGE_LAST_QUERIED_OBJECT_KIND,
+                max_by(SOURCE_OBJECT_ID, EVENT_TIME)                        AS LINEAGE_LAST_QUERIED_OBJECT_ID,
+                max_by(SIGMA_USER_EMAIL, EVENT_TIME)                        AS LINEAGE_LAST_QUERIED_BY_EMAIL,
+                CASE WHEN SUM(CASE WHEN IS_TAGGED THEN 1 ELSE 0 END) > 0
+                     THEN 'query_history' ELSE 'query_history_untagged' END AS LINEAGE_TAG_STATUS,
+                current_timestamp()                                          AS LINEAGE_REFRESHED_AT
+            FROM {LINEAGE_RAW_TABLE}
+            WHERE SCAN_SCHEMA = '{SCAN_SCHEMA}'
+              AND EVENT_TIME >= CURRENT_TIMESTAMP() - INTERVAL {LINEAGE_LOOKBACK_DAYS} DAYS
+            GROUP BY SCAN_SCHEMA, SIGDS_TABLE
+        """
+        lineage_df = spark.sql(summary_sql)
+        lineage_df.createOrReplaceTempView("_SIGMA_LINEAGE_SUMMARY")
+        n_lineage = lineage_df.count()
+
+        # Reset this schema's lineage columns first — the summary is always a
+        # full recompute of the rolling window (even though the underlying
+        # scan is incremental), so a table with no SELECTs in the window must
+        # show zero/NULL rather than retain a stale count (MERGE below only
+        # touches matched rows).
+        reset_set = ", ".join(
+            f"{n} = " + ("current_timestamp()" if n == "LINEAGE_REFRESHED_AT"
+                          else ("0" if t == "BIGINT" else "NULL"))
+            for n, t in LINEAGE_COLUMNS
+        )
+        spark.sql(f"UPDATE {TARGET_TABLE} SET {reset_set} WHERE SCAN_SCHEMA = '{SCAN_SCHEMA}'")
+
+        set_clause = ", ".join(f"t.{n} = s.{n}" for n, _ in LINEAGE_COLUMNS)
+        spark.sql(f"""
+            MERGE INTO {TARGET_TABLE} AS t
+            USING _SIGMA_LINEAGE_SUMMARY AS s
+              -- upper(): system.access.table_lineage's source_table_name (the
+              -- basis for SIGDS_TABLE in the raw/summary tables) comes back
+              -- all-lowercase from Unity Catalog, while SIGDS_WORKBOOK_MAP
+              -- keeps Sigma's original mixed-case table name -- a plain `=`
+              -- here silently matches zero rows.
+              ON  upper(t.SIGDS_TABLE) = upper(s.SIGDS_TABLE)
+              AND upper(t.SCAN_SCHEMA) = upper(s.SCAN_SCHEMA)
+            WHEN MATCHED THEN UPDATE SET {set_clause}
+        """)
+        print(f"[Phase 8/8] Query-history lineage MERGE complete — {n_lineage} SIGDS table(s) "
+              f"with SELECT activity in the last {LINEAGE_LOOKBACK_DAYS}d.")
+    except Exception as exc:
+        print(f"[Phase 8/8] SKIPPED — query-history lineage enrichment failed, likely a missing "
+              f"SELECT grant on system.access.table_lineage / system.query.history "
+              f"(enable system tables + grant, or leave enable_query_lineage=false): {exc}")
+else:
+    print("[Phase 8/8] Query-history lineage enrichment disabled (enable_query_lineage=false).")
 
 # Sanity check — show most recently modified entries
 spark.sql(f"""

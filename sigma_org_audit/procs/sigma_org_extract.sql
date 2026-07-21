@@ -51,6 +51,10 @@
 --     per-connection detail fetch (GET /v2/connections/{id}) which is the only
 --     place the writeback / input-table-WAL schema locations are exposed. Those
 --     detail rows drive sigma_writeback_scan.
+--   - Per-workbook/data-model /lineage is fetched in addition to /sources and
+--     the data-model detail: those only carry {inodeId, type} or bare metadata,
+--     while /lineage is the only endpoint exposing the connectionId + physical
+--     source name needed for source-binding and deployability analysis (9c8.4).
 -- ==============================================================================
 
 CREATE OR REPLACE PROCEDURE sigma_org_extract(
@@ -362,6 +366,31 @@ def main(session, target_database, target_schema, target_table,
     counts["workbook_sources"] = src_ok
     log("workbook sources", f"{src_ok}/{len(workbooks)}")
 
+    # --- 3b) Per-workbook lineage (source-binding truth: connectionId + physical
+    # name per source node) -----------------------------------------------------
+    # workbook_sources only carries {inodeId, type}; the connection binding and
+    # physical table/view name needed for deployability analysis (9c8.4) are ONLY
+    # exposed by /lineage. Element nodes (type='element') are included as-is --
+    # the stage layer filters them out; this raw type stays a faithful mirror.
+    def fetch_workbook_lineage(wb):
+        wb_id = RawCollector._extract_id("workbook", wb)
+        try:
+            entries = list_paginated(token_mgr, f"/v2/workbooks/{wb_id}/lineage")
+            return wb_id, {"workbookId": wb_id, "entries": entries}, None
+        except requests.HTTPError as e:
+            return wb_id, None, str(e)
+
+    wb_lineage_ok = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(fetch_workbook_lineage, wb) for wb in workbooks]
+        for f in as_completed(futures):
+            wb_id, payload, err = f.result()
+            if payload is not None:
+                collector.add("workbook_lineage", payload, object_id=wb_id)
+                wb_lineage_ok += 1
+    counts["workbook_lineage"] = wb_lineage_ok
+    log("workbook lineage", f"{wb_lineage_ok}/{len(workbooks)}")
+
     # --- 4) Per-data-model detail (full spec/metadata) -------------------------
     def fetch_datamodel_detail(dm):
         dm_id = RawCollector._extract_id("datamodel", dm)
@@ -380,6 +409,29 @@ def main(session, target_database, target_schema, target_table,
                 dm_ok += 1
     counts["datamodel_detail"] = dm_ok
     log("datamodel details", f"{dm_ok}/{len(datamodels)}")
+
+    # --- 4b) Per-data-model lineage (source-binding truth, mirrors 3b) ---------
+    # datamodel_detail is metadata only (name/owner/version) -- no source binding.
+    # /lineage is the only endpoint exposing connectionId + physical name per
+    # source node for data models too.
+    def fetch_datamodel_lineage(dm):
+        dm_id = RawCollector._extract_id("datamodel", dm)
+        try:
+            entries = list_paginated(token_mgr, f"/v2/dataModels/{dm_id}/lineage")
+            return dm_id, {"dataModelId": dm_id, "entries": entries}, None
+        except requests.HTTPError as e:
+            return dm_id, None, str(e)
+
+    dm_lineage_ok = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(fetch_datamodel_lineage, dm) for dm in datamodels]
+        for f in as_completed(futures):
+            dm_id, payload, err = f.result()
+            if payload is not None:
+                collector.add("datamodel_lineage", payload, object_id=dm_id)
+                dm_lineage_ok += 1
+    counts["datamodel_lineage"] = dm_lineage_ok
+    log("datamodel lineage", f"{dm_lineage_ok}/{len(datamodels)}")
 
     # --- 5) Per-artifact grants (optional) -------------------------------------
     if include_grants:

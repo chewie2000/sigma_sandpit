@@ -6,6 +6,37 @@ A Databricks toolkit for inventorying and monitoring Sigma writeback (input tabl
 
 When Sigma writebacks are enabled, Sigma creates a WAL table (`sigds_wal_*`) and a data table (`sigds_*`) in Databricks for each input table. Over time these accumulate — workbooks get archived, tables go stale, and orphaned WAL records are left behind. This toolkit provides visibility into that state so administrators can identify cleanup candidates and track the migration of writeback workbooks.
 
+## Safe Archival of SIGDS and WAL Tables
+
+**Read this before you act on anything this toolkit reports.** Everything else
+in this README — the inventory, the scoring, the lineage cross-checks — exists
+to feed this process safely. Getting archival wrong is not a minor mistake:
+
+> **Incorrectly removing a SIGDS or WAL table can cause irreparable, immediate
+> damage to the related Sigma content, and if the table was dropped rather
+> than moved, it may not be recoverable at all.**
+
+Sigma stores the exact fully-qualified table name of both the SIGDS data table and the WAL table in its internal metadata. When Sigma looks up an input table it searches for a table matching the exact `SIGDS_<uuid>` identifier in the writeback schema configured on the connection. If the table has been dropped or renamed, workbooks will immediately fail with errors such as:
+
+```
+Object '<DB>.<SCHEMA>."SIGDS_WAL_xxx"' does not exist or not authorized
+```
+
+This applies equally to the WAL table — Sigma holds the WAL table name in its metadata and requires an exact match.
+
+> **Best practice: move first, delete later — never drop directly.**
+
+### Recommended process
+
+1. **Identify candidates** using `geninfo_queries.sql` or `archival_scoring.sql` (archived, orphaned, or stale records) — see [Analysis Queries](#analysis-queries) and [Archival Scoring](#archival-scoring-archival_scoringsql) below.
+2. **Move** the SIGDS and WAL tables to a quarantine schema (e.g. `<SCHEMA>_quarantine`) using `ALTER TABLE ... RENAME TO`. Do not drop them yet.
+3. **Monitor** for a safe period (recommended: 30 days minimum) to confirm no workbook errors are raised and no users report missing data.
+4. **Drop** the tables from the quarantine schema once the safe period has passed.
+
+### Why this matters
+
+If a table is moved or renamed rather than dropped outright, recovery is straightforward — rename the table back to its original location (`<CATALOG>.<SCHEMA>.<SIGDS_TABLE_NAME>`) and the workbook resumes functioning immediately. A direct `DROP TABLE` is irreversible and eliminates this recovery path.
+
 ## Files
 
 | File | Purpose |
@@ -18,6 +49,9 @@ When Sigma writebacks are enabled, Sigma creates a WAL table (`sigds_wal_*`) and
 | `sql/create_sigds_workbook_map.sql` | DDL reference — the notebook auto-creates the table on first run; use this only for manual/ahead-of-time provisioning |
 | `sql/archival_scoring.sql` | Weighted confidence scoring matrix — scores every record across multiple signals to surface archival candidates |
 | `sql/geninfo_queries.sql` | Reporting queries — landscape overview, storage reclamation, owner accountability, multi-table workbooks, legacy WAL inventory |
+| `sql/query_history_lineage.sql` | Ground-truth workbook/data-model → input-table lineage mined from Unity Catalog `system.access.table_lineage` + `system.query.history`, cross-checked against `SIGDS_WORKBOOK_MAP` (manual/exploratory — full-window scan) |
+| `SIGMA_QUERY_LINEAGE_RAW` *(auto-created)* | Watermarked landing table for Phase 8's incremental lineage scan (one row per statement × source table); not a source file, created in `map_schema` on first `enable_query_lineage=true` run |
+| `sql/query_lineage_snapshot.sql` | Reporting view joining `SIGDS_WORKBOOK_MAP.LINEAGE_*` to `SIGMA_QUERY_LINEAGE_RAW` — reads only Phase 8's own output, no `system.*` grant needed |
 
 This toolkit ships as a **Databricks Asset Bundle**: the populate notebook is
 deployed once and run per writeback schema via a `for_each` task, configuration
@@ -272,13 +306,14 @@ schedule). The `for_each` task runs the populate notebook once per schema in
 immediately) and prints a **run-page URL** plus the run's state transitions. You
 get progress at two levels:
 
-- **In the terminal / run logs.** The notebook logs each of its seven phases as
-  `[Phase n/7] …`, and the long-running steps draw an ASCII bar, e.g.:
+- **In the terminal / run logs.** The notebook logs its phases as
+  `[Phase n/8] …` (phase 8 is the optional query-history lineage enrichment —
+  see below), and the long-running steps draw an ASCII bar, e.g.:
 
   ```
-  [Phase 3/7] Discovered 1,222 WAL tables. Running parallel DESCRIBE DETAIL…
+  [Phase 3/8] Discovered 1,222 WAL tables. Running parallel DESCRIBE DETAIL…
     DESCRIBE WAL ▕███████████░░░░░░░░░░░░░▏ 560/1222
-  [Phase 4/7] Extracted 87 new/updated SIGDS table records.
+  [Phase 4/8] Extracted 87 new/updated SIGDS table records.
   ```
 
 - **On the run page (UI).** Open the printed URL to watch the `for_each` task as
@@ -288,7 +323,7 @@ get progress at two levels:
 For graphical `tqdm` bars in the notebook UI, set the `use_tqdm` parameter to
 `true` (job parameter or `--params use_tqdm=true`). It has no effect on the
 plain-text CLI logs. Other tuning parameters: `describe_workers`,
-`wal_batch_size`, `max_wal_tables`.
+`wal_batch_size`, `max_wal_tables`, `enable_query_lineage`, `lineage_lookback_days`.
 
 ### Compute
 
@@ -320,6 +355,45 @@ ALTER TABLE <YOUR_CATALOG>.<YOUR_MAP_SCHEMA>.SIGDS_WORKBOOK_MAP
 ```
 
 No data is rewritten — both steps are metadata-only operations.
+
+### Upgrading an existing table (renamed LINEAGE_* columns)
+
+If you enabled `enable_query_lineage` before this rename, four columns were
+renamed to stop reusing the word "source"/"workbook" for unrelated things
+(the object that queried a table vs. the object that wrote it vs. whether the
+Sigma tag comment was recovered):
+
+| Old name | New name |
+|---|---|
+| `LINEAGE_LAST_WORKBOOK_URL` | `LINEAGE_LAST_QUERIED_OBJECT_URL` |
+| `LINEAGE_LAST_SOURCE_OBJECT_KIND` | `LINEAGE_LAST_QUERIED_OBJECT_KIND` |
+| `LINEAGE_LAST_SOURCE_OBJECT_ID` | `LINEAGE_LAST_QUERIED_OBJECT_ID` |
+| `LINEAGE_ATTRIBUTION_SOURCE` | `LINEAGE_TAG_STATUS` |
+
+Same column-mapping prerequisite as above (skip Step 1 if you already enabled
+it for the `SOURCE_SCHEMA` migration):
+
+```sql
+ALTER TABLE <YOUR_CATALOG>.<YOUR_MAP_SCHEMA>.SIGDS_WORKBOOK_MAP
+SET TBLPROPERTIES (
+  'delta.columnMapping.mode' = 'name',
+  'delta.minReaderVersion'   = '2',
+  'delta.minWriterVersion'   = '5'
+);
+
+ALTER TABLE <YOUR_CATALOG>.<YOUR_MAP_SCHEMA>.SIGDS_WORKBOOK_MAP
+  RENAME COLUMN LINEAGE_LAST_WORKBOOK_URL TO LINEAGE_LAST_QUERIED_OBJECT_URL;
+ALTER TABLE <YOUR_CATALOG>.<YOUR_MAP_SCHEMA>.SIGDS_WORKBOOK_MAP
+  RENAME COLUMN LINEAGE_LAST_SOURCE_OBJECT_KIND TO LINEAGE_LAST_QUERIED_OBJECT_KIND;
+ALTER TABLE <YOUR_CATALOG>.<YOUR_MAP_SCHEMA>.SIGDS_WORKBOOK_MAP
+  RENAME COLUMN LINEAGE_LAST_SOURCE_OBJECT_ID TO LINEAGE_LAST_QUERIED_OBJECT_ID;
+ALTER TABLE <YOUR_CATALOG>.<YOUR_MAP_SCHEMA>.SIGDS_WORKBOOK_MAP
+  RENAME COLUMN LINEAGE_ATTRIBUTION_SOURCE TO LINEAGE_TAG_STATUS;
+```
+
+Then re-run `sql/archival_scoring.sql` and `sql/query_lineage_snapshot.sql` to
+recreate the views against the renamed columns (`CREATE OR REPLACE VIEW`, so
+this is a no-op if you haven't touched them).
 
 ### Multiple writeback schemas
 
@@ -377,7 +451,44 @@ Every iteration writes to the same `SIGDS_WORKBOOK_MAP` table. All analysis quer
 
 ---
 
-## How the populate script works
+## How it works — the 9-phase pipeline
+
+Each run pulls from three independent sources — WAL/Delta metadata, the Sigma
+API, and (optionally) Unity Catalog system tables — and merges them into
+`SIGDS_WORKBOOK_MAP`, with query-history lineage landing in its own table
+alongside it:
+
+```mermaid
+flowchart TD
+    subgraph src1["Databricks — WAL & Delta"]
+        A1["1. Load watermarks\nfrom SIGDS_WORKBOOK_MAP"]
+        A2["2. Discover WAL tables\nSHOW TABLES sigds_wal_*"]
+        A3["3. Skip unchanged WAL tables\nDESCRIBE DETAIL vs watermark"]
+        A4["4. Extract latest WAL entries\nbatched UNION ALL"]
+        A5["5. Delta metadata\nDESCRIBE DETAIL per SIGDS table"]
+        A1 --> A2 --> A3 --> A4 --> A5
+    end
+
+    subgraph src2["Sigma REST API"]
+        B6["6. Sigma API enrichment\nworkbook/data model + owner"]
+        B7["7. Version tag resolution\ntag -> parent workbook"]
+        B6 --> B7
+    end
+
+    A5 --> B6
+    B7 --> M8["8. MERGE into\nSIGDS_WORKBOOK_MAP"]
+
+    subgraph src3["Unity Catalog system tables (optional)"]
+        C9a["9a. Watermarked scan\ntable_lineage x query.history"]
+        C9b["9b. Land incremental rows\nSIGMA_QUERY_LINEAGE_RAW"]
+        C9c["9c. Recompute LINEAGE_* summary\nscoped to SCAN_SCHEMA"]
+        C9a --> C9b --> C9c
+    end
+
+    M8 --> C9a
+    C9c --> OUT["SIGDS_WORKBOOK_MAP\n+ SIGMA_QUERY_LINEAGE_RAW"]
+    M8 -.->|enable_query_lineage=false| OUT
+```
 
 Each run follows these steps:
 
@@ -389,6 +500,7 @@ Each run follows these steps:
 6. **Sigma API enrichment** — fetches workbook/data-model metadata only for `WORKBOOK_ID`s not already in the table. Resolves owner names via `GET /v2/members`. `API_IS_ARCHIVED` is re-checked on every run for all known IDs.
 7. **Version tag resolution** — fetches all version tags via `GET /v2/tags`, then lists workbooks per tag to build a `taggedWorkbookId → parent workbook` mapping. Tagged version records are flagged with `IS_TAGGED_VERSION=TRUE`, `VERSION_TAG_NAME`, and `PARENT_WORKBOOK_ID`.
 8. **MERGE** — writes all changes into `SIGDS_WORKBOOK_MAP` via a single `MERGE` keyed on the composite `SIGDS_TABLE + SCAN_SCHEMA`. Records whose WAL table has disappeared are flagged `IS_DELETED=TRUE`; the flag is cleared if the WAL table reappears. All deletion and orphan flag updates are scoped to the current `SCAN_SCHEMA` so other schemas' rows are never affected.
+9. **Query-history lineage enrichment — optional, `enable_query_lineage=true`.** Joins `system.access.table_lineage` to `system.query.history` and parses the Sigma comment tag to find which workbook/data model actually SELECTed each table. The first run per schema backfills `lineage_lookback_days`; every later run scans only from the last watermark (minus `lineage_overlap_hours`), landing new rows into `SIGMA_QUERY_LINEAGE_RAW` — so it never re-reads the whole window from the system tables. The rolling-window `LINEAGE_*` summary on `SIGDS_WORKBOOK_MAP` is then recomputed from that small local table (scoped to `SCAN_SCHEMA`). Off by default and degrades to a WARN + skip (never fails the run) if the required system-table grant is missing. See [Query-History Lineage](#query-history-lineage-query_history_lineagesql) below.
 
 ---
 
@@ -431,6 +543,17 @@ Column names use consistent prefixes to make the data source immediately obvious
 | `API_IS_ARCHIVED` | Archived state from Sigma API — refreshed every run |
 | `API_OWNER_FIRST_NAME` | Owner first name resolved via `GET /v2/members` — set once |
 | `API_OWNER_LAST_NAME` | Owner last name resolved via `GET /v2/members` — set once |
+| `LINEAGE_SELECT_COUNT` | Count of SELECTs against this table in the last `lineage_lookback_days` |
+| `LINEAGE_DISTINCT_QUERY_COUNT` | Distinct `statement_id`s behind that count (one query can touch a table more than once) |
+| `LINEAGE_LAST_QUERIED_AT` | Timestamp of the most recent observed SELECT |
+| `LINEAGE_LAST_QUERIED_BY_EMAIL` | Email of the user who issued that most recent SELECT |
+| `LINEAGE_LAST_QUERIED_OBJECT_URL` | URL of the workbook/data model that issued the most recent SELECT — can differ from `WAL_WORKBOOK_URL` / `API_WORKBOOK_URL`, which describe the last *write*, not the last *read* |
+| `LINEAGE_LAST_QUERIED_OBJECT_KIND` | `WORKBOOK` or `DATA_MODEL` — which kind of object issued that SELECT |
+| `LINEAGE_LAST_QUERIED_OBJECT_ID` | Sigma object ID parsed from that URL |
+| `LINEAGE_TAG_STATUS` | `query_history` if Sigma's comment tag was recovered from the query text (confident attribution), `query_history_untagged` if a SELECT was observed but the tag wasn't (e.g. a non-adhoc query kind) |
+| `LINEAGE_REFRESHED_AT` | When Phase 8 last recomputed this row's `LINEAGE_*` summary for its `SCAN_SCHEMA` |
+
+`LINEAGE_*` columns are query-history lineage enrichment (Phase 8, `enable_query_lineage=true` only) — added on demand via `ALTER TABLE ADD COLUMNS`, absent until first enabled. See [Query-History Lineage](#query-history-lineage-query_history_lineagesql).
 
 ---
 
@@ -447,6 +570,105 @@ Column names use consistent prefixes to make the data source immediately obvious
 | 5. Owner accountability summary | Cleanup burden rolled up by workbook owner: archived, orphaned, stale counts and reclaimable GB per owner |
 | 6. Workbooks with multiple input tables | Groups by source workbook (resolving tagged versions to their parent) to find workbooks with more than one named input element. Shows named element count, total SIGDS file count (inflated by repeated tag updates), and how many schemas the workbook spans |
 | 7. Legacy WAL inventory | All `sigds_wal_<uuid>` tables, split by migration priority: active legacy WALs (still being written) flagged as urgent; inactive as low-priority |
+
+---
+
+## Query-History Lineage (`query_history_lineage.sql`)
+
+`SIGDS_WORKBOOK_MAP` links a SIGDS table to its workbook/data model via the
+`WORKBOOK_ID` embedded in WAL row metadata — a strong signal, but a heuristic:
+it reflects the last *write*, not who is currently *reading* the table.
+`query_history_lineage.sql` adds a second, independent signal mined straight
+from Unity Catalog system tables: every SELECT Sigma issues carries a trailing
+SQL comment identifying the exact workbook or data model that generated it —
+
+```
+-- Sigma Σ {"sourceUrl":"https://app.sigmacomputing.com/acme/workbook/My-WB-527Ldxl0hT3JKHuLw1USp4?:displayNodeId=fk0QY3zA9x","kind":"adhoc","request-id":"...","user-id":"...","email":"user@example.com"}
+```
+
+Joining `system.access.table_lineage` to `system.query.history` on
+`statement_id` recovers that comment for every observed SELECT against a
+writeback table, so it's ground truth for "which workbook/data model is
+actually reading this table right now" — the direct fix for a WAL heuristic
+that can under- or over-report staleness.
+
+This is an **enhancement, not a replacement**: a table with no lineage rows
+means "not observed in the lookback window", not "orphaned" — the WAL-based
+map stays the primary signal.
+
+There are three pieces, in two layers — an ingestion layer that needs
+`system.*` access, and a reporting layer that doesn't:
+
+- **Automated (Phase 8 of the populate notebook)** — set `enable_query_lineage:
+  "true"` (per-schema, in `resources/sigds_workbook_map.job.yml` or as a job
+  parameter). This is **watermarked, not a full re-scan every run**:
+
+  1. **First run for a given `scan_schema`** — no watermark exists yet, so it
+     backfills `lineage_lookback_days` (default 90) of
+     `system.access.table_lineage` / `system.query.history`.
+  2. **Every later run** — resumes from the latest `EVENT_TIME` already landed
+     for that schema, minus `lineage_overlap_hours` (default 6) to cover
+     system-table landing latency. Only that incremental delta is read from
+     the (potentially metastore-wide, expensive-to-scan) system tables.
+  3. The incremental rows land in a new table, **`SIGMA_QUERY_LINEAGE_RAW`**
+     (auto-created in `map_schema`, one row per statement × source table),
+     `MERGE`d in keyed on `(SCAN_SCHEMA, SIGDS_TABLE, STATEMENT_ID)` so the
+     overlap buffer re-reading a few hours it already landed doesn't
+     double-count. Rows older than `lineage_lookback_days` +
+     `lineage_overlap_hours` are pruned each run — nothing older is ever read
+     by the next step, so there's no reason to keep it.
+  4. The `LINEAGE_*` column set on `SIGDS_WORKBOOK_MAP` —
+     `LINEAGE_SELECT_COUNT`, `LINEAGE_DISTINCT_QUERY_COUNT`,
+     `LINEAGE_LAST_QUERIED_AT`, `LINEAGE_LAST_QUERIED_OBJECT_URL`,
+     `LINEAGE_LAST_QUERIED_OBJECT_KIND`, `LINEAGE_LAST_QUERIED_OBJECT_ID`,
+     `LINEAGE_LAST_QUERIED_BY_EMAIL`, `LINEAGE_TAG_STATUS`,
+     `LINEAGE_REFRESHED_AT` (columns are added automatically via `ALTER TABLE
+     ADD COLUMNS` the first time this runs) — is then recomputed fresh from
+     `SIGMA_QUERY_LINEAGE_RAW` every run, scoped to `lineage_lookback_days`.
+     This recompute is a full rescan, but only of the small local raw table,
+     not the system tables — so a table with no SELECTs in the current window
+     correctly resets to zero/NULL rather than keeping a stale count from
+     months ago, without re-reading months of system-table history to prove
+     it.
+
+  If the required system-table grant is missing, Phase 8 logs a WARN and
+  skips — it never fails the run. This is the only piece that touches
+  `system.access` / `system.query` directly.
+- **Reporting (`sql/query_lineage_snapshot.sql`)** — a view,
+  `V_SIGDS_LINEAGE_SNAPSHOT`, joining `SIGDS_WORKBOOK_MAP.LINEAGE_*` back onto
+  `SIGMA_QUERY_LINEAGE_RAW` for a couple of facts only the raw table can
+  answer (distinct querying users, distinct source objects touching the same
+  table), plus a `LINEAGE_CROSS_CHECK` flag distinguishing "not yet scanned"
+  from "scanned, no activity" from "flagged for cleanup but actively queried
+  — worth a look". Reads only the two tables Phase 8 already writes, so it
+  needs no `system.*` grant — safe to hand to a BI/reporting identity that
+  should never see raw account-usage data.
+- **Manual / exploratory (`sql/query_history_lineage.sql`)** — run directly in
+  a SQL editor (after replacing `<YOUR_CATALOG>` / `<YOUR_SCHEMA>`) for ad-hoc
+  investigation, independent of whether Phase 8 has ever run. Always scans the
+  full `lineage_lookback_days` window directly against the system tables (no
+  watermark/landing table — fine for an occasional manual query, not intended
+  to run on a schedule). Creates:
+
+| Object | Grain | Purpose |
+|---|---|---|
+| `V_SIGMA_QUERY_LINEAGE` | one row per (statement, table) | Raw parsed lineage: `SIGDS_TABLE`, `SOURCE_OBJECT_KIND` (`WORKBOOK` / `DATA_MODEL`), `SOURCE_OBJECT_ID`, `SOURCE_ORG_SLUG`, `SIGMA_USER_EMAIL`, `SIGMA_KIND`, `LINEAGE_TAG_STATUS` |
+| `V_SIGMA_QUERY_LINEAGE_SUMMARY` | one row per `SIGDS_TABLE` + `SCAN_SCHEMA` | Rolled up to the same grain as `SIGDS_WORKBOOK_MAP` — `SELECT_COUNT_90D`, `LAST_QUERIED_AT`, and the most recently observed source workbook/data model — ready to join |
+| Final `SELECT` in the file | one row per `SIGDS_TABLE` | Cross-check example: joins the summary onto `SIGDS_WORKBOOK_MAP` and flags tables the WAL heuristic marked for cleanup that were nonetheless actively queried in the last 90 days |
+
+**Prerequisites:** the account admin must enable the `access` and `query`
+system schemas (Catalog Explorer → System Tables — a one-time, account-level
+step), and the identity running this needs `SELECT` on
+`system.access.table_lineage` and `system.query.history`.
+
+**Caveats:** `table_lineage` retention is 365 days; both system tables land
+with a short delay (treat the most recent few minutes as provisional); only
+`kind='adhoc'` queries are guaranteed to carry the tag (other kinds are
+surfaced via `LINEAGE_TAG_STATUS` rather than silently dropped); scope
+is per-metastore (cross-workspace writeback is out of scope). Unlike the
+Snowflake port's `sigma_query_history_scan` proc, no separate "land into raw"
+step is needed — Unity Catalog system tables are already persisted with their
+own retention, so the views can be queried live.
 
 ---
 
@@ -472,6 +694,10 @@ The script creates one view, `SIGDS_ARCHIVAL_SCORED` (single source of truth for
 
 **Risk penalty:** `IS_TAGGED_VERSION` = TRUE → subtract 15 pts (floor at 0). Tagged versions (Prod, QA) are high-risk to archive and are penalised to prevent automatic tier promotion.
 
+**Query-history lineage penalty (0 to −30, requires `enable_query_lineage=true` — see [Query-History Lineage](#query-history-lineage-query_history_lineagesql)):** ground-truth counter-evidence, **asymmetric by design** — recent query activity can only reduce the score, never increase it (no lineage data ≠ confirmed dead). Tagged activity (`LINEAGE_TAG_STATUS='query_history'`, i.e. the Sigma comment was recovered) at full weight, bucketed by `DAYS_SINCE_LAST_QUERIED`: ≤30d → −30 / ≤90d → −15 / older → −5. Untagged activity (`'query_history_untagged'` — a SELECT was observed but no Sigma tag recovered) at half weight: −15 / −8 / −3. No lineage data (Phase 8 never run for that schema, or ran and found nothing) → 0.
+
+**Tier cap — a hard safety net alongside the penalty above:** if the table was queried within the last 30 days, `ARCHIVAL_TIER` can never be better than **TIER 3**, regardless of the computed score. The penalty and the cap can disagree (e.g. a huge WAL-recency score could in principle still clear 75 after only a −30 penalty); when they do, the cap wins — an actively-queried table can never show as "quarantine now."
+
 **Not in the score (by design):** edit volume (`WAL_MAX_EDIT_NUM` is a lifetime counter, not a recency measure — kept as a context column only), storage size (→ `SIGDS_TABLE_SIZE_MB` column / sort), legacy-WAL status (→ `MIGRATION_PRIORITY` flag), orphaned records (→ separate query).
 
 ### Confidence tiers
@@ -482,37 +708,15 @@ The script creates one view, `SIGDS_ARCHIVAL_SCORED` (single source of truth for
 | 50–74 | **TIER 2** | Likely candidate — review with owner |
 | 25–49 | **TIER 3** | Monitor — check in 90 days |
 | < 25 | **TIER 4** | Keep — active or protected |
+| *(cap)* | **TIER 3** | Queried within the last 30 days — capped regardless of score |
 
-Every component score is exposed alongside the total so you can see why a record scored as it did and tune thresholds. The rollup reads the same view as the candidate list, so the tier counts always match the rows.
+Every component score is exposed alongside the total so you can see why a record scored as it did and tune thresholds. The rollup reads the same view as the candidate list, so the tier counts always match the rows. **Prerequisite:** the `LINEAGE_*` columns must exist on `SIGDS_WORKBOOK_MAP` (i.e. `enable_query_lineage` has run at least once, for any schema) — otherwise this view fails with a column-not-found error; either enable Phase 8 once, or strip the `LINEAGE_*`/`SCORE_LINEAGE_PENALTY` references from the SQL.
 
 > **Important — read before taking any action based on these scores.**
 >
 > The confidence tiers and weights in this model are entirely subjective. What constitutes an appropriate threshold for archival will vary significantly from customer to customer depending on usage patterns, business criticality, data retention policies, and team workflows. The scores are a starting point for investigation, not a directive.
 >
-> **Incorrectly removing a SIGDS table or its associated WAL table can cause irreparable impact to the related Sigma content.** Workbooks and input tables that depend on these objects will break immediately and, if the tables have been dropped rather than moved, may not be recoverable. Always follow the safe deletion process (move to quarantine first, monitor, then delete) and ensure the record has been reviewed and approved by the workbook owner before any action is taken.
+> **Incorrectly removing a SIGDS table or its associated WAL table can cause irreparable impact to the related Sigma content.** Workbooks and input tables that depend on these objects will break immediately and, if the tables have been dropped rather than moved, may not be recoverable. Always follow the [Safe Archival](#safe-archival-of-sigds-and-wal-tables) process (move to quarantine first, monitor, then delete) and ensure the record has been reviewed and approved by the workbook owner before any action is taken.
 
 ---
-
-## Safe Deletion of SIGDS and WAL Tables
-
-> **Best practice: move first, delete later — never drop directly.**
-
-Sigma stores the exact fully-qualified table name of both the SIGDS data table and the WAL table in its internal metadata. When Sigma looks up an input table it searches for a table matching the exact `SIGDS_<uuid>` identifier in the writeback schema configured on the connection. If the table has been dropped or renamed, workbooks will immediately fail with errors such as:
-
-```
-Object '<DB>.<SCHEMA>."SIGDS_WAL_xxx"' does not exist or not authorized
-```
-
-This applies equally to the WAL table — Sigma holds the WAL table name in its metadata and requires an exact match.
-
-### Recommended process
-
-1. **Identify candidates** using `geninfo_queries.sql` or `archival_scoring.sql` (archived, orphaned, or stale records).
-2. **Move** the SIGDS and WAL tables to a quarantine schema (e.g. `<SCHEMA>_quarantine`) using `ALTER TABLE ... RENAME TO`. Do not drop them yet.
-3. **Monitor** for a safe period (recommended: 30 days minimum) to confirm no workbook errors are raised and no users report missing data.
-4. **Drop** the tables from the quarantine schema once the safe period has passed.
-
-### Why this matters
-
-If a table is moved or renamed rather than dropped outright, recovery is straightforward — rename the table back to its original location (`<CATALOG>.<SCHEMA>.<SIGDS_TABLE_NAME>`) and the workbook resumes functioning immediately. A direct `DROP TABLE` is irreversible and eliminates this recovery path.
 

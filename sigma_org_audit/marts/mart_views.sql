@@ -135,6 +135,144 @@ FROM STG_DATASETS ds
 LEFT JOIN wb_fanout f ON f.ORG_ID = ds.ORG_ID AND f.DATASET_ID = ds.DATASET_ID;
 
 -- ------------------------------------------------------------------------------
+-- V_SOURCE_BINDING -- one row per (workbook|datamodel) -> source node, with the
+-- source's connection resolved. This is the ground truth for 9c8.4: per-asset
+-- sources, native lineage, and the connection each source is bound to. Feeds
+-- V_DEPLOYABILITY below and the per-asset migration-readiness mart (9c8.10).
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW V_SOURCE_BINDING AS
+SELECT
+    l.ORG_ID,
+    'workbook'                           AS ASSET_TYPE,
+    l.WORKBOOK_ID                        AS ASSET_ID,
+    wb.NAME                              AS ASSET_NAME,
+    wb.PATH                              AS ASSET_PATH,
+    l.SOURCE_TYPE,
+    l.CONNECTION_ID,
+    c.NAME                               AS CONNECTION_NAME,
+    c.TYPE                               AS CONNECTION_TYPE,
+    l.SOURCE_NAME,
+    l.SOURCE_INODE_ID,
+    l.SOURCE_DATA_MODEL_ID,
+    l.SNAPSHOT_TS
+FROM STG_WORKBOOK_LINEAGE l
+LEFT JOIN STG_WORKBOOKS   wb ON wb.ORG_ID = l.ORG_ID AND wb.WORKBOOK_ID = l.WORKBOOK_ID
+LEFT JOIN STG_CONNECTIONS c  ON c.ORG_ID  = l.ORG_ID AND c.CONNECTION_ID = l.CONNECTION_ID
+UNION ALL
+SELECT
+    l.ORG_ID,
+    'datamodel'                          AS ASSET_TYPE,
+    l.DATA_MODEL_ID                      AS ASSET_ID,
+    dm.NAME                              AS ASSET_NAME,
+    dm.PATH                              AS ASSET_PATH,
+    l.SOURCE_TYPE,
+    l.CONNECTION_ID,
+    c.NAME                               AS CONNECTION_NAME,
+    c.TYPE                               AS CONNECTION_TYPE,
+    l.SOURCE_NAME,
+    l.SOURCE_INODE_ID,
+    l.SOURCE_DATA_MODEL_ID,
+    l.SNAPSHOT_TS
+FROM STG_DATAMODEL_LINEAGE l
+LEFT JOIN STG_DATAMODELS  dm ON dm.ORG_ID = l.ORG_ID AND dm.DATA_MODEL_ID = l.DATA_MODEL_ID
+LEFT JOIN STG_CONNECTIONS c  ON c.ORG_ID  = l.ORG_ID AND c.CONNECTION_ID = l.CONNECTION_ID;
+
+-- ------------------------------------------------------------------------------
+-- V_DEPLOYABILITY -- per-asset (workbook|datamodel) source-swap deployability
+-- classification, rolled up from V_SOURCE_BINDING.
+--
+-- Per-tenant migration deploys a source-swap policy that remaps ONE connection
+-- to another; an asset is only a clean swap when every source resolves to a
+-- single connection with no binding the swap mechanism can't rewrite.
+--   HAS_CUSTOM_SQL     -- a customSQL source; the embedded query text is opaque
+--                         to source-swap and may hardcode db/schema identifiers.
+--   HAS_CSV_UPLOAD     -- a csv-upload source; no connection to swap at all.
+--   HAS_LEGACY_DATASET -- a legacy `dataset` source; pre-migration artifact,
+--                         itself a migration blocker independent of source-swap.
+--   CROSS_CONNECTION   -- sources span >1 distinct connection; a single
+--                         source-swap policy cannot remap them all consistently.
+--   DATAMODEL_DEP_COUNT-- workbook sources that are themselves data models;
+--                         not a blocker, but the dependency must be sequenced
+--                         (swap the model first) rather than swapped directly.
+--
+-- RAG:
+--   GREEN -- every source is `table`, bound to exactly one connection: a clean
+--            source-swap candidate.
+--   RED   -- any hard blocker (custom SQL, CSV upload, legacy dataset, or
+--            cross-connection sources).
+--   AMBER -- everything else: no sources captured (nothing to classify yet, or
+--            lineage not yet extracted for this asset) or a data-model-only
+--            dependency that needs sequencing rather than direct swap.
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW V_DEPLOYABILITY AS
+WITH assets AS (
+    -- Full asset grain (all live workbooks + data models), so an asset with NO
+    -- lineage captured yet (extract not re-run since 9c8.4, or genuinely
+    -- sourceless) still appears -- as AMBER/"no lineage captured" -- instead of
+    -- silently vanishing from the report.
+    SELECT ORG_ID, 'workbook' AS ASSET_TYPE, WORKBOOK_ID AS ASSET_ID, NAME AS ASSET_NAME, PATH AS ASSET_PATH
+    FROM STG_WORKBOOKS
+    UNION ALL
+    SELECT ORG_ID, 'datamodel', DATA_MODEL_ID, NAME, PATH
+    FROM STG_DATAMODELS
+),
+agg AS (
+    SELECT
+        a.ORG_ID, a.ASSET_TYPE, a.ASSET_ID,
+        a.ASSET_NAME,
+        a.ASSET_PATH,
+        COUNT(b.SOURCE_TYPE)                             AS SOURCE_COUNT,
+        COUNT(DISTINCT b.CONNECTION_ID)                  AS DISTINCT_CONNECTION_COUNT,
+        COUNT_IF(b.SOURCE_TYPE = 'customSQL')            AS CUSTOM_SQL_COUNT,
+        COUNT_IF(b.SOURCE_TYPE = 'csv-upload')           AS CSV_UPLOAD_COUNT,
+        COUNT_IF(b.SOURCE_TYPE = 'dataset')              AS LEGACY_DATASET_COUNT,
+        COUNT_IF(b.SOURCE_TYPE = 'data-model')           AS DATAMODEL_DEP_COUNT,
+        COUNT_IF(b.SOURCE_TYPE = 'table')                AS TABLE_SOURCE_COUNT,
+        MAX(b.SNAPSHOT_TS)                               AS SNAPSHOT_TS
+    FROM assets a
+    LEFT JOIN V_SOURCE_BINDING b
+           ON b.ORG_ID = a.ORG_ID AND b.ASSET_TYPE = a.ASSET_TYPE AND b.ASSET_ID = a.ASSET_ID
+    GROUP BY 1, 2, 3, 4, 5
+),
+classified AS (
+    SELECT
+        agg.*,
+        (CUSTOM_SQL_COUNT > 0)                          AS HAS_CUSTOM_SQL,
+        (CSV_UPLOAD_COUNT > 0)                          AS HAS_CSV_UPLOAD,
+        (LEGACY_DATASET_COUNT > 0)                      AS HAS_LEGACY_DATASET,
+        (DATAMODEL_DEP_COUNT > 0)                       AS HAS_DATAMODEL_DEP,
+        (DISTINCT_CONNECTION_COUNT > 1)                 AS CROSS_CONNECTION
+    FROM agg
+)
+SELECT
+    classified.*,
+    CASE
+        WHEN SOURCE_COUNT = 0
+            THEN 'AMBER'
+        WHEN HAS_CUSTOM_SQL OR HAS_CSV_UPLOAD OR HAS_LEGACY_DATASET OR CROSS_CONNECTION
+            THEN 'RED'
+        WHEN TABLE_SOURCE_COUNT = SOURCE_COUNT AND DISTINCT_CONNECTION_COUNT <= 1
+            THEN 'GREEN'
+        ELSE 'AMBER'
+    END AS RAG,
+    CASE
+        WHEN SOURCE_COUNT = 0
+            THEN 'No lineage captured -- re-run sigma_org_extract to source-bind this asset'
+        WHEN HAS_CUSTOM_SQL
+            THEN 'Custom SQL source(s) -- query text may hardcode db/schema; source-swap cannot rewrite it'
+        WHEN HAS_CSV_UPLOAD
+            THEN 'CSV upload source(s) -- no connection to swap'
+        WHEN HAS_LEGACY_DATASET
+            THEN 'Legacy dataset source(s) -- pre-migration artifact, blocks clean swap independent of connection'
+        WHEN CROSS_CONNECTION
+            THEN 'Sources span ' || DISTINCT_CONNECTION_COUNT || ' distinct connections -- one source-swap policy cannot remap them all'
+        WHEN HAS_DATAMODEL_DEP
+            THEN 'Depends on ' || DATAMODEL_DEP_COUNT || ' data model(s) -- sequence: swap the model''s sources first'
+        ELSE 'Clean source-swap candidate: all sources are tables on a single connection'
+    END AS RAG_REASON
+FROM classified;
+
+-- ------------------------------------------------------------------------------
 -- V_WRITEBACK_GOVERNANCE -- status flags + archival score + reclaimable storage.
 -- Ports the writeback_info_sf weighted archival model onto STG_WRITEBACK_TABLES.
 --

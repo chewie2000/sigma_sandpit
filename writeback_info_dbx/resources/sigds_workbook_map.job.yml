@@ -37,6 +37,14 @@ resources:
                   # max_wal_tables: "0"
                   # describe_workers: "16"
                   # wal_batch_size: "100"
+                  # Query-history lineage (Phase 8) -- needs SELECT on
+                  # system.access.table_lineage / system.query.history for
+                  # every schema in `schemas` (see README "Query-History
+                  # Lineage"). Enabled here for all schemas in this job;
+                  # Phase 8 WARNs and skips per-schema (does not fail the run)
+                  # if a given schema's identity lacks the grant.
+                  enable_query_lineage: "true"
+                  lineage_lookback_days: "90"
 
       # Runs on serverless job compute (no cluster block needed). If serverless
       # is not enabled on your workspace, define a job_cluster instead and add

@@ -68,6 +68,55 @@ LEFT JOIN detail d ON d.ORG_ID = l.ORG_ID AND d.OBJECT_ID = l.OBJECT_ID AND d.rn
 WHERE l.rn = 1;
 
 -- ------------------------------------------------------------------------------
+-- STG_WORKBOOK_LINEAGE  (one row per workbook -> source node; source-binding
+-- truth for 9c8.4). Flattened from workbook_lineage.entries. SOURCE_TYPE is one
+-- of table | dataset | data-model | customSQL | csv-upload | element (API enum);
+-- 'element' rows (workbook-internal formula/chart nodes, no external binding)
+-- are excluded here -- they carry no CONNECTION_ID and are noise for deployability.
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW STG_WORKBOOK_LINEAGE AS
+WITH latest AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY ORG_ID, OBJECT_ID ORDER BY SNAPSHOT_TS DESC) AS rn
+    FROM RAW_SIGMA_OBJECTS WHERE OBJECT_TYPE = 'workbook_lineage'
+)
+SELECT
+    l.ORG_ID,
+    l.OBJECT_ID                          AS WORKBOOK_ID,
+    e.value:type::STRING                 AS SOURCE_TYPE,
+    e.value:connectionId::STRING         AS CONNECTION_ID,
+    e.value:name::STRING                 AS SOURCE_NAME,
+    e.value:inodeId::STRING              AS SOURCE_INODE_ID,
+    e.value:dataModelId::STRING          AS SOURCE_DATA_MODEL_ID,
+    l.SNAPSHOT_TS, l.SNAPSHOT_ID
+FROM latest l,
+     LATERAL FLATTEN(input => COALESCE(l.PAYLOAD:entries, ARRAY_CONSTRUCT())) e
+WHERE l.rn = 1
+  AND e.value:type::STRING <> 'element';
+
+-- ------------------------------------------------------------------------------
+-- STG_DATAMODEL_LINEAGE  (one row per data model -> source node; mirrors
+-- STG_WORKBOOK_LINEAGE for data models). Same SOURCE_TYPE enum and exclusion.
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW STG_DATAMODEL_LINEAGE AS
+WITH latest AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY ORG_ID, OBJECT_ID ORDER BY SNAPSHOT_TS DESC) AS rn
+    FROM RAW_SIGMA_OBJECTS WHERE OBJECT_TYPE = 'datamodel_lineage'
+)
+SELECT
+    l.ORG_ID,
+    l.OBJECT_ID                          AS DATA_MODEL_ID,
+    e.value:type::STRING                 AS SOURCE_TYPE,
+    e.value:connectionId::STRING         AS CONNECTION_ID,
+    e.value:name::STRING                 AS SOURCE_NAME,
+    e.value:inodeId::STRING              AS SOURCE_INODE_ID,
+    e.value:dataModelId::STRING          AS SOURCE_DATA_MODEL_ID,
+    l.SNAPSHOT_TS, l.SNAPSHOT_ID
+FROM latest l,
+     LATERAL FLATTEN(input => COALESCE(l.PAYLOAD:entries, ARRAY_CONSTRUCT())) e
+WHERE l.rn = 1
+  AND e.value:type::STRING <> 'element';
+
+-- ------------------------------------------------------------------------------
 -- STG_DATASETS  (exposes migrationStatus for migration scoring)
 -- ------------------------------------------------------------------------------
 CREATE OR REPLACE VIEW STG_DATASETS AS

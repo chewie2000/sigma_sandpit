@@ -59,6 +59,24 @@ USE SCHEMA  <YOUR_SCHEMA>;
 --                           VACUUM, so Delta maintenance can make a dead table
 --                           look active and lower its score — cross-check WAL
 --                           recency, do not trust this alone.
+-- Query-history lineage penalty (0 to −30). Ground-truth counter-evidence from
+--   Phase 8 of populate_sigds_workbook_map.py (enable_query_lineage=true) — a
+--   SELECT actually observed against this table, independent of the WAL-write
+--   heuristic everything else here is built on. ASYMMETRIC by design, same
+--   principle as the SF port's V_WRITEBACK_GOVERNANCE access enrichment: recent
+--   query activity can only make a table look LESS archivable, never more —
+--   absence of lineage rows means "not observed in the lookback window", not
+--   "confirmed dead", so it is never scored as evidence FOR archival.
+--     Tagged activity (LINEAGE_TAG_STATUS='query_history' — the Sigma
+--     comment was recovered, so this is confidently Sigma-driven), bucketed by
+--     LINEAGE_LAST_QUERIED_AT recency: <=30d -> −30 / <=90d -> −15 / older -> −5.
+--     Untagged activity ('query_history_untagged' — a SELECT was observed but
+--     no Sigma tag recovered, e.g. a non-adhoc query kind or an unrelated
+--     ad-hoc query that happens to touch the table) gets HALF weight at the
+--     same buckets: −15 / −8 / −3 — still evidence the table isn't dead, but
+--     lower confidence it's genuinely Sigma activity.
+--     NULL/zero (no lineage data — Phase 8 has never run for this schema, or
+--     ran and found nothing) -> 0, same "no evidence" treatment as elsewhere.
 -- Risk penalty: IS_TAGGED_VERSION = TRUE → −15 (tagged Prod/QA versions are
 --               high-risk to archive; floor the total at 0).
 --
@@ -71,6 +89,13 @@ USE SCHEMA  <YOUR_SCHEMA>;
 -- CONFIDENCE TIERS  (>=75 TIER 1 quarantine now · 50–74 TIER 2 review w/ owner ·
 --                    25–49 TIER 3 monitor · <25 TIER 4 keep)
 --
+-- TIER CAP — a hard safety net independent of the score above: if the table was
+-- actually queried within the last 30 days, the tier can never be better than
+-- TIER 3, even if some other component pushed the raw score into TIER 1/2
+-- range. Belt-and-suspenders alongside the score penalty above, so an
+-- actively-queried table can never show as "quarantine now" through some
+-- combination of components the penalty alone didn't sufficiently offset.
+--
 -- !! IMPORTANT — these weights/tiers are subjective starting points for
 -- investigation, NOT a directive to delete. Incorrectly removing a SIGDS or WAL
 -- table breaks the related Sigma content and may be unrecoverable.
@@ -78,6 +103,12 @@ USE SCHEMA  <YOUR_SCHEMA>;
 -- SAFE DELETION — always: (1) move to a *_quarantine schema with ALTER TABLE
 -- RENAME TO (never DROP directly); (2) monitor >= 30 days and confirm with the
 -- workbook owner; (3) only DROP from quarantine once the safe period passes.
+--
+-- PREREQUISITE — this view reads SIGDS_WORKBOOK_MAP.LINEAGE_* columns, which
+-- only exist once enable_query_lineage has run at least once (any schema) so
+-- Phase 8 has added them via ALTER TABLE ADD COLUMNS. If you haven't enabled
+-- Phase 8 yet, this view fails with a column-not-found error — either enable
+-- it once, or delete the LINEAGE_*/SCORE_LINEAGE_PENALTY references below.
 -- =============================================================================
 
 
@@ -109,12 +140,19 @@ WITH base AS (
         WAL_MAX_EDIT_NUM,
         SIGDS_TABLE_SIZE_BYTES,
         WAL_WORKBOOK_URL,
+        LINEAGE_SELECT_COUNT,
+        LINEAGE_LAST_QUERIED_AT,
+        LINEAGE_LAST_QUERIED_OBJECT_URL,
+        LINEAGE_TAG_STATUS,
         CASE WHEN WAL_LAST_EDIT_AT IS NULL THEN NULL
              ELSE DATEDIFF(DAY, WAL_LAST_EDIT_AT, CURRENT_TIMESTAMP())
         END                                                     AS DAYS_SINCE_LAST_EDIT,
         CASE WHEN SIGDS_TABLE_LAST_MODIFIED IS NULL THEN NULL
              ELSE DATEDIFF(DAY, SIGDS_TABLE_LAST_MODIFIED, CURRENT_TIMESTAMP())
         END                                                     AS DAYS_SINCE_SIGDS_MODIFIED,
+        CASE WHEN LINEAGE_LAST_QUERIED_AT IS NULL THEN NULL
+             ELSE DATEDIFF(DAY, LINEAGE_LAST_QUERIED_AT, CURRENT_TIMESTAMP())
+        END                                                     AS DAYS_SINCE_LAST_QUERIED,
         ROUND(COALESCE(SIGDS_TABLE_SIZE_BYTES, 0) / 1048576.0, 2)
                                                                 AS SIGDS_TABLE_SIZE_MB
     FROM SIGDS_WORKBOOK_MAP
@@ -138,8 +176,13 @@ scored AS (
         SIGDS_TABLE_SIZE_BYTES,
         SIGDS_TABLE_SIZE_MB,
         WAL_WORKBOOK_URL,
+        LINEAGE_SELECT_COUNT,
+        LINEAGE_LAST_QUERIED_AT,
+        LINEAGE_LAST_QUERIED_OBJECT_URL,
+        LINEAGE_TAG_STATUS,
         DAYS_SINCE_LAST_EDIT,
         DAYS_SINCE_SIGDS_MODIFIED,
+        DAYS_SINCE_LAST_QUERIED,
 
         -- Status (0–40). Every branch is guarded with IS_ORPHANED = FALSE:
         -- IS_DELETED only means the WAL table vanished — it does NOT imply the
@@ -195,6 +238,28 @@ scored AS (
             ELSE 0
         END                                                     AS PENALTY_TAGGED_VERSION,
 
+        -- Query-history lineage penalty (0 to −30) — see header for the full
+        -- rationale. Asymmetric: only ever reduces the score. Tagged activity
+        -- (confidently Sigma-driven) at full weight; untagged (observed SELECT,
+        -- tag not recovered) at half weight; no lineage data -> 0.
+        CASE
+            WHEN COALESCE(LINEAGE_SELECT_COUNT, 0) = 0 THEN 0
+            WHEN LINEAGE_TAG_STATUS = 'query_history' THEN
+                CASE
+                    WHEN DAYS_SINCE_LAST_QUERIED IS NULL
+                      OR DAYS_SINCE_LAST_QUERIED > 90  THEN -5
+                    WHEN DAYS_SINCE_LAST_QUERIED > 30  THEN -15
+                    ELSE -30
+                END
+            ELSE  -- 'query_history_untagged' — half weight, lower confidence
+                CASE
+                    WHEN DAYS_SINCE_LAST_QUERIED IS NULL
+                      OR DAYS_SINCE_LAST_QUERIED > 90  THEN -3
+                    WHEN DAYS_SINCE_LAST_QUERIED > 30  THEN -8
+                    ELSE -15
+                END
+        END                                                     AS SCORE_LINEAGE_PENALTY,
+
         -- Migration priority — legacy (pre-MultiWAL) tables. A FLAG, not scored:
         -- an actively-used legacy table should be migrated, not archived.
         CASE
@@ -228,6 +293,11 @@ SELECT
     SIGDS_TABLE_SIZE_BYTES,
     SIGDS_TABLE_SIZE_MB,
     WAL_WORKBOOK_URL,
+    LINEAGE_SELECT_COUNT,
+    LINEAGE_LAST_QUERIED_AT,
+    DAYS_SINCE_LAST_QUERIED,
+    LINEAGE_LAST_QUERIED_OBJECT_URL,
+    LINEAGE_TAG_STATUS,
     MIGRATION_PRIORITY,
 
     -- Component scores (exposed for transparency and threshold tuning)
@@ -235,23 +305,33 @@ SELECT
     SCORE_WAL_RECENCY,
     SCORE_SIGDS_RECENCY,
     PENALTY_TAGGED_VERSION,
+    SCORE_LINEAGE_PENALTY,
 
     GREATEST(0, LEAST(100,
           SCORE_STATUS
         + SCORE_WAL_RECENCY
         + SCORE_SIGDS_RECENCY
         + PENALTY_TAGGED_VERSION
+        + SCORE_LINEAGE_PENALTY
     ))                                                          AS ARCHIVABILITY_SCORE,
 
+    -- Tier cap first: queried in the last 30 days can never score better than
+    -- TIER 3, regardless of what the raw score components computed — a
+    -- safety net alongside SCORE_LINEAGE_PENALTY above, not a replacement
+    -- for it (the two can disagree; this branch wins when they do).
     CASE
+        WHEN DAYS_SINCE_LAST_QUERIED IS NOT NULL AND DAYS_SINCE_LAST_QUERIED <= 30
+         AND GREATEST(0, LEAST(100, SCORE_STATUS + SCORE_WAL_RECENCY
+             + SCORE_SIGDS_RECENCY + PENALTY_TAGGED_VERSION + SCORE_LINEAGE_PENALTY)) >= 50
+            THEN 'TIER 3 — Monitor (capped: queried within the last 30 days)'
         WHEN GREATEST(0, LEAST(100, SCORE_STATUS + SCORE_WAL_RECENCY
-            + SCORE_SIGDS_RECENCY + PENALTY_TAGGED_VERSION)) >= 75
+            + SCORE_SIGDS_RECENCY + PENALTY_TAGGED_VERSION + SCORE_LINEAGE_PENALTY)) >= 75
             THEN 'TIER 1 — Strong candidate (quarantine now)'
         WHEN GREATEST(0, LEAST(100, SCORE_STATUS + SCORE_WAL_RECENCY
-            + SCORE_SIGDS_RECENCY + PENALTY_TAGGED_VERSION)) >= 50
+            + SCORE_SIGDS_RECENCY + PENALTY_TAGGED_VERSION + SCORE_LINEAGE_PENALTY)) >= 50
             THEN 'TIER 2 — Likely candidate (review with owner)'
         WHEN GREATEST(0, LEAST(100, SCORE_STATUS + SCORE_WAL_RECENCY
-            + SCORE_SIGDS_RECENCY + PENALTY_TAGGED_VERSION)) >= 25
+            + SCORE_SIGDS_RECENCY + PENALTY_TAGGED_VERSION + SCORE_LINEAGE_PENALTY)) >= 25
             THEN 'TIER 3 — Monitor (check in 90 days)'
         ELSE 'TIER 4 — Keep (active or protected)'
     END                                                         AS ARCHIVAL_TIER
@@ -284,6 +364,10 @@ SELECT
     SCORE_WAL_RECENCY,
     SCORE_SIGDS_RECENCY,
     PENALTY_TAGGED_VERSION,
+    SCORE_LINEAGE_PENALTY,
+    LINEAGE_SELECT_COUNT,
+    DAYS_SINCE_LAST_QUERIED,
+    LINEAGE_TAG_STATUS,
     WAL_WORKBOOK_URL
 FROM SIGDS_ARCHIVAL_SCORED
 WHERE COALESCE(IS_ORPHANED, FALSE) = FALSE
@@ -309,9 +393,10 @@ WHERE COALESCE(IS_ORPHANED, FALSE) = FALSE
 GROUP BY ARCHIVAL_TIER
 ORDER BY
     CASE ARCHIVAL_TIER
-        WHEN 'TIER 1 — Strong candidate (quarantine now)'    THEN 1
-        WHEN 'TIER 2 — Likely candidate (review with owner)' THEN 2
-        WHEN 'TIER 3 — Monitor (check in 90 days)'           THEN 3
+        WHEN 'TIER 1 — Strong candidate (quarantine now)'                  THEN 1
+        WHEN 'TIER 2 — Likely candidate (review with owner)'               THEN 2
+        WHEN 'TIER 3 — Monitor (check in 90 days)'                        THEN 3
+        WHEN 'TIER 3 — Monitor (capped: queried within the last 30 days)' THEN 3
         ELSE 4
     END;
 
