@@ -1,5 +1,9 @@
 # writeback_info_dbx
 
+> **Proof of concept.** This is a reference implementation shared to demonstrate an approach and give others something to extrapolate from — not a finished, supported, or authoritative tool. Take the ideas, adapt the patterns, build your own.
+
+> **Disclaimer:** This project contains personal scripts and tools written independently by the author. Although the author is employed by Sigma Computing, this work is not created, endorsed, tested, or supported by Sigma Computing in any capacity. These scripts are provided as-is, with no warranty or guarantee of fitness for any purpose. Use at your own risk. For official Sigma Computing documentation, support, and tooling, refer to [Sigma's official documentation](https://help.sigmacomputing.com).
+
 A Databricks toolkit for inventorying and monitoring Sigma writeback (input table) activity across one or more Unity Catalog schemas. It maps every active writeback table pair — the SIGDS data table (`sigds_*`) and its SIGDS_WAL write-ahead-log table (`sigds_wal_*`) — to its Sigma workbook or data model, enriches records with Delta metadata and Sigma API ownership data, and populates a central `SIGDS_WORKBOOK_MAP` table for reporting and cleanup.
 
 ## Overview
