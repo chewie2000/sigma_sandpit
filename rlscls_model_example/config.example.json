@@ -1,0 +1,39 @@
+{
+  "connectionId": "REPLACE_WITH_YOUR_WAREHOUSE_CONNECTION_ID",
+  "folderId": "REPLACE_WITH_YOUR_TARGET_FOLDER_ID",
+  "schema": "REPLACE_WITH_YOUR_SCHEMA",
+  "operatorEmail": "REPLACE_WITH_YOUR_OWN_SIGMA_LOGIN_EMAIL",
+  "operatorId": null,
+  "teams": {
+    "RLS Demo Ops EMEA": null,
+    "RLS Demo Ops APAC": null,
+    "RLS Demo Key Accounts": null,
+    "RLS Demo Observers": null
+  },
+  "personas": [
+    {
+      "name": "user1",
+      "email": "REPLACE_WITH_A_TEST_USER_EMAIL",
+      "id": null,
+      "teams": ["RLS Demo Ops EMEA", "RLS Demo Ops APAC", "RLS Demo Key Accounts"],
+      "grants": [["office", "Hamburg"], ["site", "COB-2"]]
+    },
+    {
+      "name": "user2",
+      "email": "REPLACE_WITH_A_TEST_USER_EMAIL",
+      "id": null,
+      "teams": ["RLS Demo Observers"],
+      "grants": [["company", "Delta Textiles"]]
+    },
+    {
+      "name": "nogrants",
+      "email": "REPLACE_WITH_A_TEST_USER_EMAIL",
+      "id": null,
+      "teams": [],
+      "grants": []
+    }
+  ],
+  "dataModelId": null,
+  "secureWorkbookId": null,
+  "validationWorkbookId": null
+}

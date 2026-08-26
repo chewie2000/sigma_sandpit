@@ -1,0 +1,110 @@
+{
+  "name": "RLS Additive Grants \u2014 Validation",
+  "folderId": "86e607cd-f13e-4bef-a9cb-b0e8a103ae6f",
+  "description": "DIAGNOSTIC. Flat export used to verify the additive RLS pattern: row-count preservation and per-user filtering. Exposes the model's hidden helper columns (Team Names / User Emails / RLS per dimension, Combined RLS). NOTE: while the data model has its RLS filter applied, this shows only the viewer's own visible rows \u2014 rebuild the model with --validation-mode to inspect all 8,000 rows. Not for end users.",
+  "document": {
+    "schemaVersion": 1,
+    "kind": "workbook",
+    "elements": [
+      {
+        "id": "detail",
+        "kind": "table",
+        "name": "RLS Detail",
+        "source": {
+          "kind": "data-model",
+          "dataModelId": "2afde0e3-edee-4c2b-b48f-46afee2b2be8",
+          "elementId": "shipments"
+        },
+        "columns": [
+          {
+            "id": "c_id",
+            "formula": "[Shipments/Shipment ID]",
+            "name": "Shipment ID"
+          },
+          {
+            "id": "c_office",
+            "formula": "[Shipments/Office]",
+            "name": "Office"
+          },
+          {
+            "id": "c_company",
+            "formula": "[Shipments/Company]",
+            "name": "Company"
+          },
+          {
+            "id": "c_site",
+            "formula": "[Shipments/Site]",
+            "name": "Site"
+          },
+          {
+            "id": "c_revenue",
+            "formula": "[Shipments/Revenue EUR]",
+            "name": "Revenue EUR"
+          },
+          {
+            "id": "c_office_team_names",
+            "formula": "[Shipments/Office Team Names]",
+            "name": "Office Team Names"
+          },
+          {
+            "id": "c_office_user_emails",
+            "formula": "[Shipments/Office User Emails]",
+            "name": "Office User Emails"
+          },
+          {
+            "id": "c_office_rls",
+            "formula": "[Shipments/Office RLS]",
+            "name": "Office RLS"
+          },
+          {
+            "id": "c_company_team_names",
+            "formula": "[Shipments/Company Team Names]",
+            "name": "Company Team Names"
+          },
+          {
+            "id": "c_company_user_emails",
+            "formula": "[Shipments/Company User Emails]",
+            "name": "Company User Emails"
+          },
+          {
+            "id": "c_company_rls",
+            "formula": "[Shipments/Company RLS]",
+            "name": "Company RLS"
+          },
+          {
+            "id": "c_site_team_names",
+            "formula": "[Shipments/Site Team Names]",
+            "name": "Site Team Names"
+          },
+          {
+            "id": "c_site_user_emails",
+            "formula": "[Shipments/Site User Emails]",
+            "name": "Site User Emails"
+          },
+          {
+            "id": "c_site_rls",
+            "formula": "[Shipments/Site RLS]",
+            "name": "Site RLS"
+          },
+          {
+            "id": "c_combined_rls",
+            "formula": "[Shipments/Combined RLS]",
+            "name": "Combined RLS"
+          },
+          {
+            "id": "c_combined_rls_num",
+            "formula": "[Shipments/Combined RLS Num]",
+            "name": "Combined RLS Num"
+          }
+        ]
+      }
+    ],
+    "pages": [
+      {
+        "id": "page-main",
+        "name": "Validation"
+      }
+    ],
+    "layout": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Page type=\"grid\" gridTemplateColumns=\"repeat(24, 1fr)\" gridTemplateRows=\"auto\" id=\"page-main\">\n  <Element elementId=\"detail\" gridColumn=\"1 / 25\" gridRow=\"1 / 25\"/>\n</Page>"
+  }
+}

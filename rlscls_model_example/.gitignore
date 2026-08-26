@@ -1,0 +1,6 @@
+# Exported CSV evidence — regenerable via build_workbook.py / validate_personas.py
+out/
+
+# Org-specific IDs and persona emails, resolved by setup_personas.py.
+# config.example.json is the checked-in template.
+config.json

@@ -1,0 +1,65 @@
+{
+  "name": "RLS Additive Grants \u2014 Secured View",
+  "folderId": "86e607cd-f13e-4bef-a9cb-b0e8a103ae6f",
+  "description": "Consumer-facing view of the secured shipments table. Every row shown is one the viewer is entitled to via the additive grants ledger. Row-level security is enforced on the data model element, not here.",
+  "document": {
+    "schemaVersion": 1,
+    "kind": "workbook",
+    "elements": [
+      {
+        "id": "secured",
+        "kind": "table",
+        "name": "Shipments (secured)",
+        "source": {
+          "kind": "data-model",
+          "dataModelId": "2afde0e3-edee-4c2b-b48f-46afee2b2be8",
+          "elementId": "shipments"
+        },
+        "columns": [
+          {
+            "id": "w_shipment_id",
+            "formula": "[Shipments/Shipment ID]",
+            "name": "Shipment ID"
+          },
+          {
+            "id": "w_shipped_date",
+            "formula": "[Shipments/Shipped Date]",
+            "name": "Shipped Date"
+          },
+          {
+            "id": "w_company",
+            "formula": "[Shipments/Company]",
+            "name": "Company"
+          },
+          {
+            "id": "w_site",
+            "formula": "[Shipments/Site]",
+            "name": "Site"
+          },
+          {
+            "id": "w_office",
+            "formula": "[Shipments/Office]",
+            "name": "Office"
+          },
+          {
+            "id": "w_mode",
+            "formula": "[Shipments/Mode]",
+            "name": "Mode"
+          },
+          {
+            "id": "w_revenue_eur",
+            "formula": "[Shipments/Revenue EUR]",
+            "name": "Revenue EUR"
+          }
+        ]
+      }
+    ],
+    "pages": [
+      {
+        "id": "page-main",
+        "name": "Secured"
+      }
+    ],
+    "layout": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Page type=\"grid\" gridTemplateColumns=\"repeat(24, 1fr)\" gridTemplateRows=\"auto\" id=\"page-main\">\n  <Element elementId=\"secured\" gridColumn=\"1 / 25\" gridRow=\"1 / 25\"/>\n</Page>"
+  }
+}

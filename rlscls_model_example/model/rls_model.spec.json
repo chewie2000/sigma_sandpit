@@ -1,0 +1,226 @@
+{
+  "name": "RLS Additive Grants Example",
+  "description": "Additive row-level security: a user's scope is the UNION of every team grant and personal grant they hold. CurrentUserInTeam() is resolved per grant ROW (never against a concatenated team-name string - it silently fails for multi-team entities) and aggregated with Max(); CurrentUserEmail() covers personal grants. A compound-key Lookup() matches (entity_type, entity_value) against one grants ledger - no per-dimension child tables, no user attributes, no team-to-user mapping replicated into the warehouse.",
+  "schemaVersion": 1,
+  "folderId": "86e607cd-f13e-4bef-a9cb-b0e8a103ae6f",
+  "pages": [
+    {
+      "id": "page1",
+      "name": "Model",
+      "elements": [
+        {
+          "id": "grants",
+          "kind": "table",
+          "name": "Entity Grants",
+          "description": "The grants ledger. Additive by construction: no priority column.",
+          "source": {
+            "kind": "warehouse-table",
+            "connectionId": "42d71980-349a-4a0d-81e9-1ace9e54c49b",
+            "path": [
+              "mark_o",
+              "rls_entity_grants"
+            ]
+          },
+          "columns": [
+            {
+              "id": "g_etype",
+              "formula": "[rls_entity_grants/entity_type]",
+              "name": "Entity Type"
+            },
+            {
+              "id": "g_evalue",
+              "formula": "[rls_entity_grants/entity_value]",
+              "name": "Entity Value"
+            },
+            {
+              "id": "g_ptype",
+              "formula": "[rls_entity_grants/principal_type]",
+              "name": "Principal Type"
+            },
+            {
+              "id": "g_pid",
+              "formula": "[rls_entity_grants/principal_id]",
+              "name": "Principal ID"
+            },
+            {
+              "id": "g_team",
+              "formula": "If([Principal Type] = \"team\", [Principal ID])",
+              "name": "Team Principal",
+              "description": "Diagnostic only: null for user grants, so ListAgg yields teams."
+            },
+            {
+              "id": "g_user",
+              "formula": "If([Principal Type] = \"user\", [Principal ID])",
+              "name": "User Principal",
+              "description": "Diagnostic only: null for team grants, so ListAgg yields emails."
+            },
+            {
+              "id": "g_applies",
+              "formula": "If([Principal Type] = \"team\", Coalesce(CurrentUserInTeam([Principal ID]), False), [Principal ID] = CurrentUserEmail())",
+              "name": "Grant Applies",
+              "description": "Does THIS grant row apply to the current user?"
+            },
+            {
+              "id": "g_applies_n",
+              "formula": "If([Grant Applies] = True, 1, 0)",
+              "name": "Grant Applies Num",
+              "description": "Numeric form so Max() can aggregate it additively: Max = 1 means at least one grant matched."
+            }
+          ]
+        },
+        {
+          "id": "shipments",
+          "kind": "table",
+          "name": "Shipments",
+          "description": "Fact table secured by the additive grants pattern.",
+          "source": {
+            "kind": "warehouse-table",
+            "connectionId": "42d71980-349a-4a0d-81e9-1ace9e54c49b",
+            "path": [
+              "mark_o",
+              "rls_shipments"
+            ]
+          },
+          "columns": [
+            {
+              "id": "s_id",
+              "formula": "[rls_shipments/shipment_id]",
+              "name": "Shipment ID"
+            },
+            {
+              "id": "s_date",
+              "formula": "[rls_shipments/shipped_date]",
+              "name": "Shipped Date"
+            },
+            {
+              "id": "s_company",
+              "formula": "[rls_shipments/company]",
+              "name": "Company"
+            },
+            {
+              "id": "s_site",
+              "formula": "[rls_shipments/site]",
+              "name": "Site"
+            },
+            {
+              "id": "s_office",
+              "formula": "[rls_shipments/office]",
+              "name": "Office"
+            },
+            {
+              "id": "s_mode",
+              "formula": "[rls_shipments/mode]",
+              "name": "Mode"
+            },
+            {
+              "id": "s_revenue",
+              "formula": "[rls_shipments/revenue_eur]",
+              "name": "Revenue EUR"
+            },
+            {
+              "id": "s_teu",
+              "formula": "[rls_shipments/teu]",
+              "name": "TEU"
+            },
+            {
+              "id": "b_office_key",
+              "hidden": true,
+              "name": "Office Key",
+              "formula": "\"office\""
+            },
+            {
+              "id": "b_office_teams",
+              "hidden": true,
+              "name": "Office Team Names",
+              "formula": "Lookup(ListAgg([Entity Grants/Team Principal], \",\"), [Office Key], [Entity Grants/Entity Type], [Office], [Entity Grants/Entity Value])"
+            },
+            {
+              "id": "b_office_users",
+              "hidden": true,
+              "name": "Office User Emails",
+              "formula": "Lookup(ListAgg([Entity Grants/User Principal], \",\"), [Office Key], [Entity Grants/Entity Type], [Office], [Entity Grants/Entity Value])"
+            },
+            {
+              "id": "b_office_rls",
+              "hidden": true,
+              "name": "Office RLS",
+              "formula": "Coalesce(Lookup(Max([Entity Grants/Grant Applies Num]), [Office Key], [Entity Grants/Entity Type], [Office], [Entity Grants/Entity Value]), 0) = 1"
+            },
+            {
+              "id": "b_company_key",
+              "hidden": true,
+              "name": "Company Key",
+              "formula": "\"company\""
+            },
+            {
+              "id": "b_company_teams",
+              "hidden": true,
+              "name": "Company Team Names",
+              "formula": "Lookup(ListAgg([Entity Grants/Team Principal], \",\"), [Company Key], [Entity Grants/Entity Type], [Company], [Entity Grants/Entity Value])"
+            },
+            {
+              "id": "b_company_users",
+              "hidden": true,
+              "name": "Company User Emails",
+              "formula": "Lookup(ListAgg([Entity Grants/User Principal], \",\"), [Company Key], [Entity Grants/Entity Type], [Company], [Entity Grants/Entity Value])"
+            },
+            {
+              "id": "b_company_rls",
+              "hidden": true,
+              "name": "Company RLS",
+              "formula": "Coalesce(Lookup(Max([Entity Grants/Grant Applies Num]), [Company Key], [Entity Grants/Entity Type], [Company], [Entity Grants/Entity Value]), 0) = 1"
+            },
+            {
+              "id": "b_site_key",
+              "hidden": true,
+              "name": "Site Key",
+              "formula": "\"site\""
+            },
+            {
+              "id": "b_site_teams",
+              "hidden": true,
+              "name": "Site Team Names",
+              "formula": "Lookup(ListAgg([Entity Grants/Team Principal], \",\"), [Site Key], [Entity Grants/Entity Type], [Site], [Entity Grants/Entity Value])"
+            },
+            {
+              "id": "b_site_users",
+              "hidden": true,
+              "name": "Site User Emails",
+              "formula": "Lookup(ListAgg([Entity Grants/User Principal], \",\"), [Site Key], [Entity Grants/Entity Type], [Site], [Entity Grants/Entity Value])"
+            },
+            {
+              "id": "b_site_rls",
+              "hidden": true,
+              "name": "Site RLS",
+              "formula": "Coalesce(Lookup(Max([Entity Grants/Grant Applies Num]), [Site Key], [Entity Grants/Entity Type], [Site], [Entity Grants/Entity Value]), 0) = 1"
+            },
+            {
+              "id": "combined_b",
+              "hidden": true,
+              "name": "Combined RLS",
+              "formula": "[Office RLS] Or [Company RLS] Or [Site RLS]",
+              "description": "Visible if ANY dimension grants this row \u2014 the additive union."
+            },
+            {
+              "id": "combined_num",
+              "hidden": true,
+              "name": "Combined RLS Num",
+              "formula": "If([Combined RLS] = True, 1, 0)",
+              "description": "Filter target: 1 = visible to the current user."
+            }
+          ],
+          "filters": [
+            {
+              "id": "f_rls",
+              "columnId": "combined_num",
+              "kind": "number-range",
+              "min": 1,
+              "max": 1,
+              "includeNulls": "never"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

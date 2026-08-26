@@ -15,6 +15,7 @@ sigma_sandpit/
 ├── writeback_info_sf/         # Snowflake — writeback (input table) inventory and cleanup toolkit
 ├── writeback_info_dbx/        # Databricks — writeback (input table) inventory and cleanup toolkit
 ├── sigma_org_audit/           # Sigma org governance / migration-readiness audit pipeline (raw→stage→marts)
+├── rlscls_model_example/      # Additive row-level security pattern (union of team + personal grants)
 └── sigma_skills/              # Claude Code skills for Sigma work (proof-of-concept reference implementations)
 ```
 
@@ -34,6 +35,9 @@ Databricks toolkit for inventorying and monitoring Sigma writeback (input table)
 
 ### [sigma_org_audit](sigma_org_audit/README.md)
 A raw → stage → marts pipeline over the Sigma REST API (plus a writeback-schema scan) that produces a holistic governance / migration-readiness audit of a Sigma org: inventory, R/A/G migration scoring, ownership and writeback cleanup queues, tenancy and deployment topology, and snapshot drift. Read-only — it reports, it does not remediate.
+
+### [rlscls_model_example](rlscls_model_example/README.md)
+Working reference implementation of **additive** row-level security in Sigma, where a person's visible scope is the union of every team grant and every personal grant they hold. Uses `CurrentUserInTeam()` and `CurrentUserEmail()` against a warehouse grants ledger, so no user attributes are needed and team membership is never replicated into the warehouse. Includes deterministic synthetic data, a SQL oracle that asserts the union semantics, and end-to-end validation against a live Sigma org. Documents a significant correction: `CurrentUserInTeam()` does not accept a comma-separated list of teams.
 
 ### [sigma_skills](sigma_skills/)
 Reusable [Claude Code](https://claude.com/claude-code) skills for Sigma Computing work, shared as proof-of-concept reference implementations to extrapolate from. Currently includes [sigma-model-sql-rls-audit](sigma_skills/sigma-model-sql-rls-audit/README.md) — audits the strength of row-level security implemented in Sigma data-model Custom SQL by checking how well each block is scoped by a user attribute.
