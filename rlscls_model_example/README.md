@@ -390,6 +390,14 @@ client-side, and signing requires a Developer Access credential with embedding
 enabled, which `SIGMA_CLIENT_ID` may or may not be. **Open one in a browser to
 confirm.**
 
+This step is entirely optional and doesn't affect whether the pattern itself
+works — `validate_personas.py` above already proves the row counts match
+through the real API, independent of embedding. Embedding is a separate,
+plan-gated Sigma feature; if your org's plan doesn't include it, or you don't
+have a Developer Access credential with it enabled, skip this script — there's
+no fallback that gets you the same visual confirmation without it, but nothing
+else in this reference depends on it.
+
 ---
 
 ## Files
@@ -413,9 +421,10 @@ rlscls_model_example/
 ├── build_model.py               # generates + POSTs the data model spec
 ├── build_workbook.py            # both workbooks (--build/--kind) + grants + CSV export
 ├── validate_personas.py         # per-persona expected vs actual
-├── make_embed_urls.py           # JWT embed URLs per persona
+├── make_embed_urls.py           # OPTIONAL — visual per-persona confirmation, needs embedding enabled
 ├── doc/
-│   └── additive-rls-approach.html  # standalone write-up of the pattern
+│   ├── additive-rls-approach.html  # standalone write-up of the pattern
+│   └── additive-rls-approach.md    # same write-up, markdown version
 ├── model/                       # generated specs (committed for review)
 │   ├── rls_model.spec.json
 │   ├── rls_secured.workbook.json
