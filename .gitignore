@@ -63,3 +63,6 @@ logs/
 # Claude Code — local personal settings and worktree state
 .claude/settings.local.json
 .claude/worktrees/
+
+# Beads issue-tracker data — private, must not be pushed to a public repo
+.beads/
