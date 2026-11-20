@@ -72,8 +72,8 @@ CREATE EXTERNAL ACCESS INTEGRATION IF NOT EXISTS sigds_sigma_access
   ENABLED = TRUE;
 
 -- 4. Grants to the role that creates and runs the procedure.
---    (The procedure runs with its OWNER's rights, so everything it touches must be
---    granted to the role that creates it.)
+--    (The procedure runs with the CALLER's rights (EXECUTE AS CALLER), so everything it
+--    granted to the role that will CALL it.)
 GRANT USAGE ON INTEGRATION sigds_sigma_access          TO ROLE <YOUR_ROLE>;
 GRANT READ  ON SECRET sigds_sigma_base_url             TO ROLE <YOUR_ROLE>;
 GRANT READ  ON SECRET sigds_sigma_client_id            TO ROLE <YOUR_ROLE>;
@@ -97,6 +97,11 @@ GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE <YOUR_ROLE>;
 
 -- The role also needs, on <YOUR_DATABASE>.<YOUR_SCHEMA>: USAGE, CREATE TABLE,
 -- CREATE VIEW and CREATE PROCEDURE (SYSADMIN has these if it owns the schema).
+--
+-- NOTE: the network rule and secrets above are created by ACCOUNTADMIN *in that schema*,
+-- so your ACCOUNTADMIN session must be able to create objects there. That is automatic
+-- if the schema is owned by SYSADMIN (ACCOUNTADMIN inherits it). If you use a dedicated
+-- role instead, grant it up first:  GRANT ROLE <YOUR_ROLE> TO ROLE ACCOUNTADMIN;
 
 
 -- =============================================================================

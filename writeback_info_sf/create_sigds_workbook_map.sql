@@ -44,9 +44,9 @@ CREATE TABLE IF NOT EXISTS SIGDS_WORKBOOK_MAP (
   WAL_MAX_EDIT_NUM     NUMBER(38,0)  COMMENT 'Highest EDIT_NUM seen in the WAL for this SIGDS table',
 
   -- ---------------------------------------------------------------------------
-  -- SIGDS Snowflake table physical metadata  (populated via INFORMATION_SCHEMA.TABLES)
+  -- SIGDS Snowflake table physical metadata  (INFORMATION_SCHEMA.TABLES + ACCOUNT_USAGE.TABLE_STORAGE_METRICS)
   -- ---------------------------------------------------------------------------
-  SIGDS_TABLE_ID             VARCHAR       COMMENT 'Snowflake internal table ID from INFORMATION_SCHEMA.TABLES',
+  SIGDS_TABLE_ID             VARCHAR       COMMENT 'Snowflake internal table ID (ACCOUNT_USAGE.TABLE_STORAGE_METRICS.ID; NULL if that view is unreadable or the table is too new)',
   SIGDS_TABLE_CREATED_AT     TIMESTAMP_NTZ COMMENT 'Timestamp when the SIGDS table was first created',
   SIGDS_TABLE_LAST_MODIFIED  TIMESTAMP_NTZ COMMENT 'Timestamp of the most recent alteration to the SIGDS table (LAST_ALTERED from INFORMATION_SCHEMA.TABLES)',
   SIGDS_TABLE_SIZE_BYTES     NUMBER(38,0)  COMMENT 'Current active size of the SIGDS table in bytes (BYTES from INFORMATION_SCHEMA.TABLES)',
@@ -115,7 +115,7 @@ ALTER TABLE SIGDS_WORKBOOK_MAP ADD COLUMN IF NOT EXISTS LAST_SCANNED_AT         
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS SIGDS_ACCESS_LOG (
   QUERY_ID          VARCHAR,
-  ACCESS_KIND       VARCHAR       COMMENT 'READ (BASE_OBJECTS_ACCESSED of a SELECT) or INSERT (OBJECTS_MODIFIED of an INSERT that added rows)',
+  ACCESS_KIND       VARCHAR       COMMENT 'READ (BASE_OBJECTS_ACCESSED of a SELECT) or INSERT (OBJECTS_MODIFIED of an INSERT that added rows). In testing Sigma writeback arrived as comment-less MERGEs, so in practice only READ is populated; writes are seen via the WAL.',
   OBJECT_NAME       VARCHAR       COMMENT 'Bare table name, upper-cased and unquoted (match case-insensitively)',
   OBJECT_DATABASE   VARCHAR       COMMENT 'Upper-cased database',
   OBJECT_SCHEMA     VARCHAR       COMMENT 'Upper-cased schema',

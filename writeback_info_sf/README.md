@@ -1,6 +1,8 @@
 # writeback_info_sf
 
-> **IN DEVELOPMENT — Do not use.** This toolkit is under active development. Content may be incomplete, incorrect, or subject to breaking changes without notice. The v2 changes below have **not yet been run against a live Snowflake account** (the procedure's Python compiles and the SQL files are syntactically plausible, nothing more) — treat first runs as a test.
+> **IN DEVELOPMENT — Do not use.** This toolkit is under active development. Content may be incomplete, incorrect, or subject to breaking changes without notice.
+>
+> **Test status.** v2 has been deployed and run end to end on one Snowflake account (Enterprise Edition) against a schema of 218 WAL tables: scan, merge, orphan detection, access-log load and its incremental overlap, score snapshots, the scoring views, the coverage cap, and every report query. **Not yet exercised against a live Sigma API** (workbook names, owners, archived and not-found state): that path is covered only by local unit tests with synthetic data. Treat your first run with real Sigma credentials as a test.
 
 A standalone, **read-only information tool** for Sigma writeback (input table) estates on Snowflake. It runs **entirely inside Snowflake** as a stored procedure — call it from a Snowsight worksheet or notebook, or schedule it with a task; nothing runs on your machine. It answers three questions about every `SIGDS_*` table:
 
@@ -74,20 +76,21 @@ Everything is idempotent, so re-running a file is safe. The Sigma client secret 
 
 ### Run it
 
-In a worksheet (or a Snowsight notebook SQL cell), as the procedure owner's role. **Always pass `MAP_SCHEMA` explicitly:**
+In a worksheet (or a Snowsight notebook SQL cell), as the role that holds the setup grants (the procedure runs with the **caller's** rights). **Always pass `MAP_DATABASE` and `MAP_SCHEMA` explicitly:**
 
 ```sql
--- CALL sigds_scan(<writeback database>, <writeback schema(s), comma-separated>, <map schema>);
-CALL sigds_scan('MY_DB', 'WRITEBACK', 'WRITEBACK');
-CALL sigds_scan('MY_DB', 'PROD_WB,DEV_WB', 'WRITEBACK');       -- several writeback schemas, one run
-CALL sigds_scan('MY_DB', 'WRITEBACK', 'WRITEBACK', TRUE);      -- skip the query-history load
+-- CALL sigds_scan(<writeback db>, <writeback schema(s), comma-separated>, <map schema>, <map db>);
+CALL sigds_scan('WB_DB', 'WRITEBACK', 'INFO', 'TOOL_DB');
+CALL sigds_scan('WB_DB', 'PROD_WB,DEV_WB', 'INFO', 'TOOL_DB');       -- several writeback schemas, one run
+CALL sigds_scan('WB_DB', 'WRITEBACK', 'INFO', 'TOOL_DB', TRUE);      -- skip the query-history load
 ```
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `WB_DATABASE` | required | Database containing the writeback schema(s). |
 | `SCAN_SCHEMAS` | required | Comma-separated writeback schemas to scan. |
-| `MAP_SCHEMA` | caller's current schema | Where the map/log tables live — pass it explicitly. |
+| `MAP_SCHEMA` | caller's current schema | Schema holding the map/log tables — pass it explicitly. |
+| `MAP_DATABASE` | `WB_DATABASE` | Database holding the map/log tables. Usually **not** the writeback database — pass it explicitly. |
 | `SKIP_ACCESS_LOG` | `FALSE` | Skip the query-history load (e.g. grant not in place yet). |
 | `BACKFILL_DAYS` | `90` | First access-log load look-back (QUERY_HISTORY keeps 365). |
 | `OVERLAP_HOURS` | `12` | Re-scan buffer for ACCESS_HISTORY latency (~3 h). |
@@ -115,13 +118,13 @@ Start with `archival_scoring.sql` query 3 (is access evidence loaded?), then que
 
 | Symptom | Likely cause |
 |---|---|
-| `Bookkeeping tables not found …` | Files 2/3 haven't been run in that schema, or `MAP_SCHEMA` points elsewhere. |
+| `Bookkeeping tables not found …` | Files 2/3 haven't been run in that database/schema, or `MAP_DATABASE` / `MAP_SCHEMA` point elsewhere. |
 | `Integration … does not exist or not authorized`, or a secret/network error when creating the procedure | Step 1 not run, or your role lacks `USAGE` on the integration / `READ` on the three secrets. |
 | `Failed to connect` / host errors from the Sigma API | The host in `setup_prerequisites.sql` doesn't match your Sigma region, or the network rule/secret has a typo. |
-| `SKIPPED: cannot read … ACCESS_HISTORY` | Not Enterprise Edition, or the `IMPORTED PRIVILEGES` grant is missing for the procedure owner's role. The rest still works; scores are write-only and TIER 1 is capped. |
+| `SKIPPED: cannot read … ACCESS_HISTORY` | Not Enterprise Edition, or the `IMPORTED PRIVILEGES` grant is missing for the role calling the procedure. The rest still works; scores are write-only and TIER 1 is capped. |
 | `WARN: org-wide workbook list refused` | The Sigma credential isn't Admin scope. Enrichment still runs but `API_NOT_FOUND` is off for the run. |
-| `WARN: no WAL tables visible but N previously known` | The owner role lost `USAGE`/`SELECT` on the writeback schema. Nothing was flagged deleted. |
-| `Discovered 0 WAL table(s)` on a first run | Wrong schema name in `SCAN_SCHEMAS`, or the owner role can't see that schema. |
+| `WARN: no WAL tables visible but N previously known` | The calling role lost `USAGE`/`SELECT` on the writeback schema. Nothing was flagged deleted. |
+| `Discovered 0 WAL table(s)` on a first run | Wrong schema name in `SCAN_SCHEMAS`, or the calling role can't see that schema. |
 
 ---
 
@@ -138,6 +141,8 @@ Start with `archival_scoring.sql` query 3 (is access evidence loaded?), then que
 
 Sigma appends a JSON comment (`-- Sigma Σ {...}`) to every warehouse query it generates, carrying the source workbook URL and the acting user's email. The tool joins `QUERY_HISTORY` × `ACCESS_HISTORY`, keeps those queries that touched a scanned writeback schema, and lands one row per (query, table, `READ`/`INSERT`) in `SIGDS_ACCESS_LOG`.
 
+> **In practice this is read evidence.** On the account it was tested on, Sigma's writeback statements arrive as `MERGE`s that carry **no** Sigma comment, so the `INSERT` branch captured nothing (0 of 196 rows) and `ACCESS_WRITE_COUNT` / `ACCESS_LAST_WRITE_AT` stay empty. That is fine for scoring — **writes are seen through the WAL** (`WAL_LAST_EDIT_AT`), and query history supplies the half the WAL cannot: **reads**. Don't read a zero write count as "never written".
+
 This matters because the WAL only records *edits*. An input table that dashboards read daily but nobody edits looks abandoned from the WAL alone; query history shows it is live. In scoring, recent access applies a large penalty, and **absence of access is never treated as proof of abandonment** — it just removes a protection.
 
 Each row carries `ACCESS_EVIDENCE`:
@@ -151,7 +156,7 @@ Each row carries `ACCESS_EVIDENCE`:
 
 **Coverage cap:** until `SIGDS_ACCESS_LOAD_RUNS` shows successfully-loaded history covering `MIN_ACCESS_COVERAGE_DAYS` (default 90), no table can reach TIER 1 ("quarantine now") — it is held at TIER 2 with an explanatory `SCORE_NOTE`. (Already-`IS_ORPHANED` rows are exempt; their data table is gone, so there is nothing left to break.) Coverage is derived from the loader's own run log, not from the log's earliest row, because a table nobody touched leaves no rows to prove how long it has been watched.
 
-**Caveats:** `ACCESS_HISTORY` lags up to ~3 h (hence the overlap window); `ACCOUNT_USAGE` retains 365 days (the log keeps accumulating beyond that); it only sees the **Snowflake account the tool runs in** — writeback by another account is invisible; and only `SELECT` / `INSERT` statements are captured. Reads by tools other than Sigma are not attributed.
+**Caveats:** `ACCESS_HISTORY` lags up to ~3 h (hence the overlap window); `ACCOUNT_USAGE` retains 365 days (the log keeps accumulating beyond that); it only sees the **Snowflake account the tool runs in** — writeback by another account is invisible; and only `SELECT` / `INSERT` statements carrying Sigma's comment are captured (see the note above on writes). Reads by tools other than Sigma are not attributed.
 
 ### What changed from v1
 
@@ -185,7 +190,8 @@ Prefixes show the data source:
 | `WAL_DS_ID`, `WAL_WORKBOOK_URL`, `WAL_INPUT_TABLE_NAME` | From the latest WAL record |
 | `WAL_LAST_EDIT_AT` / `_BY` / `WAL_MAX_EDIT_NUM` | Latest WAL edit time, editor, highest edit number |
 | `WAL_TABLE_LAST_MODIFIED`, `WAL_TABLE_SIZE_BYTES` | WAL table `LAST_ALTERED` and active bytes |
-| `SIGDS_TABLE_ID` / `_CREATED_AT` / `_LAST_MODIFIED` | From `INFORMATION_SCHEMA.TABLES` (`LAST_ALTERED` tracks DDL, not edits) |
+| `SIGDS_TABLE_CREATED_AT` / `_LAST_MODIFIED` | From `INFORMATION_SCHEMA.TABLES` (`LAST_ALTERED` tracks DDL, not edits) |
+| `SIGDS_TABLE_ID` | `ACCOUNT_USAGE.TABLE_STORAGE_METRICS.ID` (NULL if unreadable or table too new) |
 | `SIGDS_TABLE_SIZE_BYTES` | Active bytes |
 | `SIGDS_TABLE_TOTAL_BYTES` | Active + Time Travel + Fail-safe (NULL if `ACCOUNT_USAGE` unreadable) |
 | `WORKBOOK_ID` / `_NAME` / `_PATH`, `OBJECT_TYPE` | Sigma workbook or data model (`WORKBOOK` / `DATA_MODEL`) |
@@ -281,8 +287,10 @@ Recovery is simple when a table was moved rather than dropped — rename it back
 
 ## Known limitations
 
-- **Untested against a live account** as of this revision — see the note at the top.
-- Access evidence needs Enterprise Edition + `IMPORTED PRIVILEGES`; single Snowflake account only; `SELECT`/`INSERT` only; relies on Sigma's query-comment format.
+- **Sigma API enrichment is untested against a live org** — see the test-status note at the top.
+- Access evidence needs Enterprise Edition + `IMPORTED PRIVILEGES`; single Snowflake account only; it is effectively read evidence (writes come from the WAL); relies on Sigma's query-comment format.
+- A SIGDS data table with **no WAL record** is invisible to the scan (discovery is WAL-driven). The tool's own `SIGDS_*` tables are not confused with writeback tables, for the same reason.
+- The procedure runs with the **caller's** rights, so the calling role needs every grant from the setup file.
 - A data model missing from the Sigma API is never flagged `API_NOT_FOUND` (its list is visibility-scoped), and a non-admin token disables the signal for workbooks too.
 - Changing the casing of `SCAN_SCHEMAS` between runs creates separate rows (names are upper-cased; pre-v2 rows stored with a different case will not merge).
 - Writeback to Databricks is out of scope here — see `writeback_info_dbx`.

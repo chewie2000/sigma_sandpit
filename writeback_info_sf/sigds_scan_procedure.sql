@@ -13,7 +13,7 @@
 --                    create_sigds_workbook_map.sql
 --                    scoring_views.sql
 --                    this file
--- Then:              CALL sigds_scan('MY_DB', 'WRITEBACK');
+-- Then:              CALL sigds_scan('WB_DB', 'WRITEBACK', 'INFO', 'TOOL_DB');
 --
 -- Find & replace <YOUR_DATABASE> / <YOUR_SCHEMA> first (the schema holding the map
 -- tables; the secrets and integration from setup_prerequisites.sql live there).
@@ -23,10 +23,17 @@
 --   SCAN_SCHEMAS    comma-separated writeback schemas, e.g. 'PROD_WB,DEV_WB' (required)
 --   MAP_SCHEMA      schema holding the map/log tables. Pass it explicitly; if omitted it
 --                   falls back to CURRENT_SCHEMA() of the calling session
+--   MAP_DATABASE    database holding the map/log tables (usually NOT the writeback
+--                   database). Pass it explicitly; if omitted it defaults to WB_DATABASE
 --   SKIP_ACCESS_LOG TRUE to skip the query-history load                  (default FALSE)
 --   BACKFILL_DAYS   first access-log load look-back; QUERY_HISTORY keeps 365 (default 90)
 --   OVERLAP_HOURS   re-scan buffer for ACCESS_HISTORY latency (~3 h)        (default 12)
 --   MAX_WAL_TABLES  cap WAL tables for testing; disables deletion detection (default 0=all)
+--
+-- Runs with the CALLER's rights (EXECUTE AS CALLER): an owner's-rights procedure cannot
+-- create the temporary staging tables the scan uses. So CALL it as the role that holds
+-- the grants from setup_prerequisites.sql (integration, secrets, writeback schema
+-- SELECT, IMPORTED PRIVILEGES on SNOWFLAKE). A TASK runs as the task owner's role.
 --
 -- Returns the run log as text (also visible in the worksheet result).
 -- Database/schema names are treated as unquoted (upper-cased) identifiers.
@@ -42,6 +49,7 @@ CREATE OR REPLACE PROCEDURE sigds_scan(
     WB_DATABASE     STRING,
     SCAN_SCHEMAS    STRING,
     MAP_SCHEMA      STRING  DEFAULT NULL,
+    MAP_DATABASE    STRING  DEFAULT NULL,
     SKIP_ACCESS_LOG BOOLEAN DEFAULT FALSE,
     BACKFILL_DAYS   NUMBER  DEFAULT 90,
     OVERLAP_HOURS   NUMBER  DEFAULT 12,
@@ -56,6 +64,7 @@ SECRETS = ('sigma_base_url'      = sigds_sigma_base_url,
            'sigma_client_id'     = sigds_sigma_client_id,
            'sigma_client_secret' = sigds_sigma_client_secret)
 HANDLER = 'main'
+EXECUTE AS CALLER
 AS
 $$
 import uuid
@@ -382,14 +391,15 @@ def extract_wal_records_batch(wal_batch):
 
 
 def load_storage_metrics(database, schema):
-    """{TABLE_NAME_UPPER: active+time-travel+fail-safe bytes}; {} if ACCOUNT_USAGE unreadable."""
+    """{TABLE_NAME_UPPER: {"total": active+time-travel+fail-safe bytes, "id": table id}};
+    {} if ACCOUNT_USAGE is unreadable. (INFORMATION_SCHEMA.TABLES has no table id.)"""
     try:
         rows = run(f"""
-            SELECT TABLE_NAME, ACTIVE_BYTES + TIME_TRAVEL_BYTES + FAILSAFE_BYTES AS TOTAL_BYTES
+            SELECT TABLE_NAME, ID, ACTIVE_BYTES + TIME_TRAVEL_BYTES + FAILSAFE_BYTES AS TOTAL_BYTES
             FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS
             WHERE TABLE_CATALOG = {q(database)} AND TABLE_SCHEMA = {q(schema)} AND DELETED = FALSE
         """)
-        return {r["TABLE_NAME"].upper(): r["TOTAL_BYTES"] for r in rows}
+        return {r["TABLE_NAME"].upper(): {"total": r["TOTAL_BYTES"], "id": r["ID"]} for r in rows}
     except Exception as e:
         log(f"  WARN: TABLE_STORAGE_METRICS unreadable ({str(e).splitlines()[0]}); "
             "falling back to active bytes only.")
@@ -402,7 +412,7 @@ def scan_schema(cfg, map_fq, fq, schema, now):
     log(f"\n=== Scanning {db}.{schema} ===")
 
     meta = {r["TABLE_NAME"].upper(): r for r in run(f"""
-        SELECT TABLE_NAME, LAST_ALTERED, CREATED, BYTES, TABLE_ID
+        SELECT TABLE_NAME, LAST_ALTERED, CREATED, BYTES
         FROM {ident(db)}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = {q(schema)}
     """)}
     totals = load_storage_metrics(db, schema)
@@ -436,9 +446,10 @@ def scan_schema(cfg, map_fq, fq, schema, now):
         m = meta.get(sigds_name.upper())
         if m is None:
             return dict(exists=False)
-        return dict(exists=True, id=str(m["TABLE_ID"]) if m.get("TABLE_ID") else None,
+        st = totals.get(sigds_name.upper()) or {}
+        return dict(exists=True, id=str(st["id"]) if st.get("id") is not None else None,
                     created=ntz(m.get("CREATED")), altered=ntz(m.get("LAST_ALTERED")),
-                    bytes=m.get("BYTES"), total=totals.get(sigds_name.upper()))
+                    bytes=m.get("BYTES"), total=st.get("total"))
 
     # --- Merge WAL + physical -------------------------------------------------
     rows = []
@@ -568,7 +579,7 @@ def load_access_log(cfg, fq):
         run("SELECT 1 FROM SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY LIMIT 1")
     except Exception as e:
         msg = ("cannot read SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY - needs Enterprise Edition+ and "
-               "GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE to the procedure owner's role")
+               "GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE to the role calling the procedure")
         log(f"  SKIPPED: {msg}\n  ({str(e).splitlines()[0]})\n"
             "  Scores will reflect WRITES ONLY and TIER 1 will be capped until this works.")
         record("SKIPPED", None, None, 0, msg)
@@ -678,7 +689,7 @@ def snapshot_scores(cfg, fq, now):
 # Entry point
 # ===========================================================================
 
-def main(session, database, scan_schemas, map_schema, skip_access_log,
+def main(session, database, scan_schemas, map_schema, map_database, skip_access_log,
          backfill_days, overlap_hours, max_wal_tables):
     global _S, _LOG
     _S, _LOG = session, []
@@ -687,36 +698,55 @@ def main(session, database, scan_schemas, map_schema, skip_access_log,
     if not database or not schemas:
         raise ValueError("DATABASE and SCAN_SCHEMAS (comma-separated) are required.")
     cfg = {
-        "database": database.upper(),
+        "database": database.upper(),                        # writeback database (scanned)
+        "map_database": (map_database or database).upper(),  # where the tool's own tables live
         "scan_schemas": schemas,
-        "map_schema": (map_schema or run("SELECT CURRENT_SCHEMA() AS S")[0]["S"]).upper(),
+        "map_schema": map_schema,
         "backfill_days": int(backfill_days or 90),
         "overlap_hours": int(overlap_hours or 12),
         "max_wal_tables": int(max_wal_tables or 0),
     }
+    if not cfg["map_schema"]:
+        cfg["map_schema"] = run("SELECT CURRENT_SCHEMA() AS S")[0]["S"]
+    if not cfg["map_schema"]:
+        raise ValueError("MAP_SCHEMA was not given and the session has no current schema.")
+    cfg["map_schema"] = cfg["map_schema"].upper()
     now = utcnow()
 
+    # Give the session a current database/schema: Snowpark's overwrite-mode staging does an
+    # internal unqualified DROP that fails in a session with none (e.g. a scheduled TASK).
+    run(f"USE DATABASE {ident(cfg['map_database'])}")
+    run(f"USE SCHEMA {ident(cfg['map_schema'])}")
+
     def fq(name):
-        return f"{ident(cfg['database'])}.{ident(cfg['map_schema'])}.{ident(name)}"
+        return f"{ident(cfg['map_database'])}.{ident(cfg['map_schema'])}.{ident(name)}"
     map_fq = fq("SIGDS_WORKBOOK_MAP")
 
     log(f"sigds_scan: scanning {cfg['database']}.[{', '.join(schemas)}], map in "
-        f"{cfg['database']}.{cfg['map_schema']}")
+        f"{cfg['map_database']}.{cfg['map_schema']}")
     try:
         run(f"SELECT COUNT(*) AS N FROM {map_fq}")
         run(f"SELECT COUNT(*) AS N FROM {fq('SIGDS_ACCESS_LOG')}")
     except Exception as e:
         raise RuntimeError(
-            f"Bookkeeping tables not found in {cfg['database']}.{cfg['map_schema']} "
+            f"Bookkeeping tables not found in {cfg['map_database']}.{cfg['map_schema']} "
             f"({str(e).splitlines()[0]}). Run create_sigds_workbook_map.sql and scoring_views.sql first, "
-            "or pass MAP_SCHEMA explicitly.")
+            "or pass MAP_DATABASE / MAP_SCHEMA explicitly.")
 
     sc = sigma_config()
 
     for schema in schemas:
         scan_schema(cfg, map_fq, fq, schema, now)
 
-    refresh_enrichment(map_fq, fq, sc, now)
+    try:
+        refresh_enrichment(map_fq, fq, sc, now)
+    except Exception as e:
+        # Loud but not fatal: the warehouse-side evidence (access log, scores) is still
+        # worth collecting. Owner / archived / not-found data simply stays as of the
+        # last successful run.
+        log(f"\nERROR: Sigma enrichment failed ({type(e).__name__}: {str(e).splitlines()[0][:300]}).\n"
+            "  Continuing without it - workbook names, owners, archived and not-found state\n"
+            "  are as of the LAST SUCCESSFUL run. Check the Sigma secrets and network rule.")
 
     if skip_access_log:
         log("\nAccess log skipped (SKIP_ACCESS_LOG).")
@@ -732,9 +762,10 @@ $$;
 -- =============================================================================
 -- Run it
 -- =============================================================================
---   CALL sigds_scan('MY_DB', 'WRITEBACK');
---   CALL sigds_scan('MY_DB', 'PROD_WB,DEV_WB', 'WRITEBACK');   -- several schemas, map in WRITEBACK
---   CALL sigds_scan('MY_DB', 'WRITEBACK', NULL, TRUE);         -- skip the query-history load
+--   -- CALL sigds_scan(<writeback db>, <writeback schema(s)>, <map schema>, <map db>);
+--   CALL sigds_scan('WB_DB', 'WRITEBACK', 'INFO', 'TOOL_DB');
+--   CALL sigds_scan('WB_DB', 'PROD_WB,DEV_WB', 'INFO', 'TOOL_DB');       -- several schemas
+--   CALL sigds_scan('WB_DB', 'WRITEBACK', 'INFO', 'TOOL_DB', TRUE);      -- skip the query-history load
 --
 -- Schedule it (optional). Needs EXECUTE TASK (see setup_prerequisites.sql) and a
 -- warehouse. Daily at 06:00 UTC:
@@ -743,5 +774,5 @@ $$;
 --   WAREHOUSE = <YOUR_WAREHOUSE>
 --   SCHEDULE  = 'USING CRON 0 6 * * * UTC'
 -- AS
---   CALL sigds_scan('MY_DB', 'WRITEBACK');
+--   CALL sigds_scan('WB_DB', 'WRITEBACK', 'INFO', 'TOOL_DB');
 -- ALTER TASK sigds_scan_daily RESUME;
