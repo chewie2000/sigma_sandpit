@@ -78,6 +78,85 @@ CREATE TABLE IF NOT EXISTS SIGDS_WORKBOOK_MAP (
   API_OWNER_ID         VARCHAR       COMMENT 'Sigma member UUID of the workbook owner (from Sigma API)',
   API_IS_ARCHIVED      BOOLEAN       COMMENT 'Archived state from Sigma API; re-checked on every run. FALSE for data models. IDs absent from the API response are left unchanged.',
   API_OWNER_FIRST_NAME VARCHAR       COMMENT 'Owner first name resolved via GET /v2/members',
-  API_OWNER_LAST_NAME  VARCHAR       COMMENT 'Owner last name resolved via GET /v2/members'
+  API_OWNER_LAST_NAME  VARCHAR       COMMENT 'Owner last name resolved via GET /v2/members',
 
+  -- ---------------------------------------------------------------------------
+  -- Added in v2 (also applied to existing deployments by the ALTERs below)
+  -- ---------------------------------------------------------------------------
+  WAL_TABLE_SIZE_BYTES   NUMBER(38,0)  COMMENT 'Active size of the WAL table in bytes (INFORMATION_SCHEMA.TABLES). Reclaimed together with the SIGDS table, so it counts toward reclaimable storage.',
+  SIGDS_TABLE_TOTAL_BYTES NUMBER(38,0) COMMENT 'Active + Time Travel + Fail-safe bytes from ACCOUNT_USAGE.TABLE_STORAGE_METRICS. NULL when ACCOUNT_USAGE is unreadable or the table is too new to appear (~2h latency). Scoring falls back to SIGDS_TABLE_SIZE_BYTES.',
+  API_NOT_FOUND          BOOLEAN       COMMENT 'TRUE when this WORKBOOK_ID was NOT returned by the Sigma API on the latest run (deleted, or not visible to the token). Never set for data models. Re-evaluated every run.',
+  API_LAST_SEEN_AT       TIMESTAMP_NTZ COMMENT 'UTC time of the last run in which the Sigma API returned this WORKBOOK_ID.',
+  LAST_SCANNED_AT        TIMESTAMP_NTZ COMMENT 'UTC time of the last run that processed this row (every row is refreshed every run).'
+
+);
+
+-- Upgrade path for deployments created before v2 (no-ops on a fresh install).
+ALTER TABLE SIGDS_WORKBOOK_MAP ADD COLUMN IF NOT EXISTS WAL_TABLE_SIZE_BYTES    NUMBER(38,0);
+ALTER TABLE SIGDS_WORKBOOK_MAP ADD COLUMN IF NOT EXISTS SIGDS_TABLE_TOTAL_BYTES NUMBER(38,0);
+ALTER TABLE SIGDS_WORKBOOK_MAP ADD COLUMN IF NOT EXISTS API_NOT_FOUND           BOOLEAN;
+ALTER TABLE SIGDS_WORKBOOK_MAP ADD COLUMN IF NOT EXISTS API_LAST_SEEN_AT        TIMESTAMP_NTZ;
+ALTER TABLE SIGDS_WORKBOOK_MAP ADD COLUMN IF NOT EXISTS LAST_SCANNED_AT         TIMESTAMP_NTZ;
+
+
+-- =============================================================================
+-- SIGDS_ACCESS_LOG -- ground-truth reads/writes of writeback tables.
+--
+-- Sigma appends a JSON comment ("-- Sigma Σ {...}") to every warehouse query it
+-- generates, carrying the source workbook URL and the acting user's email.
+-- populate_sigds_workbook_map.py joins SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY to
+-- ACCESS_HISTORY, keeps queries carrying that comment that touched an object in
+-- a scanned writeback schema, and lands one row per (query, object, access kind).
+-- This is what tells a table that is READ all day but never edited apart from one
+-- that is genuinely dead -- the WAL alone cannot.
+-- Requires Snowflake Enterprise Edition+ and GRANT IMPORTED PRIVILEGES ON
+-- DATABASE SNOWFLAKE; without them the loader records a SKIPPED run and the
+-- scoring views cap their recommendations (see SIGDS_SCORING_CONFIG).
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS SIGDS_ACCESS_LOG (
+  QUERY_ID          VARCHAR,
+  ACCESS_KIND       VARCHAR       COMMENT 'READ (BASE_OBJECTS_ACCESSED of a SELECT) or INSERT (OBJECTS_MODIFIED of an INSERT that added rows)',
+  OBJECT_NAME       VARCHAR       COMMENT 'Bare table name, upper-cased and unquoted (match case-insensitively)',
+  OBJECT_DATABASE   VARCHAR       COMMENT 'Upper-cased database',
+  OBJECT_SCHEMA     VARCHAR       COMMENT 'Upper-cased schema',
+  START_TIME        TIMESTAMP_NTZ COMMENT 'Query start time, UTC',
+  USER_NAME         VARCHAR       COMMENT 'Snowflake user the query ran as (usually the Sigma connection user)',
+  ROLE_NAME         VARCHAR,
+  QUERY_TYPE        VARCHAR,
+  ROWS_INSERTED     NUMBER(38,0),
+  SIGMA_SOURCE_URL  VARCHAR       COMMENT 'Workbook URL from the Sigma query comment',
+  SIGMA_KIND        VARCHAR       COMMENT 'Sigma query kind from the comment',
+  SIGMA_USER_EMAIL  VARCHAR       COMMENT 'Sigma user who triggered the query',
+  LOADED_AT         TIMESTAMP_NTZ
+);
+
+-- One row per loader run. Coverage (how far back the log is trustworthy) is
+-- derived from this, NOT from MIN(START_TIME) of the log: a table nobody touched
+-- leaves no log rows, so the log alone cannot prove how long it has been watched.
+CREATE TABLE IF NOT EXISTS SIGDS_ACCESS_LOAD_RUNS (
+  RUN_ID        VARCHAR,
+  RUN_AT        TIMESTAMP_NTZ,
+  WINDOW_START  TIMESTAMP_NTZ,
+  WINDOW_END    TIMESTAMP_NTZ,
+  STATUS        VARCHAR       COMMENT 'OK or SKIPPED',
+  ROWS_LOADED   NUMBER(38,0),
+  DETAIL        VARCHAR
+);
+
+-- Per-run snapshot of every row's score + tier, so movement over time is visible
+-- (see geninfo_queries.sql, query 9).
+CREATE TABLE IF NOT EXISTS SIGDS_SCORE_HISTORY (
+  RUN_ID          VARCHAR,
+  SCORED_AT       TIMESTAMP_NTZ,
+  SCAN_SCHEMA     VARCHAR,
+  SIGDS_TABLE     VARCHAR,
+  WORKBOOK_NAME   VARCHAR,
+  TOTAL_SCORE     NUMBER(5,0),
+  TIER_CODE       NUMBER(1,0),
+  ACCESS_EVIDENCE VARCHAR,
+  TOTAL_BYTES     NUMBER(38,0),
+  IS_ORPHANED     BOOLEAN,
+  IS_DELETED      BOOLEAN,
+  API_IS_ARCHIVED BOOLEAN,
+  API_NOT_FOUND   BOOLEAN
 );

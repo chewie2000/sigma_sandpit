@@ -2,9 +2,10 @@
 -- geninfo_queries.sql
 --
 -- Read-only reporting queries for SIGDS_WORKBOOK_MAP (Snowflake).
--- These queries cover the same analytical dimensions as archival_scoring.sql
--- (status flags, edit recency, edit volume, storage, legacy WAL, version tags)
--- but are structured as exploratory reporting views rather than a scoring engine.
+-- Queries 1-7 are exploratory reporting over the map (status flags, edit recency,
+-- edit volume, storage, legacy WAL, version tags). Queries 8-10 use the v2 additions:
+-- query-history access evidence, score history, and quarantine monitoring.
+-- The scoring model itself lives in scoring_views.sql (see archival_scoring.sql).
 --
 -- Before running, replace <YOUR_DATABASE> and <YOUR_SCHEMA> with the Snowflake
 -- database and schema where SIGDS_WORKBOOK_MAP resides.
@@ -270,3 +271,88 @@ ORDER BY
             OR DATEDIFF(DAY, WAL_LAST_EDIT_AT, CURRENT_TIMESTAMP()) >= 180
        THEN 1 ELSE 0 END ASC,   -- active first
   WAL_LAST_EDIT_AT DESC NULLS LAST;
+
+
+-- =============================================================================
+-- 8) Read-only consumers — live tables the WAL alone would call stale
+--    Tables with recent workbook READS but no recent edits. A write-only view
+--    (queries 3 and 4, or the pre-v2 scoring) would class these as abandoned;
+--    query history shows they are in active use. Never quarantine these.
+--    Requires SIGDS_ACCESS_LOG to be loaded (python script step "access log").
+-- =============================================================================
+
+SELECT
+  SCAN_SCHEMA,
+  SIGDS_TABLE,
+  WORKBOOK_NAME,
+  OWNER_FULL_NAME,
+  DAYS_SINCE_LAST_EDIT,
+  WAL_MAX_EDIT_NUM,
+  DAYS_SINCE_ACCESS,
+  ACCESS_READ_COUNT,
+  ACCESS_DISTINCT_USERS,
+  ACCESS_LAST_USER_EMAIL,
+  ACCESS_LAST_SOURCE_URL,
+  TOTAL_SIZE_MB
+FROM V_SIGDS_ARCHIVAL_SCORE
+WHERE ACCESS_EVIDENCE = 'RECENT'
+  AND (DAYS_SINCE_LAST_EDIT IS NULL OR DAYS_SINCE_LAST_EDIT > 90)
+ORDER BY ACCESS_READ_COUNT DESC;
+
+
+-- =============================================================================
+-- 9) Tier movement since the previous run
+--    Compares each table's latest SIGDS_SCORE_HISTORY snapshot with the one
+--    before it. Tables moving toward TIER 1 deserve an owner conversation;
+--    tables moving away were revived (or the config changed — check
+--    SIGDS_SCORING_CONFIG before reading much into mass movement).
+-- =============================================================================
+
+WITH ranked AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY SCAN_SCHEMA, SIGDS_TABLE ORDER BY SCORED_AT DESC) AS RN
+  FROM SIGDS_SCORE_HISTORY
+)
+SELECT
+  cur.SCAN_SCHEMA,
+  cur.SIGDS_TABLE,
+  cur.WORKBOOK_NAME,
+  prev.TIER_CODE     AS PREVIOUS_TIER,
+  cur.TIER_CODE      AS CURRENT_TIER,
+  prev.TOTAL_SCORE   AS PREVIOUS_SCORE,
+  cur.TOTAL_SCORE    AS CURRENT_SCORE,
+  cur.ACCESS_EVIDENCE,
+  prev.SCORED_AT     AS PREVIOUS_RUN_AT,
+  cur.SCORED_AT      AS CURRENT_RUN_AT
+FROM ranked cur
+JOIN ranked prev
+  ON  prev.SCAN_SCHEMA = cur.SCAN_SCHEMA
+  AND prev.SIGDS_TABLE = cur.SIGDS_TABLE
+  AND cur.RN = 1 AND prev.RN = 2
+WHERE cur.TIER_CODE <> prev.TIER_CODE
+ORDER BY cur.TIER_CODE ASC, cur.TOTAL_SCORE DESC;
+
+
+-- =============================================================================
+-- 10) Quarantine watch — failed Sigma queries since a table was moved
+--     During the 30-day quarantine period, any Sigma-generated query that fails
+--     with "object does not exist" (error 2003) against a SIGDS name is a sign
+--     something still depended on it: rename it back immediately.
+--     Replace <WRITEBACK_SCHEMA> with the schema name (matched against query text)
+--     and adjust the window to the start of your quarantine period.
+--     Indicative, not exhaustive: it depends on the failed statement still carrying
+--     Sigma's query comment, and ACCOUNT_USAGE lags by up to ~45 minutes.
+-- =============================================================================
+
+SELECT
+  START_TIME,
+  USER_NAME,
+  ERROR_CODE,
+  ERROR_MESSAGE,
+  LEFT(QUERY_TEXT, 400) AS QUERY_TEXT_PREVIEW
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE START_TIME >= DATEADD(DAY, -30, CURRENT_TIMESTAMP())
+  AND ERROR_CODE IN ('2003', '2043')
+  AND POSITION('-- Sigma Σ ' IN QUERY_TEXT) > 0
+  AND QUERY_TEXT ILIKE '%SIGDS%'
+  AND QUERY_TEXT ILIKE '%<WRITEBACK_SCHEMA>%'
+ORDER BY START_TIME DESC;

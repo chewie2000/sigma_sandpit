@@ -1,21 +1,28 @@
 # writeback_info_sf
 
-> **IN DEVELOPMENT — Do not use.** This toolkit is currently under active development. Content may be incomplete, incorrect, or subject to breaking changes without notice.
+> **IN DEVELOPMENT — Do not use.** This toolkit is under active development. Content may be incomplete, incorrect, or subject to breaking changes without notice. The v2 changes below have **not yet been run against a live Snowflake account** (the Python compiles and the SQL files split cleanly, nothing more) — treat first runs as a test.
 
-A Snowflake toolkit for inventorying and monitoring Sigma writeback (input table) activity across a schema. It maps every active writeback WAL table to its Sigma workbook or data model, enriches records with Snowflake table metadata and Sigma API ownership data, and populates a central `SIGDS_WORKBOOK_MAP` table for reporting and cleanup.
+A standalone, **read-only information tool** for Sigma writeback (input table) estates on Snowflake. It answers three questions about every `SIGDS_*` table:
+
+1. **Whose is it?** — maps each WAL / data table to its Sigma workbook or data model, owner, folder, and archived / deleted state.
+2. **Is anyone using it?** — combines the WAL (who *edits*) with Snowflake query history (who *reads*), so a table that is read all day but never edited is not mistaken for a dead one.
+3. **What could be reclaimed?** — a transparent, tunable score and tier per table, plus reclaimable storage including Time Travel / Fail-safe.
+
+It never drops, renames, or alters writeback tables. It needs no ACCOUNTADMIN, no external access integration, and no other toolkit — just a Python runner, a Snowflake role, and Sigma API credentials.
 
 ## Overview
 
-When Sigma writebacks are enabled, Sigma creates a WAL table (`SIGDS_WAL_*`) and a data table (`SIGDS_*`) in Snowflake for each input table. Over time these accumulate — workbooks get archived, tables go stale, and orphaned WAL records are left behind. This toolkit provides visibility into that state so administrators can identify cleanup candidates and track the migration of writeback workbooks.
+When Sigma writebacks are enabled, Sigma creates a WAL table (`SIGDS_WAL_*`) and a data table (`SIGDS_*`) in Snowflake for each input table. Over time these accumulate — workbooks get archived or deleted, tables go stale, WAL records are orphaned. This toolkit gives administrators visibility into that state so cleanup can be planned safely.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `create_sigds_workbook_map.sql` | DDL — creates the `SIGDS_WORKBOOK_MAP` table in Snowflake (run once) |
-| `populate_sigds_workbook_map.py` | Main script — incrementally populates `SIGDS_WORKBOOK_MAP` from WAL tables and the Sigma API |
-| `archival_scoring.sql` | Weighted confidence scoring matrix — scores every record across multiple signals to surface archival candidates |
-| `geninfo_queries.sql` | Reporting queries — landscape overview, storage reclamation, owner accountability, multi-table workbooks, legacy WAL inventory |
+| `populate_sigds_workbook_map.py` | The runner. `--init` creates objects; a normal run scans, enriches, loads the access log, and snapshots scores. Configured by environment variables. |
+| `create_sigds_workbook_map.sql` | DDL: `SIGDS_WORKBOOK_MAP`, `SIGDS_ACCESS_LOG`, `SIGDS_ACCESS_LOAD_RUNS`, `SIGDS_SCORE_HISTORY`. Idempotent; upgrades pre-v2 maps in place. |
+| `scoring_views.sql` | The scoring model, in **one place**: `SIGDS_SCORING_CONFIG` (tunable weights), `V_SIGDS_ACCESS_SUMMARY`, `V_SIGDS_ARCHIVAL_SCORE`, `V_SIGDS_TIER_SUMMARY`. |
+| `archival_scoring.sql` | Read-only queries over the scoring views, plus the safe-deletion procedure. |
+| `geninfo_queries.sql` | Exploratory reports: landscape, reclamation, staleness, owners, multi-table workbooks, legacy WALs, read-only consumers, tier movement, quarantine watch. |
 
 ---
 
@@ -23,230 +30,260 @@ When Sigma writebacks are enabled, Sigma creates a WAL table (`SIGDS_WAL_*`) and
 
 ### Prerequisites
 
-- Snowflake account with access to the database and schema containing your `SIGDS_WAL_*` and `SIGDS_*` tables
-- A Snowflake user with `SELECT` on the writeback schema and `SELECT` + `INSERT` + `UPDATE` + `MERGE` on the schema where `SIGDS_WORKBOOK_MAP` lives
-- Python 3.8+ with `snowflake-connector-python` and `requests` installed:
+- Python 3.8+ with `snowflake-connector-python` and `requests`:
   ```
   pip install snowflake-connector-python requests
   ```
-- Sigma API client credentials (admin scope recommended for full org visibility)
+- A Snowflake role with `SELECT` on the writeback schema(s) and `CREATE TABLE` / `CREATE VIEW` + DML on the schema that will hold the map.
+- **Recommended — for access evidence:** Snowflake **Enterprise Edition** or higher, and
+  ```sql
+  GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE <YOUR_ROLE>;
+  ```
+  This unlocks `ACCOUNT_USAGE.ACCESS_HISTORY` / `QUERY_HISTORY` (who reads and writes each table) and `TABLE_STORAGE_METRICS` (Time Travel / Fail-safe bytes). Without it the tool still works, but scores reflect **writes only** and nothing can reach TIER 1 (see [Access evidence](#access-evidence-and-the-safety-cap)).
+- Sigma API client credentials with **Admin** scope: *Administration → Developer Access → Create New*. Admin scope is what lets the tool list **every** workbook in the org (`skipPermissionCheck`); without it, "workbook not found" cannot be trusted and the tool turns that signal off for the run. [Docs](https://help.sigmacomputing.com/reference/generate-client-credentials).
 
-### 1. Create the table (once)
+### Configuration — environment variables
 
-Edit `create_sigds_workbook_map.sql` and replace the placeholders, then run in Snowflake:
+Nothing secret lives in the source any more.
 
-```sql
--- Replace before running:
-USE DATABASE <YOUR_DATABASE>;
-USE SCHEMA   <YOUR_SCHEMA>;
-```
+| Variable | Required | Meaning |
+|---|---|---|
+| `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE`, `SNOWFLAKE_WAREHOUSE` | yes | Connection. Account e.g. `xy12345.us-east-1`. |
+| `SNOWFLAKE_PASSWORD` **or** `SNOWFLAKE_AUTHENTICATOR` (e.g. `externalbrowser`) **or** `SNOWFLAKE_PRIVATE_KEY_PATH` (+ `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`) | one | Authentication. Key-pair / SSO preferred over a password. |
+| `SIGDS_DATABASE` | yes | Database containing the writeback schema(s). |
+| `SIGDS_SCAN_SCHEMAS` | yes | **Comma-separated** writeback schemas to scan in one run, e.g. `PROD_WRITES,DEV_WRITES`. |
+| `SIGDS_MAP_SCHEMA` | no | Where the map/log tables live. Default: first scan schema. |
+| `SIGMA_BASE_URL` | yes | e.g. `https://aws-api.sigmacomputing.com` (`/v2` optional). Table below. |
+| `SIGMA_CLIENT_ID`, `SIGMA_CLIENT_SECRET` | yes | Sigma API credentials. |
+| `SIGDS_BACKFILL_DAYS` | no | First access-log load look-back. Default 90 (QUERY_HISTORY keeps 365). |
+| `SIGDS_OVERLAP_HOURS` | no | Re-scan buffer for ACCESS_HISTORY latency (~3 h). Default 12. |
+| `SIGDS_MAX_WAL_TABLES` | no | Cap WAL tables for testing; disables deletion detection. |
 
-### 2. Configure and run the populate script
+Database and schema names are treated as unquoted (upper-cased) identifiers.
 
-Edit the configuration block at the top of `populate_sigds_workbook_map.py`:
-
-```python
-ACCOUNT             = "<YOUR_ACCOUNT>"       # e.g. xy12345.us-east-1
-USER                = "<YOUR_USER>"
-PASSWORD            = "<YOUR_PASSWORD>"
-ROLE                = "<YOUR_ROLE>"
-WAREHOUSE           = "<YOUR_WAREHOUSE>"
-DATABASE            = "<YOUR_DATABASE>"
-SCAN_SCHEMA         = "<YOUR_SCAN_SCHEMA>"   # schema containing SIGDS_WAL_* tables to scan
-MAP_SCHEMA          = "<YOUR_MAP_SCHEMA>"    # schema where SIGDS_WORKBOOK_MAP lives
-SIGMA_API_BASE      = "<YOUR_API_BASE_URL>/v2"
-SIGMA_CLIENT_ID     = "<YOUR_SIGMA_CLIENT_ID>"
-SIGMA_CLIENT_SECRET = "<YOUR_SIGMA_CLIENT_SECRET>"
-```
-
-For a single-schema setup, set `SCAN_SCHEMA` and `MAP_SCHEMA` to the same value.
-
-#### ACCOUNT
-
-The Snowflake account identifier. Found in your Snowflake URL: for `https://xy12345.us-east-1.snowflakecomputing.com` the account is `xy12345.us-east-1`. For accounts in the AWS US East region the identifier is just the account locator (e.g. `xy12345`).
-
-#### SIGMA_API_BASE
-
-The base URL depends on the cloud and region your Sigma organisation is hosted on. The `/v2` suffix is required — all API calls are versioned under this path.
-
-| Cloud / Region | Base URL |
+| Cloud / Region | `SIGMA_BASE_URL` |
 |---|---|
-| AWS US | `https://aws-api.sigmacomputing.com/v2` |
-| AWS EU | `https://api.eu.aws.sigmacomputing.com/v2` |
-| Azure US | `https://api.us.azure.sigmacomputing.com/v2` |
-| GCP US | `https://api.us.gcp.sigmacomputing.com/v2` |
+| AWS US | `https://aws-api.sigmacomputing.com` |
+| AWS EU | `https://api.eu.aws.sigmacomputing.com` |
+| Azure US | `https://api.us.azure.sigmacomputing.com` |
+| GCP US | `https://api.us.gcp.sigmacomputing.com` |
 
-#### SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET
+### Run — first time, step by step
 
-These are OAuth 2.0 client credentials generated from within Sigma. You will need **Admin** access to generate them.
-
-1. In Sigma, go to **Administration → Developer Access**.
-2. Click **Create New** under Client Credentials.
-3. Give the credential a name, select **Admin** scope, and click **Create**.
-4. Copy the **Client ID** and **Client Secret** immediately — the secret is only shown once.
-
-Full instructions: [Sigma API credentials documentation](https://help.sigmacomputing.com/reference/generate-client-credentials).
-
-> **Note:** Admin scope is recommended so the script can resolve workbook ownership and see all workbooks regardless of folder permissions.
-
-Run the script from any Python environment with network access to Snowflake and the Sigma API:
+The database and the map schema (`SIGDS_MAP_SCHEMA`) must **already exist** — `--init` creates tables and views in them, not the database or schema themselves. Your role needs `CREATE TABLE` / `CREATE VIEW` there.
 
 ```bash
+# 1. Install dependencies (a virtualenv is a good idea)
+pip install snowflake-connector-python requests
+
+# 2. Configure — example values; keep these out of git
+export SNOWFLAKE_ACCOUNT=xy12345.us-east-1
+export SNOWFLAKE_USER=you@example.com
+export SNOWFLAKE_ROLE=SYSADMIN
+export SNOWFLAKE_WAREHOUSE=COMPUTE_WH
+export SNOWFLAKE_AUTHENTICATOR=externalbrowser     # or SNOWFLAKE_PASSWORD / SNOWFLAKE_PRIVATE_KEY_PATH
+export SIGDS_DATABASE=MY_DB
+export SIGDS_SCAN_SCHEMAS=WRITEBACK                # comma-separate several: WRITEBACK,WRITEBACK_DEV
+export SIGDS_MAP_SCHEMA=WRITEBACK                  # optional; defaults to the first scan schema
+export SIGMA_BASE_URL=https://aws-api.sigmacomputing.com
+export SIGMA_CLIENT_ID=...
+export SIGMA_CLIENT_SECRET=...
+
+# 3. Once: create the tables and scoring views (safe to re-run; keeps your config tuning)
+python populate_sigds_workbook_map.py --init
+
+# 4. Scan. Repeat daily/weekly — the access-log load is incremental
 python populate_sigds_workbook_map.py
 ```
 
-### Multiple writeback schemas
+Flags: `--init` (create objects, then exit) and `--skip-access-log` (skip the query-history load, e.g. if the grant isn't in place yet). If the tables don't exist the script stops and tells you to run `--init`.
 
-`SIGDS_WORKBOOK_MAP` supports multiple writeback schemas in a single table. Every row is stamped with the `SCAN_SCHEMA` value from the run that produced it. The MERGE key is the composite `SIGDS_TABLE + SCAN_SCHEMA`, preventing collisions when the same bare table name exists in more than one schema.
+A successful scan prints, in order: Sigma token → per-schema WAL/MERGE counts → Sigma enrichment counts → access-log window (or a `SKIPPED` reason) → score snapshot and a tier summary. The first access-log load backfills 90 days and can take a while on a busy account.
 
-To cover multiple schemas, run the script once per schema:
+### Then look at the results
 
-```python
-# Run 1 — production writeback schema
-SCAN_SCHEMA = "PROD_WRITES"
-MAP_SCHEMA  = "PROD_WRITES"
+Open `archival_scoring.sql` and `geninfo_queries.sql` in Snowsight (or `snow sql -f`) and replace the placeholders **by hand** — `--init` only substitutes them in the two setup files:
 
-# Run 2 — development writeback schema (map table stays the same)
-SCAN_SCHEMA = "DEV_WRITES"
-MAP_SCHEMA  = "PROD_WRITES"
-```
+| Placeholder | Where | Replace with |
+|---|---|---|
+| `<YOUR_DATABASE>` | both files | your `SIGDS_DATABASE` |
+| `<YOUR_SCHEMA>` | both files | your `SIGDS_MAP_SCHEMA` |
+| `<WRITEBACK_SCHEMA>` | `geninfo_queries.sql`, query 10 only | the writeback schema you quarantined tables from |
+
+Start with `archival_scoring.sql` query 3 (is access evidence loaded?), then query 2 (tier summary), then query 1 (ranked candidates).
+
+### If something goes wrong
+
+| Symptom | Likely cause |
+|---|---|
+| `Missing required environment variable: …` | An export above is missing in this shell. |
+| `Tables not found … Run with --init first.` | `--init` hasn't run, or `SIGDS_MAP_SCHEMA` points somewhere else than at `--init` time. |
+| `SKIPPED: cannot read … ACCESS_HISTORY` | Not Enterprise Edition, or the `IMPORTED PRIVILEGES` grant is missing. The rest still works; scores are write-only and TIER 1 is capped. |
+| `WARN: org-wide workbook list refused` | The Sigma credential isn't Admin scope. Enrichment still runs but `API_NOT_FOUND` is off for the run. |
+| `WARN: no WAL tables visible but N previously known` | The role lost `USAGE`/`SELECT` on the writeback schema. Nothing was flagged deleted. |
+| `Discovered 0 WAL table(s)` on a first run | Wrong `SIGDS_SCAN_SCHEMAS`, or the role can't see the schema. |
+
+Run it daily or weekly: the access-log load is incremental, and score history only becomes useful with more than one snapshot.
 
 ---
 
-## How the populate script works
+## How a run works
 
-Each run follows these steps:
+1. **Scan each schema** — discovers `SIGDS_WAL_*` tables from `INFORMATION_SCHEMA.TABLES`, reads the latest WAL entry per SIGDS table (batched `UNION ALL`, 100 tables per query), attaches physical metadata (size, created, last altered; Time Travel + Fail-safe from `TABLE_STORAGE_METRICS` when readable), and MERGEs into `SIGDS_WORKBOOK_MAP`.
+   **Every row is refreshed on every run.** (The pre-v2 script only updated rows whose WAL edit number had grown, so size, owner, and archive state silently froze.)
+2. **Flag what vanished** — WAL tables gone from the schema → `IS_DELETED`; SIGDS data tables gone → `IS_ORPHANED`. If *zero* WAL tables are visible but some were known, the tool refuses to flag deletions (almost certainly a grants problem, not a mass deletion).
+3. **Enrich from Sigma** — one fetch of workbooks (org-wide), data models, version tags, and members; then refresh name, path, owner, archived state, and tagged-version status for **every** known `WORKBOOK_ID`. A workbook the API no longer returns is flagged `API_NOT_FOUND` (previously this could only fire for IDs that had *never* been enriched). Not set for data models — their API list is visibility-scoped.
+4. **Load the access log** — see below.
+5. **Snapshot scores** into `SIGDS_SCORE_HISTORY` and print a tier summary.
 
-1. **Authenticate** — obtains a Sigma OAuth bearer token.
-2. **Load watermarks** — reads stored `WAL_MAX_EDIT_NUM` values and known `WORKBOOK_ID`s from `SIGDS_WORKBOOK_MAP` in a single query.
-3. **Discover WAL tables** — queries `INFORMATION_SCHEMA.TABLES` for all `SIGDS_WAL_*` tables in the schema. Detects tables that have disappeared since the last run.
-4. **Extract latest WAL entries** — reads the most recent WAL row per SIGDS table using batched `UNION ALL` queries (one Snowflake query per batch of up to 100 tables). Records where `WAL_MAX_EDIT_NUM` has not increased since the last run are filtered out before the MERGE.
-5. **SIGDS table metadata** — resolves size and timestamp information for each discovered SIGDS table from the `INFORMATION_SCHEMA.TABLES` data already fetched in step 3 (no additional queries needed).
-6. **Sigma API enrichment** — fetches workbook/data-model metadata only for `WORKBOOK_ID`s not already in the table. Resolves owner names via `GET /v2/members`. `API_IS_ARCHIVED` is re-checked on every run for all known IDs.
-7. **Version tag resolution** — fetches all version tags via `GET /v2/tags`, then lists workbooks per tag to build a `taggedWorkbookId → parent workbook` mapping. Tagged version records are flagged with `IS_TAGGED_VERSION=TRUE`, `VERSION_TAG_NAME`, and `PARENT_WORKBOOK_ID`.
-8. **MERGE** — writes all changes into `SIGDS_WORKBOOK_MAP` via a temp staging table and a single MERGE statement keyed on `SIGDS_TABLE + SCAN_SCHEMA`. Records whose WAL table has disappeared are flagged `IS_DELETED=TRUE`; the flag is cleared if the WAL table reappears. Deletion and orphan flag updates are scoped to the current `SCAN_SCHEMA`.
+### Access evidence and the safety cap
 
-### Differences from the Databricks version
+Sigma appends a JSON comment (`-- Sigma Σ {...}`) to every warehouse query it generates, carrying the source workbook URL and the acting user's email. The tool joins `QUERY_HISTORY` × `ACCESS_HISTORY`, keeps those queries that touched a scanned writeback schema, and lands one row per (query, table, `READ`/`INSERT`) in `SIGDS_ACCESS_LOG`.
 
-| Aspect | Databricks | Snowflake |
+This matters because the WAL only records *edits*. An input table that dashboards read daily but nobody edits looks abandoned from the WAL alone; query history shows it is live. In scoring, recent access applies a large penalty, and **absence of access is never treated as proof of abandonment** — it just removes a protection.
+
+Each row carries `ACCESS_EVIDENCE`:
+
+| Value | Meaning |
+|---|---|
+| `RECENT` | Read/written within `ACCESS_RECENT_DAYS` (90) — large penalty |
+| `OLDER` | Last access within `ACCESS_OLDER_DAYS` (365) — small penalty |
+| `NONE_IN_WINDOW` | Log loaded, nothing seen — no penalty |
+| `NOT_LOADED` | Access log never loaded — **score reflects writes only** |
+
+**Coverage cap:** until `SIGDS_ACCESS_LOAD_RUNS` shows successfully-loaded history covering `MIN_ACCESS_COVERAGE_DAYS` (default 90), no table can reach TIER 1 ("quarantine now") — it is held at TIER 2 with an explanatory `SCORE_NOTE`. (Already-`IS_ORPHANED` rows are exempt; their data table is gone, so there is nothing left to break.) Coverage is derived from the loader's own run log, not from the log's earliest row, because a table nobody touched leaves no rows to prove how long it has been watched.
+
+**Caveats:** `ACCESS_HISTORY` lags up to ~3 h (hence the overlap window); `ACCOUNT_USAGE` retains 365 days (the log keeps accumulating beyond that); it only sees the **Snowflake account the tool runs in** — writeback by another account is invisible; and only `SELECT` / `INSERT` statements are captured. Reads by tools other than Sigma are not attributed.
+
+### What changed from v1
+
+| | v1 | v2 |
 |---|---|---|
-| Runtime | PySpark notebook on a cluster | Standard Python script (`snowflake-connector-python`) |
-| WAL change detection | `DESCRIBE DETAIL` (metadata-only, no table scan) compared to stored timestamp watermark | All WAL tables processed every run; MERGE skips rows where `WAL_MAX_EDIT_NUM` is unchanged |
-| Table metadata | `DESCRIBE DETAIL` per table, parallelised via thread pool | Single `INFORMATION_SCHEMA.TABLES` query covering all tables |
-| Storage path | `SIGDS_TABLE_LOCATION` (cloud path from `DESCRIBE DETAIL`) | Not applicable — Snowflake is fully managed; column omitted |
-| JSON extraction | `get_json_object(col, '$.key')` | `TRY_PARSE_JSON(col):key::VARCHAR` |
-| `TIMESTAMP` column | Unquoted | Double-quoted (`"TIMESTAMP"`) — reserved word in Snowflake |
-| MERGE staging | Spark DataFrame registered as temp view | Snowflake `TEMPORARY TABLE` with `executemany` insert |
-| Date arithmetic | `INTERVAL 30 DAY` | `DATEADD(DAY, -30, CURRENT_TIMESTAMP())` |
+| Activity signal | WAL edits only | WAL edits **+ query-history reads/writes** |
+| Row refresh | Only rows with a higher WAL edit number | Every row, every run |
+| "Workbook deleted" detection | Only never-enriched IDs | Every known ID, every run (`API_NOT_FOUND`) |
+| Owner / name / path | Set once, never refreshed | Refreshed every run |
+| Scoring logic | Copy-pasted in two places | One view, weights in `SIGDS_SCORING_CONFIG` |
+| History | Overwritten in place | `SIGDS_SCORE_HISTORY` snapshot per run |
+| Storage | Active bytes of the data table | Data table incl. Time Travel/Fail-safe + WAL table |
+| Credentials | Plaintext constants in the script | Environment variables; key-pair / SSO supported |
+| Schemas | Edit the script, re-run per schema | `SIGDS_SCAN_SCHEMAS=A,B,C` |
+| Setup | Edit placeholders in SQL by hand | `--init` |
 
 ---
 
 ## SIGDS_WORKBOOK_MAP — key columns
 
-Column names use consistent prefixes to make the data source immediately obvious:
-- **`WAL_`** — sourced from WAL row data or WAL table metadata
-- **`SIGDS_`** — sourced from `INFORMATION_SCHEMA.TABLES` on the writeback data table
-- **`API_`** — sourced from the Sigma REST API
+Prefixes show the data source:
+- **`WAL_`** — WAL row data or WAL table metadata
+- **`SIGDS_`** — `INFORMATION_SCHEMA` / storage metrics for the writeback data table
+- **`API_`** — Sigma REST API
 
 | Column | Description |
 |---|---|
-| `SIGDS_TABLE` | Bare SIGDS table name — part of composite primary key |
-| `SCAN_SCHEMA` | Schema that was scanned to produce this row — part of composite primary key |
-| `WAL_TABLE_FQN` | Fully-qualified WAL table name (`database.schema.SIGDS_WAL_*`) |
-| `WAL_DS_ID` | Input table dataset ID extracted from the WAL record |
-| `WAL_WORKBOOK_URL` | Workbook URL extracted from WAL METADATA (`sigmaUrl` / `workbookUrl`) |
-| `WAL_INPUT_TABLE_NAME` | Input table element title extracted from WAL METADATA |
-| `WAL_LAST_EDIT_AT` | Timestamp of the latest WAL row for this SIGDS table |
-| `WAL_LAST_EDIT_BY` | Email of the user who made the last edit, from WAL METADATA |
-| `WAL_MAX_EDIT_NUM` | Highest `EDIT_NUM` seen in the WAL for this SIGDS table; used as watermark |
-| `WAL_TABLE_LAST_MODIFIED` | `LAST_ALTERED` from `INFORMATION_SCHEMA.TABLES` on the WAL table at last processing |
-| `SIGDS_TABLE_ID` | Snowflake internal table ID from `INFORMATION_SCHEMA.TABLES` |
-| `SIGDS_TABLE_CREATED_AT` | Timestamp when the SIGDS table was first created |
-| `SIGDS_TABLE_LAST_MODIFIED` | `LAST_ALTERED` from `INFORMATION_SCHEMA.TABLES` for the SIGDS table |
-| `SIGDS_TABLE_SIZE_BYTES` | Active bytes from `INFORMATION_SCHEMA.TABLES` |
-| `WORKBOOK_ID` | Sigma workbook or data model ID |
-| `WORKBOOK_NAME / PATH` | Display name and folder path (from Sigma API) |
-| `OBJECT_TYPE` | `WORKBOOK` or `DATA_MODEL` |
-| `ORG_SLUG` | Sigma org slug parsed from the workbook URL |
-| `IS_ORPHANED` | `TRUE` when the SIGDS data table no longer exists in Snowflake |
-| `IS_DELETED` | `TRUE` when the WAL table has disappeared from the schema |
-| `IS_LEGACY_WAL` | `TRUE` for old `SIGDS_WAL_<uuid>` naming (pre-DS_ID convention) |
-| `IS_TAGGED_VERSION` | `TRUE` when the workbook ID is a version tag (e.g. Prod, QA) |
-| `VERSION_TAG_NAME` | Name of the version tag when `IS_TAGGED_VERSION` is TRUE |
-| `PARENT_WORKBOOK_ID` | Source workbook ID when `IS_TAGGED_VERSION` is TRUE |
-| `API_WORKBOOK_URL` | Workbook URL from the Sigma API — set once on first enrichment |
-| `API_OWNER_ID` | Sigma member UUID of the workbook owner (from Sigma API) |
-| `API_IS_ARCHIVED` | Archived state from Sigma API — refreshed every run |
-| `API_OWNER_FIRST_NAME` | Owner first name resolved via `GET /v2/members` — set once |
-| `API_OWNER_LAST_NAME` | Owner last name resolved via `GET /v2/members` — set once |
+| `SIGDS_TABLE`, `SCAN_SCHEMA` | Composite primary key |
+| `WAL_TABLE_FQN` | Fully-qualified WAL table name |
+| `WAL_DS_ID`, `WAL_WORKBOOK_URL`, `WAL_INPUT_TABLE_NAME` | From the latest WAL record |
+| `WAL_LAST_EDIT_AT` / `_BY` / `WAL_MAX_EDIT_NUM` | Latest WAL edit time, editor, highest edit number |
+| `WAL_TABLE_LAST_MODIFIED`, `WAL_TABLE_SIZE_BYTES` | WAL table `LAST_ALTERED` and active bytes |
+| `SIGDS_TABLE_ID` / `_CREATED_AT` / `_LAST_MODIFIED` | From `INFORMATION_SCHEMA.TABLES` (`LAST_ALTERED` tracks DDL, not edits) |
+| `SIGDS_TABLE_SIZE_BYTES` | Active bytes |
+| `SIGDS_TABLE_TOTAL_BYTES` | Active + Time Travel + Fail-safe (NULL if `ACCOUNT_USAGE` unreadable) |
+| `WORKBOOK_ID` / `_NAME` / `_PATH`, `OBJECT_TYPE` | Sigma workbook or data model (`WORKBOOK` / `DATA_MODEL`) |
+| `ORG_SLUG` | Org slug parsed from the WAL workbook URL |
+| `IS_ORPHANED` | SIGDS data table no longer exists |
+| `IS_DELETED` / `DELETED_AT` | WAL table gone from the schema (auto-cleared if it reappears) |
+| `IS_LEGACY_WAL` | Old `SIGDS_WAL_<uuid>` naming |
+| `IS_TAGGED_VERSION`, `VERSION_TAG_NAME`, `PARENT_WORKBOOK_ID` | Version-tag (Prod/QA) resolution |
+| `API_OWNER_ID` / `_FIRST_NAME` / `_LAST_NAME` | Owner, refreshed each run |
+| `API_IS_ARCHIVED` | Archived in Sigma, refreshed each run |
+| `API_NOT_FOUND` | Not returned by the API on the latest run (workbooks only) |
+| `API_LAST_SEEN_AT`, `LAST_SCANNED_AT` | Last API sighting / last scan (UTC) |
+
+Access data lives in `SIGDS_ACCESS_LOG` and is rolled up by `V_SIGDS_ACCESS_SUMMARY` (last read, last write, counts, distinct users, last source workbook URL and user).
 
 ---
 
-## Analysis Queries
+## Scoring
 
-`geninfo_queries.sql` covers the same analytical dimensions as `archival_scoring.sql` but as exploratory reporting views rather than a scoring engine. Replace `<YOUR_DATABASE>` and `<YOUR_SCHEMA>` before running.
+All logic is in `V_SIGDS_ARCHIVAL_SCORE` (`scoring_views.sql`). Weights, bands, tier cut-offs, and the access penalty are **rows in `SIGDS_SCORING_CONFIG`** — tune with `UPDATE`, no SQL edits:
 
-| Query | What it shows |
-|---|---|
-| 1. Landscape overview | Per-schema summary: total tables, orphaned/deleted/archived counts, total and reclaimable storage (GB) |
-| 2. Storage reclamation opportunity | All tables with a clear archival signal (orphaned, deleted, or archived workbook), ranked by size with the primary reason surfaced |
-| 3. Active workbooks going stale | Active workbooks where writeback activity has dropped off, grouped into inactivity bands (31–90 / 91–180 / 181–365 / >365 days) |
-| 4. Most active writeback tables | Highest-edit-volume input tables — the inverse archival view; useful for identifying business-critical tables before any cleanup nearby |
-| 5. Owner accountability summary | Cleanup burden rolled up by workbook owner: archived, orphaned, stale counts and reclaimable GB per owner |
-| 6. Workbooks with multiple input tables | Groups by source workbook (resolving tagged versions to their parent) to find workbooks with more than one named input element |
-| 7. Legacy WAL inventory | All `SIGDS_WAL_<uuid>` tables, split by migration priority: active legacy WALs (still being written) flagged as urgent; inactive as low-priority |
+```sql
+UPDATE SIGDS_SCORING_CONFIG SET WAL_DAYS_1 = 540, TIER1_MIN = 80 WHERE CONFIG_ID = 1;
+```
 
----
+### Model (positive components total 100; higher = stronger archival candidate)
 
-## Archival Scoring (`archival_scoring.sql`)
-
-Scores every record in `SIGDS_WORKBOOK_MAP` across six weighted signals to produce a ranked list of archival candidates.
-
-### Scoring model (total = 100 pts, higher = stronger archival candidate)
-
-| Dimension | Max | Logic |
+| Dimension | Max | Logic (defaults) |
 |---|---|---|
-| Archival / deletion status | 30 | `IS_ORPHANED`=TRUE → 30 / `IS_DELETED`=TRUE → 25 / `API_IS_ARCHIVED`=TRUE → 20 / workbook absent from API → 15 |
-| WAL edit recency | 25 | >365 days (or NULL) → 25 / >180 → 18 / >90 → 10 / >30 → 4 |
-| SIGDS table modification | 15 | >365 days (or NULL) → 15 / >180 → 10 / >90 → 5 |
-| Edit volume (`WAL_MAX_EDIT_NUM`) | 10 | 0/NULL → 10 / ≤10 → 8 / ≤50 → 5 / ≤200 → 2 |
-| Legacy WAL flag | 10 | Legacy + active (<180 days) → 10 / Legacy + inactive → 5 |
-| Storage reclamation | 10 | >1 GB → 10 / >100 MB → 7 / >10 MB → 4 / else → 1 |
+| Status | 30 | orphaned 30 / WAL deleted 25 / workbook archived 20 / workbook not in API 15 |
+| WAL edit recency | 25 | >365 d or never → 25 / >180 → 18 / >90 → 10 / >30 → 4 |
+| SIGDS table altered | 15 | >365 d → 15 / >180 → 10 / >90 → 5 (weak: `LAST_ALTERED` is DDL) |
+| Edit volume | 10 | 0 → 10 / ≤10 → 8 / ≤50 → 5 / ≤200 → 2 (calibrate to your org) |
+| Legacy WAL | 10 | legacy & active (<180 d) → 10 / legacy & inactive → 5 |
+| Storage | 10 | >1 GB → 10 / >100 MB → 7 / >10 MB → 4 / else 1 |
 
-**Risk penalty:** `IS_TAGGED_VERSION` = TRUE → subtract 15 pts (floor at 0).
+| Penalty | Default |
+|---|---|
+| Tagged version (Prod/QA) | −15 |
+| Access within 90 days (`RECENT`) | **−40** |
+| Last access 91–365 days (`OLDER`) | −15 |
 
-### Confidence tiers
+Score is floored at 0 and capped at 100.
+
+### Tiers
 
 | Score | Tier | Recommendation |
 |---|---|---|
-| ≥ 75 | **TIER 1** | Strong candidate — quarantine now |
+| ≥ 75 | **TIER 1** | Strong candidate — quarantine now *(only once access coverage ≥ 90 days)* |
 | 50–74 | **TIER 2** | Likely candidate — review with owner |
 | 25–49 | **TIER 3** | Monitor — check in 90 days |
 | < 25 | **TIER 4** | Keep — active or protected |
 
 > **Important — read before taking any action based on these scores.**
 >
-> The confidence tiers and weights in this model are entirely subjective. What constitutes an appropriate threshold for archival will vary significantly from customer to customer. The scores are a starting point for investigation, not a directive.
+> The weights and tiers are entirely subjective. What counts as an appropriate threshold varies significantly from customer to customer. Scores are a starting point for investigation, not a directive. Note too that this tool cannot see readers outside the Snowflake account it runs in, or anything not issued by Sigma.
 >
-> **Incorrectly removing a SIGDS table or its associated WAL table can cause irreparable impact to the related Sigma content.** Always follow the safe deletion process (move to quarantine first, monitor, then delete) and ensure the record has been reviewed and approved by the workbook owner before any action is taken.
+> **Incorrectly removing a SIGDS table or its WAL table can cause irreparable impact to the related Sigma content.** Always follow the safe deletion process below and have the workbook owner approve before any action.
+
+## Analysis queries (`geninfo_queries.sql`)
+
+| Query | What it shows |
+|---|---|
+| 1. Landscape overview | Per-schema totals: orphaned / deleted / archived counts, total and reclaimable GB |
+| 2. Storage reclamation opportunity | Tables with a clear archival signal, ranked by size |
+| 3. Active workbooks going stale | Inactivity bands (31–90 / 91–180 / 181–365 / >365 days) |
+| 4. Most active writeback tables | Highest edit volume — the inverse view; business-critical tables |
+| 5. Owner accountability | Cleanup burden per workbook owner |
+| 6. Workbooks with multiple input tables | Resolves tagged versions to their parent workbook |
+| 7. Legacy WAL inventory | `SIGDS_WAL_<uuid>` tables, active (urgent) vs inactive |
+| 8. Read-only consumers | **New.** Live tables with recent reads but no recent edits — the false positives a write-only view would produce |
+| 9. Tier movement | **New.** Tables whose tier changed since the previous run |
+| 10. Quarantine watch | **New.** Failed Sigma queries (error 2003) against SIGDS names during a quarantine period |
 
 ---
 
 ## Safe Deletion of SIGDS and WAL Tables
 
-> **Best practice: move first, delete later — never drop directly.**
+> **Best practice: move first, delete later — never drop directly.** This tool reports; it does not remediate.
 
-Sigma stores the exact fully-qualified table name of both the SIGDS data table and the WAL table in its internal metadata. If the table has been dropped or renamed, workbooks will immediately fail with errors.
+Sigma stores the exact fully-qualified name of both the SIGDS data table and the WAL table in its metadata. If either is dropped or renamed, workbooks fail immediately.
 
-### Recommended process
-
-1. **Identify candidates** using `geninfo_queries.sql` or `archival_scoring.sql`.
-2. **Move** the SIGDS and WAL tables to a quarantine schema using `ALTER TABLE ... RENAME TO`:
+1. **Identify candidates** with `archival_scoring.sql`. Prefer TIER 1/2 rows whose `ACCESS_EVIDENCE` is `NONE_IN_WINDOW`, and check `SCORE_NOTE`.
+2. **Move** *both* the SIGDS and WAL tables to a quarantine schema:
    ```sql
    ALTER TABLE <DATABASE>.<SCHEMA>.<TABLE>
      RENAME TO <DATABASE>.<SCHEMA>_QUARANTINE.<TABLE>;
    ```
-3. **Monitor** for a minimum of 30 days to confirm no workbook errors are raised.
-4. **Drop** the tables from the quarantine schema once the safe period has passed.
+3. **Monitor ≥ 30 days.** Run `geninfo_queries.sql` query 10 — any failed Sigma query against a moved name means something still depended on it: rename it straight back.
+4. **Drop** from quarantine only after a clean period and owner sign-off.
 
-Recovery is straightforward if a table is moved rather than dropped — rename it back to its original location and the workbook resumes functioning immediately. A direct `DROP TABLE` is irreversible.
+Recovery is simple when a table was moved rather than dropped — rename it back and the workbook resumes. A direct `DROP TABLE` is irreversible.
+
+## Known limitations
+
+- **Untested against a live account** as of this revision — see the note at the top.
+- Access evidence needs Enterprise Edition + `IMPORTED PRIVILEGES`; single Snowflake account only; `SELECT`/`INSERT` only; relies on Sigma's query-comment format.
+- A data model missing from the Sigma API is never flagged `API_NOT_FOUND` (its list is visibility-scoped), and a non-admin token disables the signal for workbooks too.
+- Changing `SIGDS_SCAN_SCHEMAS` casing between runs creates separate rows (names are upper-cased; pre-v2 rows stored with a different case will not merge).
+- Writeback to Databricks is out of scope here — see `writeback_info_dbx`.
