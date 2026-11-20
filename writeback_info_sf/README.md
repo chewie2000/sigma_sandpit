@@ -1,14 +1,14 @@
 # writeback_info_sf
 
-> **IN DEVELOPMENT — Do not use.** This toolkit is under active development. Content may be incomplete, incorrect, or subject to breaking changes without notice. The v2 changes below have **not yet been run against a live Snowflake account** (the Python compiles and the SQL files split cleanly, nothing more) — treat first runs as a test.
+> **IN DEVELOPMENT — Do not use.** This toolkit is under active development. Content may be incomplete, incorrect, or subject to breaking changes without notice. The v2 changes below have **not yet been run against a live Snowflake account** (the procedure's Python compiles and the SQL files are syntactically plausible, nothing more) — treat first runs as a test.
 
-A standalone, **read-only information tool** for Sigma writeback (input table) estates on Snowflake. It answers three questions about every `SIGDS_*` table:
+A standalone, **read-only information tool** for Sigma writeback (input table) estates on Snowflake. It runs **entirely inside Snowflake** as a stored procedure — call it from a Snowsight worksheet or notebook, or schedule it with a task; nothing runs on your machine. It answers three questions about every `SIGDS_*` table:
 
 1. **Whose is it?** — maps each WAL / data table to its Sigma workbook or data model, owner, folder, and archived / deleted state.
 2. **Is anyone using it?** — combines the WAL (who *edits*) with Snowflake query history (who *reads*), so a table that is read all day but never edited is not mistaken for a dead one.
 3. **What could be reclaimed?** — a transparent, tunable score and tier per table, plus reclaimable storage including Time Travel / Fail-safe.
 
-It never drops, renames, or alters writeback tables. It needs no ACCOUNTADMIN, no external access integration, and no other toolkit — just a Python runner, a Snowflake role, and Sigma API credentials.
+It never drops, renames, or alters writeback tables. It does not depend on any other toolkit. The only elevated step is a **one-time ACCOUNTADMIN setup** (a network rule, secrets and an external access integration), which is what lets a Snowflake procedure call the Sigma API.
 
 ## Overview
 
@@ -16,98 +16,97 @@ When Sigma writebacks are enabled, Sigma creates a WAL table (`SIGDS_WAL_*`) and
 
 ## Files
 
-| File | Purpose |
-|---|---|
-| `populate_sigds_workbook_map.py` | The runner. `--init` creates objects; a normal run scans, enriches, loads the access log, and snapshots scores. Configured by environment variables. |
-| `create_sigds_workbook_map.sql` | DDL: `SIGDS_WORKBOOK_MAP`, `SIGDS_ACCESS_LOG`, `SIGDS_ACCESS_LOAD_RUNS`, `SIGDS_SCORE_HISTORY`. Idempotent; upgrades pre-v2 maps in place. |
-| `scoring_views.sql` | The scoring model, in **one place**: `SIGDS_SCORING_CONFIG` (tunable weights), `V_SIGDS_ACCESS_SUMMARY`, `V_SIGDS_ARCHIVAL_SCORE`, `V_SIGDS_TIER_SUMMARY`. |
-| `archival_scoring.sql` | Read-only queries over the scoring views, plus the safe-deletion procedure. |
-| `geninfo_queries.sql` | Exploratory reports: landscape, reclamation, staleness, owners, multi-table workbooks, legacy WALs, read-only consumers, tier movement, quarantine watch. |
+Run them in this order, once; then just `CALL sigds_scan(...)` on a schedule.
+
+| # | File | Purpose |
+|---|---|---|
+| 1 | `setup_prerequisites.sql` | **ACCOUNTADMIN, once.** Network rule (your Sigma host only), secrets for the Sigma URL + credentials, external access integration, grants. |
+| 2 | `create_sigds_workbook_map.sql` | DDL: `SIGDS_WORKBOOK_MAP`, `SIGDS_ACCESS_LOG`, `SIGDS_ACCESS_LOAD_RUNS`, `SIGDS_SCORE_HISTORY`. Idempotent; upgrades pre-v2 maps in place. |
+| 3 | `scoring_views.sql` | The scoring model, in **one place**: `SIGDS_SCORING_CONFIG` (tunable weights), `V_SIGDS_ACCESS_SUMMARY`, `V_SIGDS_ARCHIVAL_SCORE`, `V_SIGDS_TIER_SUMMARY`. Re-running keeps your config tuning. |
+| 4 | `sigds_scan_procedure.sql` | The scan itself: `sigds_scan(...)` Python stored procedure, plus an example `TASK`. |
+| — | `archival_scoring.sql` | Read-only queries over the scoring views, plus the safe-deletion procedure. |
+| — | `geninfo_queries.sql` | Exploratory reports: landscape, reclamation, staleness, owners, multi-table workbooks, legacy WALs, read-only consumers, tier movement, quarantine watch. |
 
 ---
 
-## Setup
+## Setup (once)
 
 ### Prerequisites
 
-- Python 3.8+ with `snowflake-connector-python` and `requests`:
-  ```
-  pip install snowflake-connector-python requests
-  ```
-- A Snowflake role with `SELECT` on the writeback schema(s) and `CREATE TABLE` / `CREATE VIEW` + DML on the schema that will hold the map.
-- **Recommended — for access evidence:** Snowflake **Enterprise Edition** or higher, and
-  ```sql
-  GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE <YOUR_ROLE>;
-  ```
-  This unlocks `ACCOUNT_USAGE.ACCESS_HISTORY` / `QUERY_HISTORY` (who reads and writes each table) and `TABLE_STORAGE_METRICS` (Time Travel / Fail-safe bytes). Without it the tool still works, but scores reflect **writes only** and nothing can reach TIER 1 (see [Access evidence](#access-evidence-and-the-safety-cap)).
-- Sigma API client credentials with **Admin** scope: *Administration → Developer Access → Create New*. Admin scope is what lets the tool list **every** workbook in the org (`skipPermissionCheck`); without it, "workbook not found" cannot be trusted and the tool turns that signal off for the run. [Docs](https://help.sigmacomputing.com/reference/generate-client-credentials).
+- A Snowflake database and schema to hold the tool's tables and procedure (the **map schema**). They must already exist. The role that will own the procedure (`<YOUR_ROLE>` below, e.g. `SYSADMIN`) needs `USAGE`, `CREATE TABLE`, `CREATE VIEW` and `CREATE PROCEDURE` on that schema.
+- Access to `ACCOUNTADMIN` for step 1 only.
+- A Sigma API client credential with **Admin** scope: *Administration → Developer Access → Create New* (the secret is shown once). Admin scope is what lets the tool list **every** workbook in the org (`skipPermissionCheck`); without it, "workbook not found" cannot be trusted and the tool turns that signal off for the run. [Docs](https://help.sigmacomputing.com/reference/generate-client-credentials).
+- **Recommended — for access evidence:** Snowflake **Enterprise Edition** or higher. Step 1 grants `IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE` to your role, which unlocks `ACCOUNT_USAGE.ACCESS_HISTORY` / `QUERY_HISTORY` (who reads and writes each table) and `TABLE_STORAGE_METRICS` (Time Travel / Fail-safe bytes). Without it the tool still works, but scores reflect **writes only** and nothing can reach TIER 1 (see [Access evidence](#access-evidence-and-the-safety-cap)).
 
-### Configuration — environment variables
+### Your Sigma API host
 
-Nothing secret lives in the source any more.
-
-| Variable | Required | Meaning |
-|---|---|---|
-| `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE`, `SNOWFLAKE_WAREHOUSE` | yes | Connection. Account e.g. `xy12345.us-east-1`. |
-| `SNOWFLAKE_PASSWORD` **or** `SNOWFLAKE_AUTHENTICATOR` (e.g. `externalbrowser`) **or** `SNOWFLAKE_PRIVATE_KEY_PATH` (+ `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`) | one | Authentication. Key-pair / SSO preferred over a password. |
-| `SIGDS_DATABASE` | yes | Database containing the writeback schema(s). |
-| `SIGDS_SCAN_SCHEMAS` | yes | **Comma-separated** writeback schemas to scan in one run, e.g. `PROD_WRITES,DEV_WRITES`. |
-| `SIGDS_MAP_SCHEMA` | no | Where the map/log tables live. Default: first scan schema. |
-| `SIGMA_BASE_URL` | yes | e.g. `https://aws-api.sigmacomputing.com` (`/v2` optional). Table below. |
-| `SIGMA_CLIENT_ID`, `SIGMA_CLIENT_SECRET` | yes | Sigma API credentials. |
-| `SIGDS_BACKFILL_DAYS` | no | First access-log load look-back. Default 90 (QUERY_HISTORY keeps 365). |
-| `SIGDS_OVERLAP_HOURS` | no | Re-scan buffer for ACCESS_HISTORY latency (~3 h). Default 12. |
-| `SIGDS_MAX_WAL_TABLES` | no | Cap WAL tables for testing; disables deletion detection. |
-
-Database and schema names are treated as unquoted (upper-cased) identifiers.
-
-| Cloud / Region | `SIGMA_BASE_URL` |
+| Cloud / Region | Host (no `https://`) |
 |---|---|
-| AWS US | `https://aws-api.sigmacomputing.com` |
-| AWS EU | `https://api.eu.aws.sigmacomputing.com` |
-| Azure US | `https://api.us.azure.sigmacomputing.com` |
-| GCP US | `https://api.us.gcp.sigmacomputing.com` |
+| AWS US (West) | `aws-api.sigmacomputing.com` |
+| AWS US (East) | `api.us-a.aws.sigmacomputing.com` |
+| AWS EU | `api.eu.aws.sigmacomputing.com` |
+| AWS UK | `api.uk.aws.sigmacomputing.com` |
+| AWS CA | `api.ca.aws.sigmacomputing.com` |
+| AWS AU / APAC | `api.au.aws.sigmacomputing.com` |
+| Azure US | `api.us.azure.sigmacomputing.com` |
+| Azure EU | `api.eu.azure.sigmacomputing.com` |
+| GCP US | `api.sigmacomputing.com` |
 
-### Run — first time, step by step
+### Deploy — in a Snowsight worksheet
 
-The database and the map schema (`SIGDS_MAP_SCHEMA`) must **already exist** — `--init` creates tables and views in them, not the database or schema themselves. Your role needs `CREATE TABLE` / `CREATE VIEW` there.
+For each of the four files: open it, **find & replace** the placeholders, paste into a Snowsight worksheet, and **Run All**. (Snowsight: Cmd/Ctrl+F opens find, with a replace option.)
 
-```bash
-# 1. Install dependencies (a virtualenv is a good idea)
-pip install snowflake-connector-python requests
+| Placeholder | Meaning | Files |
+|---|---|---|
+| `<YOUR_DATABASE>` | Database holding the tool's tables + procedure | 1, 2, 3, 4 |
+| `<YOUR_SCHEMA>` | The map schema | 1, 2, 3, 4 |
+| `<YOUR_ROLE>` | Role that will own and run the procedure | 1 |
+| `<YOUR_SIGMA_API_HOST>` | From the table above | 1 |
+| `<YOUR_SIGMA_CLIENT_ID>` / `<YOUR_SIGMA_CLIENT_SECRET>` | Sigma API credential | 1 |
+| `<YOUR_WAREHOUSE>` | Only if you enable the example `TASK` | 4 |
 
-# 2. Configure — example values; keep these out of git
-export SNOWFLAKE_ACCOUNT=xy12345.us-east-1
-export SNOWFLAKE_USER=you@example.com
-export SNOWFLAKE_ROLE=SYSADMIN
-export SNOWFLAKE_WAREHOUSE=COMPUTE_WH
-export SNOWFLAKE_AUTHENTICATOR=externalbrowser     # or SNOWFLAKE_PASSWORD / SNOWFLAKE_PRIVATE_KEY_PATH
-export SIGDS_DATABASE=MY_DB
-export SIGDS_SCAN_SCHEMAS=WRITEBACK                # comma-separate several: WRITEBACK,WRITEBACK_DEV
-export SIGDS_MAP_SCHEMA=WRITEBACK                  # optional; defaults to the first scan schema
-export SIGMA_BASE_URL=https://aws-api.sigmacomputing.com
-export SIGMA_CLIENT_ID=...
-export SIGMA_CLIENT_SECRET=...
+1. **`setup_prerequisites.sql`** — runs as `ACCOUNTADMIN` (the file switches role itself). Also uncomment and edit the writeback-schema `GRANT`s at the bottom so your role can read the schema(s) you'll scan.
+2. **`create_sigds_workbook_map.sql`** — run as your role.
+3. **`scoring_views.sql`** — run as your role.
+4. **`sigds_scan_procedure.sql`** — run as your role (the role that was granted the integration and secrets in step 1).
 
-# 3. Once: create the tables and scoring views (safe to re-run; keeps your config tuning)
-python populate_sigds_workbook_map.py --init
+Everything is idempotent, so re-running a file is safe. The Sigma client secret passes through Snowflake query history once, in step 1 (inherent to `CREATE SECRET`); rotate it afterwards if that matters.
 
-# 4. Scan. Repeat daily/weekly — the access-log load is incremental
-python populate_sigds_workbook_map.py
+### Run it
+
+In a worksheet (or a Snowsight notebook SQL cell), as the procedure owner's role. **Always pass `MAP_SCHEMA` explicitly:**
+
+```sql
+-- CALL sigds_scan(<writeback database>, <writeback schema(s), comma-separated>, <map schema>);
+CALL sigds_scan('MY_DB', 'WRITEBACK', 'WRITEBACK');
+CALL sigds_scan('MY_DB', 'PROD_WB,DEV_WB', 'WRITEBACK');       -- several writeback schemas, one run
+CALL sigds_scan('MY_DB', 'WRITEBACK', 'WRITEBACK', TRUE);      -- skip the query-history load
 ```
 
-Flags: `--init` (create objects, then exit) and `--skip-access-log` (skip the query-history load, e.g. if the grant isn't in place yet). If the tables don't exist the script stops and tells you to run `--init`.
+| Parameter | Default | Meaning |
+|---|---|---|
+| `WB_DATABASE` | required | Database containing the writeback schema(s). |
+| `SCAN_SCHEMAS` | required | Comma-separated writeback schemas to scan. |
+| `MAP_SCHEMA` | caller's current schema | Where the map/log tables live — pass it explicitly. |
+| `SKIP_ACCESS_LOG` | `FALSE` | Skip the query-history load (e.g. grant not in place yet). |
+| `BACKFILL_DAYS` | `90` | First access-log load look-back (QUERY_HISTORY keeps 365). |
+| `OVERLAP_HOURS` | `12` | Re-scan buffer for ACCESS_HISTORY latency (~3 h). |
+| `MAX_WAL_TABLES` | `0` (all) | Cap WAL tables for testing; disables deletion detection. |
 
-A successful scan prints, in order: Sigma token → per-schema WAL/MERGE counts → Sigma enrichment counts → access-log window (or a `SKIPPED` reason) → score snapshot and a tier summary. The first access-log load backfills 90 days and can take a while on a busy account.
+Database and schema names are treated as unquoted (upper-cased) identifiers. The call **returns the run log as text** — read it in the result pane: Sigma API counts → per-schema WAL/MERGE counts → enrichment counts → access-log window (or a `SKIPPED` reason) → score snapshot and a tier summary.
+
+The first run backfills 90 days of query history, which can be heavy on a busy account — use a larger warehouse for it; later runs are incremental and small.
+
+**Schedule it** (optional): an example `CREATE TASK` is at the bottom of `sigds_scan_procedure.sql` (grant `EXECUTE TASK` first — it's commented in the setup file). Daily or weekly works; score history only becomes useful with more than one snapshot.
 
 ### Then look at the results
 
-Open `archival_scoring.sql` and `geninfo_queries.sql` in Snowsight (or `snow sql -f`) and replace the placeholders **by hand** — `--init` only substitutes them in the two setup files:
+Open `archival_scoring.sql` and `geninfo_queries.sql`, replace the placeholders, and run them in Snowsight:
 
 | Placeholder | Where | Replace with |
 |---|---|---|
-| `<YOUR_DATABASE>` | both files | your `SIGDS_DATABASE` |
-| `<YOUR_SCHEMA>` | both files | your `SIGDS_MAP_SCHEMA` |
+| `<YOUR_DATABASE>` | both files | your database |
+| `<YOUR_SCHEMA>` | both files | your map schema |
 | `<WRITEBACK_SCHEMA>` | `geninfo_queries.sql`, query 10 only | the writeback schema you quarantined tables from |
 
 Start with `archival_scoring.sql` query 3 (is access evidence loaded?), then query 2 (tier summary), then query 1 (ranked candidates).
@@ -116,14 +115,13 @@ Start with `archival_scoring.sql` query 3 (is access evidence loaded?), then que
 
 | Symptom | Likely cause |
 |---|---|
-| `Missing required environment variable: …` | An export above is missing in this shell. |
-| `Tables not found … Run with --init first.` | `--init` hasn't run, or `SIGDS_MAP_SCHEMA` points somewhere else than at `--init` time. |
-| `SKIPPED: cannot read … ACCESS_HISTORY` | Not Enterprise Edition, or the `IMPORTED PRIVILEGES` grant is missing. The rest still works; scores are write-only and TIER 1 is capped. |
+| `Bookkeeping tables not found …` | Files 2/3 haven't been run in that schema, or `MAP_SCHEMA` points elsewhere. |
+| `Integration … does not exist or not authorized`, or a secret/network error when creating the procedure | Step 1 not run, or your role lacks `USAGE` on the integration / `READ` on the three secrets. |
+| `Failed to connect` / host errors from the Sigma API | The host in `setup_prerequisites.sql` doesn't match your Sigma region, or the network rule/secret has a typo. |
+| `SKIPPED: cannot read … ACCESS_HISTORY` | Not Enterprise Edition, or the `IMPORTED PRIVILEGES` grant is missing for the procedure owner's role. The rest still works; scores are write-only and TIER 1 is capped. |
 | `WARN: org-wide workbook list refused` | The Sigma credential isn't Admin scope. Enrichment still runs but `API_NOT_FOUND` is off for the run. |
-| `WARN: no WAL tables visible but N previously known` | The role lost `USAGE`/`SELECT` on the writeback schema. Nothing was flagged deleted. |
-| `Discovered 0 WAL table(s)` on a first run | Wrong `SIGDS_SCAN_SCHEMAS`, or the role can't see the schema. |
-
-Run it daily or weekly: the access-log load is incremental, and score history only becomes useful with more than one snapshot.
+| `WARN: no WAL tables visible but N previously known` | The owner role lost `USAGE`/`SELECT` on the writeback schema. Nothing was flagged deleted. |
+| `Discovered 0 WAL table(s)` on a first run | Wrong schema name in `SCAN_SCHEMAS`, or the owner role can't see that schema. |
 
 ---
 
@@ -166,9 +164,10 @@ Each row carries `ACCESS_EVIDENCE`:
 | Scoring logic | Copy-pasted in two places | One view, weights in `SIGDS_SCORING_CONFIG` |
 | History | Overwritten in place | `SIGDS_SCORE_HISTORY` snapshot per run |
 | Storage | Active bytes of the data table | Data table incl. Time Travel/Fail-safe + WAL table |
-| Credentials | Plaintext constants in the script | Environment variables; key-pair / SSO supported |
-| Schemas | Edit the script, re-run per schema | `SIGDS_SCAN_SCHEMAS=A,B,C` |
-| Setup | Edit placeholders in SQL by hand | `--init` |
+| Runs where | A Python script on your machine | A Snowflake stored procedure (`sigds_scan`) — schedulable with a task |
+| Credentials | Plaintext constants in the script | Snowflake `SECRET` objects |
+| Schemas | Edit the script, re-run per schema | `SCAN_SCHEMAS => 'A,B,C'` |
+| Setup | Edit placeholders in the script and SQL | Find & replace placeholders, run four SQL files |
 
 ---
 
@@ -285,5 +284,5 @@ Recovery is simple when a table was moved rather than dropped — rename it back
 - **Untested against a live account** as of this revision — see the note at the top.
 - Access evidence needs Enterprise Edition + `IMPORTED PRIVILEGES`; single Snowflake account only; `SELECT`/`INSERT` only; relies on Sigma's query-comment format.
 - A data model missing from the Sigma API is never flagged `API_NOT_FOUND` (its list is visibility-scoped), and a non-admin token disables the signal for workbooks too.
-- Changing `SIGDS_SCAN_SCHEMAS` casing between runs creates separate rows (names are upper-cased; pre-v2 rows stored with a different case will not merge).
+- Changing the casing of `SCAN_SCHEMAS` between runs creates separate rows (names are upper-cased; pre-v2 rows stored with a different case will not merge).
 - Writeback to Databricks is out of scope here — see `writeback_info_dbx`.

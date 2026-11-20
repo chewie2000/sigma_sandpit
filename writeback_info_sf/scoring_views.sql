@@ -12,8 +12,7 @@
 -- Run create_sigds_workbook_map.sql first. Idempotent -- safe to re-run (the
 -- config row is only inserted if missing, so your tuning survives a re-run).
 --
--- Before running (or use `python populate_sigds_workbook_map.py --init`, which
--- substitutes these for you), replace <YOUR_DATABASE> and <YOUR_SCHEMA>.
+-- Before running, replace <YOUR_DATABASE> and <YOUR_SCHEMA> (find & replace).
 -- =============================================================================
 
 USE DATABASE <YOUR_DATABASE>;

@@ -2,11 +2,11 @@
 -- create_sigds_workbook_map.sql
 --
 -- DDL for the SIGDS_WORKBOOK_MAP table in Snowflake.
--- Run this once before executing populate_sigds_workbook_map.py.
+-- Run this once (then scoring_views.sql and sigds_scan_procedure.sql) before CALL sigds_scan.
 --
--- Before running, replace <YOUR_DATABASE> and <YOUR_SCHEMA> below with the
--- Snowflake database and schema where the table should be created.
--- These must match the DATABASE and MAP_SCHEMA values set in the Python script.
+-- Before running, replace <YOUR_DATABASE> and <YOUR_SCHEMA> (find & replace) with the
+-- Snowflake database and schema where the tables should be created. The schema must
+-- already exist. Pass the same schema as MAP_SCHEMA when you CALL sigds_scan.
 --
 -- Logical primary key : SIGDS_TABLE + SCAN_SCHEMA  (one row per table per schema)
 -- Merge key           : SIGDS_TABLE + SCAN_SCHEMA  (composite key in the MERGE statement)
@@ -104,7 +104,7 @@ ALTER TABLE SIGDS_WORKBOOK_MAP ADD COLUMN IF NOT EXISTS LAST_SCANNED_AT         
 --
 -- Sigma appends a JSON comment ("-- Sigma Σ {...}") to every warehouse query it
 -- generates, carrying the source workbook URL and the acting user's email.
--- populate_sigds_workbook_map.py joins SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY to
+-- The sigds_scan procedure joins SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY to
 -- ACCESS_HISTORY, keeps queries carrying that comment that touched an object in
 -- a scanned writeback schema, and lands one row per (query, object, access kind).
 -- This is what tells a table that is READ all day but never edited apart from one

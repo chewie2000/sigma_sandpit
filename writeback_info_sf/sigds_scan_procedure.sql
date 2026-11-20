@@ -1,84 +1,77 @@
-#!/usr/bin/env python3
-"""
-populate_sigds_workbook_map.py  (Snowflake)
+-- =============================================================================
+-- sigds_scan_procedure.sql  (Snowflake)
+--
+-- The whole writeback_info_sf scan, running INSIDE Snowflake as a Python stored
+-- procedure -- nothing runs on your machine. Call it from a Snowsight worksheet
+-- or notebook cell, or schedule it with a TASK (example at the bottom).
+--
+-- Read-only with respect to writeback: it never drops, renames or alters SIGDS /
+-- WAL tables. It writes only its own bookkeeping tables (SIGDS_WORKBOOK_MAP,
+-- SIGDS_ACCESS_LOG, SIGDS_ACCESS_LOAD_RUNS, SIGDS_SCORE_HISTORY).
+--
+-- Run order (once):  setup_prerequisites.sql (ACCOUNTADMIN)
+--                    create_sigds_workbook_map.sql
+--                    scoring_views.sql
+--                    this file
+-- Then:              CALL sigds_scan('MY_DB', 'WRITEBACK');
+--
+-- Find & replace <YOUR_DATABASE> / <YOUR_SCHEMA> first (the schema holding the map
+-- tables; the secrets and integration from setup_prerequisites.sql live there).
+--
+-- Parameters
+--   WB_DATABASE     database containing the writeback schema(s)           (required)
+--   SCAN_SCHEMAS    comma-separated writeback schemas, e.g. 'PROD_WB,DEV_WB' (required)
+--   MAP_SCHEMA      schema holding the map/log tables. Pass it explicitly; if omitted it
+--                   falls back to CURRENT_SCHEMA() of the calling session
+--   SKIP_ACCESS_LOG TRUE to skip the query-history load                  (default FALSE)
+--   BACKFILL_DAYS   first access-log load look-back; QUERY_HISTORY keeps 365 (default 90)
+--   OVERLAP_HOURS   re-scan buffer for ACCESS_HISTORY latency (~3 h)        (default 12)
+--   MAX_WAL_TABLES  cap WAL tables for testing; disables deletion detection (default 0=all)
+--
+-- Returns the run log as text (also visible in the worksheet result).
+-- Database/schema names are treated as unquoted (upper-cased) identifiers.
+--
+-- Sizing: the first run backfills query history, which can be heavy on a busy
+-- account -- use a larger warehouse for it; later runs are incremental and small.
+-- =============================================================================
 
-Read-only information tool for Sigma writeback (input table) estates. Inventories
-every SIGDS_WAL_* / SIGDS_* table in one or more writeback schemas, maps each to its
-Sigma workbook / data model, and records who actually READS and WRITES it, so the
-scoring views can tell a dead table from a quiet-but-live one.
+USE DATABASE <YOUR_DATABASE>;
+USE SCHEMA   <YOUR_SCHEMA>;
 
-It never drops, renames or modifies writeback tables. The only things it writes are
-its own bookkeeping tables (SIGDS_WORKBOOK_MAP and friends).
-
-What a run does
----------------
- 1. Connect to Snowflake; load the Sigma API token.
- 2. For each scan schema: discover WAL tables, read the latest WAL entry per SIGDS
-    table, attach physical metadata (INFORMATION_SCHEMA + optional ACCOUNT_USAGE
-    storage incl. Time Travel / Fail-safe), MERGE into SIGDS_WORKBOOK_MAP, flag
-    WAL tables that vanished (IS_DELETED) and data tables that vanished (IS_ORPHANED).
-    EVERY row is refreshed on EVERY run (the old script only refreshed rows whose
-    WAL edit number had grown, which froze size/owner/archive state).
- 3. Fetch the Sigma inventory once (workbooks org-wide, data models, version tags,
-    members) and refresh enrichment for every known WORKBOOK_ID: name, path, owner,
-    archived, tagged version, and API_NOT_FOUND (a workbook that has since been
-    deleted from Sigma).
- 4. Load the access log: join ACCOUNT_USAGE.QUERY_HISTORY x ACCESS_HISTORY, keep
-    queries carrying Sigma's "-- Sigma Σ {json}" comment that touched a scanned
-    writeback schema, MERGE into SIGDS_ACCESS_LOG. Incremental via
-    SIGDS_ACCESS_LOAD_RUNS; degrades to a recorded SKIPPED run if ACCESS_HISTORY is
-    unreadable (needs Enterprise Edition + IMPORTED PRIVILEGES on SNOWFLAKE).
- 5. Snapshot every table's score + tier to SIGDS_SCORE_HISTORY.
-
-Setup
------
-    python populate_sigds_workbook_map.py --init     # create tables + scoring views
-    python populate_sigds_workbook_map.py            # scan
-
-Configuration (environment variables -- nothing secret lives in this file)
--------------------------------------------------------------------------
-  SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_ROLE, SNOWFLAKE_WAREHOUSE   required
-  one of: SNOWFLAKE_PASSWORD | SNOWFLAKE_AUTHENTICATOR (e.g. externalbrowser)
-          | SNOWFLAKE_PRIVATE_KEY_PATH [+ SNOWFLAKE_PRIVATE_KEY_PASSPHRASE]
-  SIGDS_DATABASE            required  database containing the writeback schema(s)
-  SIGDS_SCAN_SCHEMAS        required  comma-separated writeback schemas to scan
-  SIGDS_MAP_SCHEMA          optional  where the map/log tables live (default: first scan schema)
-  SIGMA_BASE_URL            required  e.g. https://aws-api.sigmacomputing.com  (/v2 optional)
-  SIGMA_CLIENT_ID / SIGMA_CLIENT_SECRET   required (admin scope recommended)
-  SIGDS_BACKFILL_DAYS       optional  first access-log load look-back (default 90)
-  SIGDS_OVERLAP_HOURS       optional  re-scan buffer for ACCESS_HISTORY latency (default 12)
-  SIGDS_MAX_WAL_TABLES      optional  cap WAL tables for testing (disables deletion detection)
-
-Database / schema names are treated as unquoted identifiers (upper-cased).
-
-Design notes
-------------
-- Snowflake's INFORMATION_SCHEMA.TABLES.LAST_ALTERED tracks DDL, not DML, so there is
-  no cheap "did this WAL table change" check; every WAL table is read every run.
-- WAL METADATA / EDIT columns are VARCHAR JSON; TRY_PARSE_JSON tolerates bad rows.
-- "TIMESTAMP" is reserved in Snowflake and is double-quoted wherever it is used.
-"""
-
-import argparse
-import base64
-import os
-import re
-import sys
+CREATE OR REPLACE PROCEDURE sigds_scan(
+    WB_DATABASE     STRING,
+    SCAN_SCHEMAS    STRING,
+    MAP_SCHEMA      STRING  DEFAULT NULL,
+    SKIP_ACCESS_LOG BOOLEAN DEFAULT FALSE,
+    BACKFILL_DAYS   NUMBER  DEFAULT 90,
+    OVERLAP_HOURS   NUMBER  DEFAULT 12,
+    MAX_WAL_TABLES  NUMBER  DEFAULT 0
+)
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python', 'requests')
+EXTERNAL_ACCESS_INTEGRATIONS = (sigds_sigma_access)
+SECRETS = ('sigma_base_url'      = sigds_sigma_base_url,
+           'sigma_client_id'     = sigds_sigma_client_id,
+           'sigma_client_secret' = sigds_sigma_client_secret)
+HANDLER = 'main'
+AS
+$$
 import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
+import _snowflake
 import requests
-import snowflake.connector
-from snowflake.connector import DictCursor
-
-HERE = Path(__file__).resolve().parent
+from snowflake.snowpark.types import (
+    BooleanType, LongType, StringType, StructField, StructType,
+    TimestampTimeZone, TimestampType,
+)
 
 # Sigma appends "-- Sigma Σ {json}" (U+03A3) to every query it generates.
 SIGMA_PREFIX = "-- Sigma Σ "
 
-# Staging / MERGE column layout for the per-schema WAL + physical load.
-# (name, snowflake type) -- single definition drives the temp table, MERGE and rows.
+# (name, snowflake type) -- one definition drives the staging table, MERGE and rows.
 MAIN_COLUMNS = [
     ("WAL_TABLE_FQN",             "VARCHAR"),
     ("WAL_DS_ID",                 "VARCHAR"),
@@ -90,14 +83,14 @@ MAIN_COLUMNS = [
     ("WAL_INPUT_TABLE_NAME",      "VARCHAR"),
     ("WAL_LAST_EDIT_AT",          "TIMESTAMP_NTZ"),
     ("WAL_LAST_EDIT_BY",          "VARCHAR"),
-    ("WAL_MAX_EDIT_NUM",          "NUMBER(38,0)"),
+    ("WAL_MAX_EDIT_NUM",          "NUMBER"),
     ("SIGDS_TABLE_ID",            "VARCHAR"),
     ("SIGDS_TABLE_CREATED_AT",    "TIMESTAMP_NTZ"),
     ("SIGDS_TABLE_LAST_MODIFIED", "TIMESTAMP_NTZ"),
-    ("SIGDS_TABLE_SIZE_BYTES",    "NUMBER(38,0)"),
-    ("SIGDS_TABLE_TOTAL_BYTES",   "NUMBER(38,0)"),
+    ("SIGDS_TABLE_SIZE_BYTES",    "NUMBER"),
+    ("SIGDS_TABLE_TOTAL_BYTES",   "NUMBER"),
     ("WAL_TABLE_LAST_MODIFIED",   "TIMESTAMP_NTZ"),
-    ("WAL_TABLE_SIZE_BYTES",      "NUMBER(38,0)"),
+    ("WAL_TABLE_SIZE_BYTES",      "NUMBER"),
     ("IS_ORPHANED",               "BOOLEAN"),
     ("IS_DELETED",                "BOOLEAN"),
     ("DELETED_AT",                "TIMESTAMP_NTZ"),
@@ -106,161 +99,124 @@ MAIN_COLUMNS = [
 ]
 KEY_COLUMNS = ("SIGDS_TABLE", "SCAN_SCHEMA")
 
+PHYSICAL_COLUMNS = [
+    ("SIGDS_TABLE", "VARCHAR"), ("SCAN_SCHEMA", "VARCHAR"), ("ID", "VARCHAR"),
+    ("CREATED", "TIMESTAMP_NTZ"), ("ALTERED", "TIMESTAMP_NTZ"), ("BYTES", "NUMBER"),
+    ("TOTAL", "NUMBER"), ("WAL_BYTES", "NUMBER"), ("IS_ORPHANED", "BOOLEAN"),
+    ("SCANNED", "TIMESTAMP_NTZ"),
+]
+
+ENRICH_COLUMNS = [
+    ("WORKBOOK_ID", "VARCHAR"), ("WORKBOOK_NAME", "VARCHAR"), ("WORKBOOK_PATH", "VARCHAR"),
+    ("OBJECT_TYPE", "VARCHAR"), ("API_WORKBOOK_URL", "VARCHAR"), ("API_OWNER_ID", "VARCHAR"),
+    ("API_IS_ARCHIVED", "BOOLEAN"), ("API_OWNER_FIRST_NAME", "VARCHAR"),
+    ("API_OWNER_LAST_NAME", "VARCHAR"), ("IS_TAGGED_VERSION", "BOOLEAN"),
+    ("VERSION_TAG_NAME", "VARCHAR"), ("PARENT_WORKBOOK_ID", "VARCHAR"),
+    ("API_NOT_FOUND", "BOOLEAN"), ("API_LAST_SEEN_AT", "TIMESTAMP_NTZ"),
+]
+
+# Module state set by main() (the helpers below are plain functions).
+_S = None          # Snowpark session
+_LOG = []          # run log, returned to the caller
+
 
 # ===========================================================================
-# Small helpers
+# Helpers
 # ===========================================================================
 
-def q(val) -> str:
+def log(msg):
+    _LOG.append(str(msg))
+    print(msg)
+
+
+def run(sql):
+    """Execute SQL; return rows as dicts keyed by (upper-case) column name."""
+    return [r.as_dict() for r in _S.sql(sql).collect()]
+
+
+def q(val):
     """Single-quoted SQL string literal."""
     return "'" + str(val).replace("'", "''") + "'"
 
 
-def ident(name: str) -> str:
+def qn(val):
+    """Like q() but None -> NULL."""
+    return "NULL" if val is None else q(val)
+
+
+def ident(name):
     """Double-quoted SQL identifier."""
     return '"' + name.replace('"', '""') + '"'
 
 
-def utcnow() -> datetime:
-    """Naive UTC now (matches TIMESTAMP_NTZ columns)."""
+def utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def bare_name(fqn: str) -> str:
+def ntz(dt):
+    """Naive-UTC datetime (or None) -- keeps TIMESTAMP_NTZ staging well-defined."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def ts(dt):
+    """SQL TIMESTAMP_NTZ literal (or NULL)."""
+    dt = ntz(dt)
+    return "NULL" if dt is None else f"'{dt.isoformat(sep=' ')}'::TIMESTAMP_NTZ"
+
+
+def bare_name(fqn):
     """Last part of a '"DB"."SCHEMA"."NAME"' style name, unquoted."""
     return fqn.split(".")[-1].replace('"', "")
 
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
+def _snow_type(t):
+    if t == "VARCHAR":
+        return StringType()
+    if t == "TIMESTAMP_NTZ":
+        return TimestampType(TimestampTimeZone.NTZ)
+    if t == "BOOLEAN":
+        return BooleanType()
+    return LongType()
 
 
-# ===========================================================================
-# Configuration
-# ===========================================================================
-
-def _env(name, default=None, required=False):
-    val = os.environ.get(name, default)
-    if required and not val:
-        raise SystemExit(f"Missing required environment variable: {name}")
-    return val
+def stage(table_fq, columns, rows):
+    """Write python rows to a TEMPORARY table (session-scoped) via Snowpark."""
+    schema = StructType([StructField(c, _snow_type(t), True) for c, t in columns])
+    df = _S.create_dataframe(rows, schema=schema)
+    df.write.save_as_table(table_fq, mode="overwrite", table_type="temporary")
 
 
-def load_config():
-    scan_schemas = [s.strip().upper() for s in _env("SIGDS_SCAN_SCHEMAS", required=True).split(",") if s.strip()]
-    if not scan_schemas:
-        raise SystemExit("SIGDS_SCAN_SCHEMAS must list at least one schema.")
-    base = _env("SIGMA_BASE_URL", required=True).rstrip("/")
-    if not base.endswith("/v2"):
-        base += "/v2"
-    cfg = {
-        "account":   _env("SNOWFLAKE_ACCOUNT", required=True),
-        "user":      _env("SNOWFLAKE_USER", required=True),
-        "role":      _env("SNOWFLAKE_ROLE", required=True),
-        "warehouse": _env("SNOWFLAKE_WAREHOUSE", required=True),
-        "password":      _env("SNOWFLAKE_PASSWORD"),
-        "authenticator": _env("SNOWFLAKE_AUTHENTICATOR"),
-        "key_path":      _env("SNOWFLAKE_PRIVATE_KEY_PATH"),
-        "key_pass":      _env("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE"),
-        "database":    _env("SIGDS_DATABASE", required=True).upper(),
-        "scan_schemas": scan_schemas,
-        "map_schema":  _env("SIGDS_MAP_SCHEMA", scan_schemas[0]).upper(),
-        "sigma_base":  base,
-        "sigma_id":     _env("SIGMA_CLIENT_ID", required=True),
-        "sigma_secret": _env("SIGMA_CLIENT_SECRET", required=True),
-        "backfill_days":  int(_env("SIGDS_BACKFILL_DAYS", "90")),
-        "overlap_hours":  int(_env("SIGDS_OVERLAP_HOURS", "12")),
-        "max_wal_tables": int(_env("SIGDS_MAX_WAL_TABLES", "0")),
-    }
-    if not (cfg["password"] or cfg["authenticator"] or cfg["key_path"]):
-        raise SystemExit("Set one of SNOWFLAKE_PASSWORD, SNOWFLAKE_AUTHENTICATOR or SNOWFLAKE_PRIVATE_KEY_PATH.")
-    return cfg
-
-
-def connect(cfg):
-    kwargs = dict(
-        account=cfg["account"], user=cfg["user"], role=cfg["role"],
-        warehouse=cfg["warehouse"], database=cfg["database"], schema=cfg["map_schema"],
-    )
-    if cfg["key_path"]:
-        from cryptography.hazmat.primitives import serialization
-        with open(cfg["key_path"], "rb") as fh:
-            key = serialization.load_pem_private_key(
-                fh.read(), password=cfg["key_pass"].encode() if cfg["key_pass"] else None)
-        kwargs["private_key"] = key.private_bytes(
-            serialization.Encoding.DER, serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption())
-    elif cfg["authenticator"]:
-        kwargs["authenticator"] = cfg["authenticator"]
-    else:
-        kwargs["password"] = cfg["password"]
-    return snowflake.connector.connect(**kwargs)
-
-
-# ===========================================================================
-# --init : create tables and scoring views from the SQL files
-# ===========================================================================
-
-def split_sql(text: str):
-    """Split a SQL script on ';' outside single-quoted strings, dropping '--' comments."""
-    stmts, buf, in_str, i = [], [], False, 0
-    while i < len(text):
-        ch = text[i]
-        if in_str:
-            buf.append(ch)
-            if ch == "'":
-                if text[i + 1: i + 2] == "'":      # escaped quote
-                    buf.append("'")
-                    i += 1
-                else:
-                    in_str = False
-        elif ch == "'":
-            in_str = True
-            buf.append(ch)
-        elif ch == "-" and text[i + 1: i + 2] == "-":
-            while i < len(text) and text[i] != "\n":
-                i += 1
-            continue
-        elif ch == ";":
-            stmt = "".join(buf).strip()
-            if stmt:
-                stmts.append(stmt)
-            buf = []
-        else:
-            buf.append(ch)
-        i += 1
-    tail = "".join(buf).strip()
-    if tail:
-        stmts.append(tail)
-    return stmts
-
-
-def run_init(cfg):
-    conn = connect(cfg)
-    cur = conn.cursor()
-    for fname in ("create_sigds_workbook_map.sql", "scoring_views.sql"):
-        sql = (HERE / fname).read_text(encoding="utf-8")
-        sql = sql.replace("<YOUR_DATABASE>", cfg["database"]).replace("<YOUR_SCHEMA>", cfg["map_schema"])
-        stmts = split_sql(sql)
-        log(f"--init: {fname}: {len(stmts)} statement(s)")
-        for stmt in stmts:
-            cur.execute(stmt)
-    cur.close()
-    conn.close()
-    log("--init complete.")
+def first_value(rows):
+    """First column of the first row (e.g. 'number of rows inserted' from DML)."""
+    return int(list(rows[0].values())[0]) if rows else 0
 
 
 # ===========================================================================
 # Sigma API
 # ===========================================================================
 
-def get_sigma_token(cfg) -> str:
-    auth_b64 = base64.b64encode(f"{cfg['sigma_id']}:{cfg['sigma_secret']}".encode()).decode()
+def sigma_config():
+    base = _snowflake.get_generic_secret_string("sigma_base_url").rstrip("/")
+    if not base.endswith("/v2"):
+        base += "/v2"
+    return {
+        "base": base,
+        "id": _snowflake.get_generic_secret_string("sigma_client_id"),
+        "secret": _snowflake.get_generic_secret_string("sigma_client_secret"),
+    }
+
+
+def get_sigma_token(sc):
     resp = requests.post(
-        f"{cfg['sigma_base']}/auth/token",
-        headers={"Authorization": f"Basic {auth_b64}",
-                 "Content-Type": "application/x-www-form-urlencoded"},
-        data={"grant_type": "client_credentials"}, timeout=30)
+        f"{sc['base']}/auth/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "client_credentials",
+              "client_id": sc["id"], "client_secret": sc["secret"]},
+        timeout=30)
     resp.raise_for_status()
     token = resp.json().get("access_token")
     if not token:
@@ -268,12 +224,11 @@ def get_sigma_token(cfg) -> str:
     return token
 
 
-def sigma_paginate(cfg, token, endpoint, extra_params=None) -> list:
-    """Fetch all pages of a Sigma list endpoint and return a flat list."""
+def sigma_paginate(sc, token, endpoint, extra_params=None):
     headers = {"Authorization": f"Bearer {token}"}
     items, params = [], dict(extra_params or {})
     while True:
-        resp = requests.get(f"{cfg['sigma_base']}/{endpoint}", headers=headers, params=params, timeout=60)
+        resp = requests.get(f"{sc['base']}/{endpoint}", headers=headers, params=params, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         for key in ("entries", "workbooks", "dataModels", "data", "items"):
@@ -281,13 +236,13 @@ def sigma_paginate(cfg, token, endpoint, extra_params=None) -> list:
                 items.extend(data[key])
                 break
         else:
-            log(f"  WARN: {endpoint!r} — no recognised list key in response: {list(data.keys())}")
+            log(f"  WARN: {endpoint!r} - no recognised list key in response: {list(data.keys())}")
         if not data.get("nextPage"):
             return items
         params["page"] = data["nextPage"]
 
 
-def build_id_index(entries: list, target_ids: set) -> dict:
+def build_id_index(entries, target_ids):
     """Index API objects by whichever ID field best overlaps the WAL's workbook IDs."""
     if not entries or not target_ids:
         return {}
@@ -302,30 +257,30 @@ def join_path(raw_path):
     return "/".join(raw_path) if isinstance(raw_path, list) else raw_path
 
 
-def fetch_sigma_inventory(cfg, token, target_ids):
+def fetch_sigma_inventory(sc, token, target_ids):
     """One fetch per run: workbooks (org-wide), data models, version tags, members."""
     try:
-        workbooks = sigma_paginate(cfg, token, "workbooks", {"skipPermissionCheck": "true", "limit": 500})
+        workbooks = sigma_paginate(sc, token, "workbooks", {"skipPermissionCheck": "true", "limit": 500})
         org_wide = True
     except requests.HTTPError as e:
-        # Non-admin tokens can't use skipPermissionCheck. Fall back, but then a
-        # workbook missing from the list may just be invisible, not deleted.
-        log(f"  WARN: org-wide workbook list refused ({e}); falling back to visible workbooks only. "
+        # Non-admin credentials can't use skipPermissionCheck. Fall back, but then a
+        # workbook missing from the list may be invisible rather than deleted.
+        log(f"  WARN: org-wide workbook list refused ({e}); using visible workbooks only. "
             "API_NOT_FOUND will NOT be set this run.")
-        workbooks = sigma_paginate(cfg, token, "workbooks", {"limit": 500})
+        workbooks = sigma_paginate(sc, token, "workbooks", {"limit": 500})
         org_wide = False
-    datamodels = sigma_paginate(cfg, token, "dataModels")
+    datamodels = sigma_paginate(sc, token, "dataModels")
     log(f"Sigma API: {len(workbooks)} workbook(s) (org-wide={org_wide}), {len(datamodels)} data model(s).")
 
     wb_index = build_id_index(workbooks, target_ids)
     dm_index = build_id_index(datamodels, target_ids)
 
     tagged = {}
-    for tag in sigma_paginate(cfg, token, "tags"):
+    for tag in sigma_paginate(sc, token, "tags"):
         tag_id = tag.get("versionTagId")
         if not tag_id:
             continue
-        for wb in sigma_paginate(cfg, token, f"tags/{tag_id}/workbooks"):
+        for wb in sigma_paginate(sc, token, f"tags/{tag_id}/workbooks"):
             for t in wb.get("tags", []):
                 twid = t.get("taggedWorkbookId")
                 if twid:
@@ -340,7 +295,7 @@ def fetch_sigma_inventory(cfg, token, target_ids):
     log(f"Sigma API: {len(tagged)} tagged workbook version(s).")
 
     members = {m["memberId"].strip().lower(): m
-               for m in sigma_paginate(cfg, token, "members") if m.get("memberId")}
+               for m in sigma_paginate(sc, token, "members") if m.get("memberId")}
     log(f"Sigma API: {len(members)} member(s).")
     return {"wb": wb_index, "dm": dm_index, "tagged": tagged, "members": members, "org_wide": org_wide}
 
@@ -357,7 +312,7 @@ def resolve_workbook(wid, inv, stored, now):
         "IS_TAGGED_VERSION": stored.get("IS_TAGGED_VERSION") or False,
         "VERSION_TAG_NAME": stored.get("VERSION_TAG_NAME"),
         "PARENT_WORKBOOK_ID": stored.get("PARENT_WORKBOOK_ID"),
-        "API_NOT_FOUND": False, "API_LAST_SEEN_AT": stored.get("API_LAST_SEEN_AT"),
+        "API_NOT_FOUND": False, "API_LAST_SEEN_AT": ntz(stored.get("API_LAST_SEEN_AT")),
     }
     if wb:
         out.update(WORKBOOK_NAME=wb.get("name"), WORKBOOK_PATH=join_path(wb.get("path")),
@@ -390,11 +345,11 @@ def resolve_workbook(wid, inv, stored, now):
 
 
 # ===========================================================================
-# Snowflake: WAL extraction and physical metadata
+# WAL extraction and physical metadata
 # ===========================================================================
 
-def extract_wal_records_batch(cur, wal_batch: list) -> list:
-    """One UNION ALL query over a batch of WAL tables -> latest WAL entry per SIGDS table."""
+def extract_wal_records_batch(wal_batch):
+    """One UNION ALL over a batch of WAL tables -> latest WAL entry per SIGDS table."""
     parts = []
     for wal_fqn in wal_batch:
         parts.append(f"""
@@ -419,57 +374,38 @@ def extract_wal_records_batch(cur, wal_batch: list) -> list:
                 ORDER BY EDIT_NUM DESC)                                          AS rn
         FROM {wal_fqn}
         """)
-    cur.execute(f"""
+    return run(f"""
         SELECT * EXCLUDE rn
         FROM   ({" UNION ALL ".join(parts)})
         WHERE  rn = 1 AND SIGDS_TABLE IS NOT NULL
     """)
-    return cur.fetchall()
 
 
-def load_storage_metrics(cur, database, schema) -> dict:
+def load_storage_metrics(database, schema):
     """{TABLE_NAME_UPPER: active+time-travel+fail-safe bytes}; {} if ACCOUNT_USAGE unreadable."""
     try:
-        cur.execute("""
+        rows = run(f"""
             SELECT TABLE_NAME, ACTIVE_BYTES + TIME_TRAVEL_BYTES + FAILSAFE_BYTES AS TOTAL_BYTES
             FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS
-            WHERE TABLE_CATALOG = %s AND TABLE_SCHEMA = %s AND DELETED = FALSE
-        """, (database, schema))
-        return {r["TABLE_NAME"].upper(): r["TOTAL_BYTES"] for r in cur.fetchall()}
+            WHERE TABLE_CATALOG = {q(database)} AND TABLE_SCHEMA = {q(schema)} AND DELETED = FALSE
+        """)
+        return {r["TABLE_NAME"].upper(): r["TOTAL_BYTES"] for r in rows}
     except Exception as e:
         log(f"  WARN: TABLE_STORAGE_METRICS unreadable ({str(e).splitlines()[0]}); "
             "falling back to active bytes only.")
         return {}
 
 
-def stage_and_merge(cur, map_fq, rows):
-    """Bulk-load rows into a temp table and MERGE into the map (update ALL columns)."""
-    cols = [c for c, _ in MAIN_COLUMNS]
-    ddl = ", ".join(f"{c} {t}" for c, t in MAIN_COLUMNS)
-    cur.execute(f"CREATE OR REPLACE TEMPORARY TABLE _SIGDS_UPDATES ({ddl})")
-    cur.executemany(f"INSERT INTO _SIGDS_UPDATES VALUES ({', '.join(['%s'] * len(cols))})", rows)
-    update_set = ", ".join(f"t.{c} = s.{c}" for c in cols if c not in KEY_COLUMNS)
-    cur.execute(f"""
-        MERGE INTO {map_fq} AS t
-        USING _SIGDS_UPDATES AS s
-          ON t.SIGDS_TABLE = s.SIGDS_TABLE AND t.SCAN_SCHEMA = s.SCAN_SCHEMA
-        WHEN MATCHED THEN UPDATE SET {update_set}
-        WHEN NOT MATCHED THEN INSERT ({', '.join(cols)})
-             VALUES ({', '.join('s.' + c for c in cols)})
-    """)
-
-
-def scan_schema(cur, cfg, map_fq, schema, now):
-    """WAL + physical load for one writeback schema. Returns count of rows merged."""
+def scan_schema(cfg, map_fq, fq, schema, now):
+    """WAL + physical load for one writeback schema. Returns rows merged."""
     db = cfg["database"]
     log(f"\n=== Scanning {db}.{schema} ===")
 
-    cur.execute(f"""
+    meta = {r["TABLE_NAME"].upper(): r for r in run(f"""
         SELECT TABLE_NAME, LAST_ALTERED, CREATED, BYTES, TABLE_ID
-        FROM {ident(db)}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = %s
-    """, (schema,))
-    meta = {r["TABLE_NAME"].upper(): r for r in cur.fetchall()}
-    totals = load_storage_metrics(cur, db, schema)
+        FROM {ident(db)}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = {q(schema)}
+    """)}
+    totals = load_storage_metrics(db, schema)
 
     wal_names = sorted(n for n in meta if n.startswith("SIGDS_WAL"))
     capped = cfg["max_wal_tables"] > 0
@@ -478,16 +414,14 @@ def scan_schema(cur, cfg, map_fq, schema, now):
     wal_fqns = [f"{ident(db)}.{ident(schema)}.{ident(meta[n]['TABLE_NAME'])}" for n in wal_names]
     log(f"Discovered {len(wal_fqns)} WAL table(s).")
 
-    # Stored state for this schema (deletion detection + physical refresh).
-    cur.execute(f"SELECT SIGDS_TABLE, WAL_TABLE_FQN, IS_DELETED FROM {map_fq} WHERE SCAN_SCHEMA = %s", (schema,))
-    stored = cur.fetchall()
+    stored = run(f"SELECT SIGDS_TABLE, WAL_TABLE_FQN, IS_DELETED FROM {map_fq} WHERE SCAN_SCHEMA = {q(schema)}")
 
     # --- WAL extraction (batched) -------------------------------------------
     records, batch_size = [], 100
     for i in range(0, len(wal_fqns), batch_size):
         batch = wal_fqns[i: i + batch_size]
         log(f"  WAL batch {i // batch_size + 1}/{-(-len(wal_fqns) // batch_size)} ({len(batch)} tables)")
-        records.extend(extract_wal_records_batch(cur, batch))
+        records.extend(extract_wal_records_batch(batch))
 
     # Two WALs can cover one SIGDS table during legacy->DS_ID migration: keep highest edit.
     best = {}
@@ -503,8 +437,8 @@ def scan_schema(cur, cfg, map_fq, schema, now):
         if m is None:
             return dict(exists=False)
         return dict(exists=True, id=str(m["TABLE_ID"]) if m.get("TABLE_ID") else None,
-                    created=m.get("CREATED"), altered=m.get("LAST_ALTERED"), bytes=m.get("BYTES"),
-                    total=totals.get(sigds_name.upper()))
+                    created=ntz(m.get("CREATED")), altered=ntz(m.get("LAST_ALTERED")),
+                    bytes=m.get("BYTES"), total=totals.get(sigds_name.upper()))
 
     # --- Merge WAL + physical -------------------------------------------------
     rows = []
@@ -514,14 +448,24 @@ def scan_schema(cur, cfg, map_fq, schema, now):
         rows.append((
             r["WAL_TABLE_FQN"], r["WAL_DS_ID"], r["SIGDS_TABLE"], schema, r["WORKBOOK_ID"],
             r["WAL_WORKBOOK_URL"], r["ORG_SLUG"], r["WAL_INPUT_TABLE_NAME"],
-            r["WAL_LAST_EDIT_AT"], r["WAL_LAST_EDIT_BY"], r["WAL_MAX_EDIT_NUM"],
+            ntz(r["WAL_LAST_EDIT_AT"]), r["WAL_LAST_EDIT_BY"], r["WAL_MAX_EDIT_NUM"],
             p.get("id"), p.get("created"), p.get("altered"), p.get("bytes"), p.get("total"),
-            wal_meta.get("LAST_ALTERED"), wal_meta.get("BYTES"),
+            ntz(wal_meta.get("LAST_ALTERED")), wal_meta.get("BYTES"),
             not p["exists"], False, None,
             "sigds_wal_ds_" not in (r["WAL_TABLE_FQN"] or "").lower(), now,
         ))
     if rows:
-        stage_and_merge(cur, map_fq, rows)
+        cols = [c for c, _ in MAIN_COLUMNS]
+        upd = fq("_SIGDS_UPDATES")
+        stage(upd, MAIN_COLUMNS, rows)
+        update_set = ", ".join(f"t.{c} = s.{c}" for c in cols if c not in KEY_COLUMNS)
+        run(f"""
+            MERGE INTO {map_fq} AS t USING {upd} AS s
+              ON t.SIGDS_TABLE = s.SIGDS_TABLE AND t.SCAN_SCHEMA = s.SCAN_SCHEMA
+            WHEN MATCHED THEN UPDATE SET {update_set}
+            WHEN NOT MATCHED THEN INSERT ({', '.join(cols)})
+                 VALUES ({', '.join('s.' + c for c in cols)})
+        """)
         log(f"MERGE: {len(rows)} row(s) refreshed.")
     n_orphaned = sum(1 for row in rows if row[18])
     if n_orphaned:
@@ -529,23 +473,23 @@ def scan_schema(cur, cfg, map_fq, schema, now):
 
     # --- WAL tables that vanished ---------------------------------------------
     if capped:
-        log("Deletion detection skipped (SIGDS_MAX_WAL_TABLES set).")
+        log("Deletion detection skipped (MAX_WAL_TABLES set).")
     else:
         current = set(wal_fqns)
         gone = {s["WAL_TABLE_FQN"] for s in stored
                 if s["WAL_TABLE_FQN"] and s["WAL_TABLE_FQN"] not in current and not s["IS_DELETED"]}
         if gone and not wal_fqns:
-            # Zero WAL tables visible but we previously knew of some: far more likely a
-            # grants/role problem than a mass deletion. Don't poison the data.
-            log(f"  WARN: no WAL tables visible but {len(gone)} previously known — refusing to flag "
+            # Zero WAL tables visible but some were known: far more likely a grants
+            # problem than a mass deletion. Don't poison the data.
+            log(f"  WARN: no WAL tables visible but {len(gone)} previously known - refusing to flag "
                 "deletions. Check the role's USAGE/SELECT on the schema.")
         elif gone:
-            cur.execute(f"""
+            run(f"""
                 UPDATE {map_fq}
-                SET IS_DELETED = TRUE, DELETED_AT = %s
-                WHERE SCAN_SCHEMA = %s AND (IS_DELETED IS NULL OR IS_DELETED = FALSE)
+                SET IS_DELETED = TRUE, DELETED_AT = {ts(now)}
+                WHERE SCAN_SCHEMA = {q(schema)} AND (IS_DELETED IS NULL OR IS_DELETED = FALSE)
                   AND WAL_TABLE_FQN IN ({', '.join(q(g) for g in sorted(gone))})
-            """, (now, schema))
+            """)
             log(f"Flagged {len(gone)} WAL table(s) as deleted.")
 
     # --- Physical refresh for rows the WAL no longer feeds --------------------
@@ -559,13 +503,10 @@ def scan_schema(cur, cfg, map_fq, schema, now):
                          if s["WAL_TABLE_FQN"] else None)
             prow.append((s["SIGDS_TABLE"], schema, p.get("id"), p.get("created"), p.get("altered"),
                          p.get("bytes"), p.get("total"), wal_bytes, not p["exists"], now))
-        cur.execute("""CREATE OR REPLACE TEMPORARY TABLE _SIGDS_PHYSICAL (
-            SIGDS_TABLE VARCHAR, SCAN_SCHEMA VARCHAR, ID VARCHAR, CREATED TIMESTAMP_NTZ,
-            ALTERED TIMESTAMP_NTZ, BYTES NUMBER(38,0), TOTAL NUMBER(38,0), WAL_BYTES NUMBER(38,0),
-            IS_ORPHANED BOOLEAN, SCANNED TIMESTAMP_NTZ)""")
-        cur.executemany("INSERT INTO _SIGDS_PHYSICAL VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", prow)
-        cur.execute(f"""
-            MERGE INTO {map_fq} t USING _SIGDS_PHYSICAL s
+        phys = fq("_SIGDS_PHYSICAL")
+        stage(phys, PHYSICAL_COLUMNS, prow)
+        run(f"""
+            MERGE INTO {map_fq} t USING {phys} s
               ON t.SIGDS_TABLE = s.SIGDS_TABLE AND t.SCAN_SCHEMA = s.SCAN_SCHEMA
             WHEN MATCHED THEN UPDATE SET
               t.SIGDS_TABLE_ID = s.ID, t.SIGDS_TABLE_CREATED_AT = s.CREATED,
@@ -581,38 +522,30 @@ def scan_schema(cur, cfg, map_fq, schema, now):
 # Enrichment refresh (Sigma API) across the whole map
 # ===========================================================================
 
-def refresh_enrichment(cur, cfg, map_fq, token, now):
-    cur.execute(f"""
+def refresh_enrichment(map_fq, fq, sc, now):
+    stored = {r["WORKBOOK_ID"]: r for r in run(f"""
         SELECT WORKBOOK_ID, WORKBOOK_NAME, WORKBOOK_PATH, OBJECT_TYPE, API_WORKBOOK_URL, API_OWNER_ID,
                API_IS_ARCHIVED, API_OWNER_FIRST_NAME, API_OWNER_LAST_NAME, IS_TAGGED_VERSION,
                VERSION_TAG_NAME, PARENT_WORKBOOK_ID, API_LAST_SEEN_AT
         FROM {map_fq} WHERE WORKBOOK_ID IS NOT NULL
         QUALIFY ROW_NUMBER() OVER (PARTITION BY WORKBOOK_ID ORDER BY API_LAST_SEEN_AT DESC NULLS LAST) = 1
-    """)
-    stored = {r["WORKBOOK_ID"]: r for r in cur.fetchall()}
+    """)}
     if not stored:
-        log("\nEnrichment: no WORKBOOK_IDs in the map — Sigma API skipped.")
+        log("\nEnrichment: no WORKBOOK_IDs in the map - Sigma API skipped.")
         return
     log(f"\n=== Sigma enrichment ({len(stored)} distinct WORKBOOK_ID(s)) ===")
-    inv = fetch_sigma_inventory(cfg, token, set(stored))
+    token = get_sigma_token(sc)
+    inv = fetch_sigma_inventory(sc, token, set(stored))
 
     enrich = [resolve_workbook(wid, inv, st, now) for wid, st in stored.items()]
-    not_found = sum(1 for e in enrich if e["API_NOT_FOUND"])
-    archived = sum(1 for e in enrich if e["API_IS_ARCHIVED"])
-    log(f"Resolved {len(enrich)} workbook(s): {archived} archived, {not_found} not found in Sigma.")
+    log(f"Resolved {len(enrich)} workbook(s): {sum(1 for e in enrich if e['API_IS_ARCHIVED'])} archived, "
+        f"{sum(1 for e in enrich if e['API_NOT_FOUND'])} not found in Sigma.")
 
-    cols = ["WORKBOOK_ID", "WORKBOOK_NAME", "WORKBOOK_PATH", "OBJECT_TYPE", "API_WORKBOOK_URL",
-            "API_OWNER_ID", "API_IS_ARCHIVED", "API_OWNER_FIRST_NAME", "API_OWNER_LAST_NAME",
-            "IS_TAGGED_VERSION", "VERSION_TAG_NAME", "PARENT_WORKBOOK_ID", "API_NOT_FOUND",
-            "API_LAST_SEEN_AT"]
-    types = ["VARCHAR"] * 6 + ["BOOLEAN", "VARCHAR", "VARCHAR", "BOOLEAN", "VARCHAR", "VARCHAR",
-                               "BOOLEAN", "TIMESTAMP_NTZ"]
-    cur.execute("CREATE OR REPLACE TEMPORARY TABLE _SIGDS_ENRICH (%s)" %
-                ", ".join(f"{c} {t}" for c, t in zip(cols, types)))
-    cur.executemany(f"INSERT INTO _SIGDS_ENRICH VALUES ({', '.join(['%s'] * len(cols))})",
-                    [tuple(e.get(c) for c in cols) for e in enrich])
-    cur.execute(f"""
-        MERGE INTO {map_fq} t USING _SIGDS_ENRICH s ON t.WORKBOOK_ID = s.WORKBOOK_ID
+    cols = [c for c, _ in ENRICH_COLUMNS]
+    tmp = fq("_SIGDS_ENRICH")
+    stage(tmp, ENRICH_COLUMNS, [tuple(e.get(c) for c in cols) for e in enrich])
+    run(f"""
+        MERGE INTO {map_fq} t USING {tmp} s ON t.WORKBOOK_ID = s.WORKBOOK_ID
         WHEN MATCHED THEN UPDATE SET {', '.join(f't.{c} = s.{c}' for c in cols[1:])}
     """)
 
@@ -621,42 +554,41 @@ def refresh_enrichment(cur, cfg, map_fq, token, now):
 # Access log (query history x access history)
 # ===========================================================================
 
-def load_access_log(cur, cfg, fq):
+def load_access_log(cfg, fq):
     """Incrementally land Sigma-attributed reads/writes of writeback tables."""
     run_id, now = str(uuid.uuid4()), utcnow()
     runs, access = fq("SIGDS_ACCESS_LOAD_RUNS"), fq("SIGDS_ACCESS_LOG")
     log("\n=== Access log (QUERY_HISTORY x ACCESS_HISTORY) ===")
 
     def record(status, ws, we, rows, detail):
-        cur.execute(f"INSERT INTO {runs} VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                    (run_id, now, ws, we, status, rows, detail))
+        run(f"INSERT INTO {runs} VALUES ({q(run_id)}, {ts(now)}, {ts(ws)}, {ts(we)}, "
+            f"{q(status)}, {int(rows)}, {qn(detail)})")
 
     try:
-        cur.execute("SELECT 1 FROM SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY LIMIT 1")
-        cur.fetchall()
+        run("SELECT 1 FROM SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY LIMIT 1")
     except Exception as e:
-        msg = ("cannot read SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY — needs Enterprise Edition+ and "
-               f"GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE {cfg['role']}")
+        msg = ("cannot read SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY - needs Enterprise Edition+ and "
+               "GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE to the procedure owner's role")
         log(f"  SKIPPED: {msg}\n  ({str(e).splitlines()[0]})\n"
             "  Scores will reflect WRITES ONLY and TIER 1 will be capped until this works.")
         record("SKIPPED", None, None, 0, msg)
         return
 
-    cur.execute(f"SELECT MAX(WINDOW_END) AS WE FROM {runs} WHERE STATUS = 'OK'")
-    last_end = cur.fetchone()["WE"]
+    last_end = run(f"SELECT MAX(WINDOW_END) AS WE FROM {runs} WHERE STATUS = 'OK'")[0]["WE"]
     if last_end is None:
         window_start = now - timedelta(days=cfg["backfill_days"])
-        log(f"  First run — backfilling {cfg['backfill_days']} day(s).")
+        log(f"  First run - backfilling {cfg['backfill_days']} day(s).")
     else:
-        window_start = last_end - timedelta(hours=cfg["overlap_hours"])
-        log(f"  Resuming from {last_end.isoformat()} (-{cfg['overlap_hours']}h overlap).")
+        window_start = ntz(last_end) - timedelta(hours=cfg["overlap_hours"])
+        log(f"  Resuming from {ntz(last_end).isoformat()} (-{cfg['overlap_hours']}h overlap).")
     window_end = now
 
     schemas_in = ", ".join(q(s) for s in cfg["scan_schemas"])
     prefix = q(SIGMA_PREFIX)
-    ws_lit, we_lit = f"'{window_start.isoformat()}+00:00'::TIMESTAMP_TZ", f"'{window_end.isoformat()}+00:00'::TIMESTAMP_TZ"
+    ws_lit = f"'{window_start.isoformat()}+00:00'::TIMESTAMP_TZ"
+    we_lit = f"'{window_end.isoformat()}+00:00'::TIMESTAMP_TZ"
     try:
-        cur.execute(f"""
+        res = run(f"""
         MERGE INTO {access} t USING (
             WITH scoped AS (
                 SELECT QUERY_ID, START_TIME, USER_NAME, ROLE_NAME, QUERY_TYPE, ROWS_INSERTED,
@@ -703,91 +635,113 @@ def load_access_log(cur, cfg, fq):
         VALUES
             (s.QUERY_ID, s.ACCESS_KIND, s.OBJECT_NAME, s.OBJECT_DATABASE, s.OBJECT_SCHEMA, s.START_TIME,
              s.USER_NAME, s.ROLE_NAME, s.QUERY_TYPE, s.ROWS_INSERTED, s.SIGMA_SOURCE_URL, s.SIGMA_KIND,
-             s.SIGMA_USER_EMAIL, '{now.isoformat()}'::TIMESTAMP_NTZ)
+             s.SIGMA_USER_EMAIL, {ts(now)})
         """)
-        inserted = int(list(cur.fetchone().values())[0])
+        inserted = first_value(res)
     except Exception as e:
         # Don't record OK: a failed load must not extend coverage.
         log(f"  ERROR loading access log: {str(e).splitlines()[0]}")
         record("SKIPPED", window_start, window_end, 0, f"load failed: {str(e).splitlines()[0]}")
         return
     record("OK", window_start, window_end, inserted, None)
-    log(f"  {inserted} new access row(s) landed for window {window_start:%Y-%m-%d %H:%M} → {window_end:%Y-%m-%d %H:%M} UTC.")
+    log(f"  {inserted} new access row(s) landed for window "
+        f"{window_start:%Y-%m-%d %H:%M} -> {window_end:%Y-%m-%d %H:%M} UTC.")
 
 
 # ===========================================================================
 # Score snapshot + summary
 # ===========================================================================
 
-def snapshot_scores(cur, cfg, fq, now):
+def snapshot_scores(cfg, fq, now):
     run_id = str(uuid.uuid4())
     schemas_in = ", ".join(q(s) for s in cfg["scan_schemas"])
     try:
-        cur.execute(f"""
+        res = run(f"""
             INSERT INTO {fq('SIGDS_SCORE_HISTORY')}
-            SELECT {q(run_id)}, %s, SCAN_SCHEMA, SIGDS_TABLE, WORKBOOK_NAME, TOTAL_SCORE, TIER_CODE,
+            SELECT {q(run_id)}, {ts(now)}, SCAN_SCHEMA, SIGDS_TABLE, WORKBOOK_NAME, TOTAL_SCORE, TIER_CODE,
                    ACCESS_EVIDENCE, TOTAL_BYTES, IS_ORPHANED, IS_DELETED, API_IS_ARCHIVED, API_NOT_FOUND
             FROM {fq('V_SIGDS_ARCHIVAL_SCORE')}
             WHERE UPPER(SCAN_SCHEMA) IN ({schemas_in})
-        """, (now,))
-        log(f"\nScore snapshot saved ({cur.rowcount} row(s)).")
-        cur.execute(f"SELECT * FROM {fq('V_SIGDS_TIER_SUMMARY')} ORDER BY TIER_CODE")
+        """)
+        log(f"\nScore snapshot saved ({first_value(res)} row(s)).")
         log("\nTier summary:")
-        for r in cur.fetchall():
+        for r in run(f"SELECT * FROM {fq('V_SIGDS_TIER_SUMMARY')} ORDER BY TIER_CODE"):
             log(f"  {r['ARCHIVAL_TIER']:<48} {r['RECORD_COUNT']:>5} table(s)  {r['TOTAL_SIZE_GB']} GB"
                 + (f"  [{r['HELD_BY_COVERAGE_CAP']} held by coverage cap]" if r["HELD_BY_COVERAGE_CAP"] else "")
                 + (f"  [{r['WRITE_ONLY_SCORED']} scored on writes only]" if r["WRITE_ONLY_SCORED"] else ""))
     except Exception as e:
-        log(f"\nWARN: score snapshot skipped ({str(e).splitlines()[0]}). Run with --init to create the scoring views.")
+        log(f"\nWARN: score snapshot skipped ({str(e).splitlines()[0]}). "
+            "Has scoring_views.sql been run?")
 
 
 # ===========================================================================
-# Main
+# Entry point
 # ===========================================================================
 
-def main():
-    ap = argparse.ArgumentParser(description="Populate SIGDS_WORKBOOK_MAP and the writeback access log.")
-    ap.add_argument("--init", action="store_true", help="create tables and scoring views, then exit")
-    ap.add_argument("--skip-access-log", action="store_true", help="skip the query-history load")
-    args = ap.parse_args()
+def main(session, database, scan_schemas, map_schema, skip_access_log,
+         backfill_days, overlap_hours, max_wal_tables):
+    global _S, _LOG
+    _S, _LOG = session, []
 
-    cfg = load_config()
-    if args.init:
-        run_init(cfg)
-        return
-
+    schemas = [s.strip().upper() for s in (scan_schemas or "").split(",") if s.strip()]
+    if not database or not schemas:
+        raise ValueError("DATABASE and SCAN_SCHEMAS (comma-separated) are required.")
+    cfg = {
+        "database": database.upper(),
+        "scan_schemas": schemas,
+        "map_schema": (map_schema or run("SELECT CURRENT_SCHEMA() AS S")[0]["S"]).upper(),
+        "backfill_days": int(backfill_days or 90),
+        "overlap_hours": int(overlap_hours or 12),
+        "max_wal_tables": int(max_wal_tables or 0),
+    }
     now = utcnow()
-    conn = connect(cfg)
-    cur = conn.cursor(DictCursor)
 
     def fq(name):
         return f"{ident(cfg['database'])}.{ident(cfg['map_schema'])}.{ident(name)}"
     map_fq = fq("SIGDS_WORKBOOK_MAP")
 
+    log(f"sigds_scan: scanning {cfg['database']}.[{', '.join(schemas)}], map in "
+        f"{cfg['database']}.{cfg['map_schema']}")
     try:
-        cur.execute(f"SELECT COUNT(*) AS N FROM {map_fq}")
-        cur.execute(f"SELECT COUNT(*) AS N FROM {fq('SIGDS_ACCESS_LOG')}")
+        run(f"SELECT COUNT(*) AS N FROM {map_fq}")
+        run(f"SELECT COUNT(*) AS N FROM {fq('SIGDS_ACCESS_LOG')}")
     except Exception as e:
-        raise SystemExit(f"Tables not found ({str(e).splitlines()[0]}). Run with --init first.")
+        raise RuntimeError(
+            f"Bookkeeping tables not found in {cfg['database']}.{cfg['map_schema']} "
+            f"({str(e).splitlines()[0]}). Run create_sigds_workbook_map.sql and scoring_views.sql first, "
+            "or pass MAP_SCHEMA explicitly.")
 
-    token = get_sigma_token(cfg)
-    log("Sigma token obtained.")
+    sc = sigma_config()
 
-    for schema in cfg["scan_schemas"]:
-        scan_schema(cur, cfg, map_fq, schema, now)
+    for schema in schemas:
+        scan_schema(cfg, map_fq, fq, schema, now)
 
-    refresh_enrichment(cur, cfg, map_fq, token, now)
+    refresh_enrichment(map_fq, fq, sc, now)
 
-    if args.skip_access_log:
-        log("\nAccess log skipped (--skip-access-log).")
+    if skip_access_log:
+        log("\nAccess log skipped (SKIP_ACCESS_LOG).")
     else:
-        load_access_log(cur, cfg, fq)
+        load_access_log(cfg, fq)
 
-    snapshot_scores(cur, cfg, fq, now)
-    cur.close()
-    conn.close()
+    snapshot_scores(cfg, fq, now)
     log("\nDone.")
+    return "\n".join(_LOG)
+$$;
 
 
-if __name__ == "__main__":
-    main()
+-- =============================================================================
+-- Run it
+-- =============================================================================
+--   CALL sigds_scan('MY_DB', 'WRITEBACK');
+--   CALL sigds_scan('MY_DB', 'PROD_WB,DEV_WB', 'WRITEBACK');   -- several schemas, map in WRITEBACK
+--   CALL sigds_scan('MY_DB', 'WRITEBACK', NULL, TRUE);         -- skip the query-history load
+--
+-- Schedule it (optional). Needs EXECUTE TASK (see setup_prerequisites.sql) and a
+-- warehouse. Daily at 06:00 UTC:
+--
+-- CREATE OR REPLACE TASK sigds_scan_daily
+--   WAREHOUSE = <YOUR_WAREHOUSE>
+--   SCHEDULE  = 'USING CRON 0 6 * * * UTC'
+-- AS
+--   CALL sigds_scan('MY_DB', 'WRITEBACK');
+-- ALTER TASK sigds_scan_daily RESUME;

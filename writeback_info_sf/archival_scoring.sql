@@ -7,7 +7,7 @@
 -- here, so changing a threshold can never leave two copies disagreeing.
 --
 -- Run order: create_sigds_workbook_map.sql -> scoring_views.sql ->
---            populate_sigds_workbook_map.py -> this file.
+--            sigds_scan_procedure.sql -> CALL sigds_scan(...) -> this file.
 --
 -- Before running, replace <YOUR_DATABASE> and <YOUR_SCHEMA>.
 --
