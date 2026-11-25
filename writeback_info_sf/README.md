@@ -269,6 +269,68 @@ All logic is in `V_SIGDS_ARCHIVAL_SCORE` (`scoring_views.sql`). Weights, bands, 
 UPDATE SIGDS_SCORING_CONFIG SET WAL_DAYS_1 = 540, TIER1_MIN = 80 WHERE CONFIG_ID = 1;
 ```
 
+### Decision logic
+
+How one table moves from "identified" to a tier and a recommended action. Every number below is a default that lives in `SIGDS_SCORING_CONFIG`.
+
+```mermaid
+flowchart TD
+    A["Identified table<br/>one row in SIGDS_WORKBOOK_MAP<br/>mapped to its workbook, owner and WAL table"] --> B{"Status signal<br/>first match wins"}
+
+    B -->|"Data table already gone"| S1["Orphaned: 30 points"]
+    B -->|"WAL table gone"| S2["WAL deleted: 25 points"]
+    B -->|"Workbook archived in Sigma"| S3["Archived: 20 points"]
+    B -->|"Workbook not returned by the API"| S4["Not found: 15 points"]
+    B -->|"Live workbook"| S5["No status points"]
+
+    S1 --> C["Activity and size signals add points"]
+    S2 --> C
+    S3 --> C
+    S4 --> C
+    S5 --> C
+
+    C --> C1["No WAL edits for a long time<br/>up to 25 points"]
+    C --> C2["Data table not altered for a long time<br/>up to 15 points, weak signal"]
+    C --> C3["Few or no edits ever<br/>up to 10 points"]
+    C --> C4["Legacy WAL naming<br/>up to 10 points"]
+    C --> C5["More storage to reclaim<br/>up to 10 points"]
+
+    C1 --> D["Protections subtract points"]
+    C2 --> D
+    C3 --> D
+    C4 --> D
+    C5 --> D
+
+    D --> D1["Tagged version, for example Prod or QA<br/>minus 15"]
+    D --> D2["Read in query history within 90 days<br/>minus 40"]
+    D --> D3["Last read 91 to 365 days ago<br/>minus 15"]
+
+    D1 --> E["Total score<br/>floored at 0, capped at 100"]
+    D2 --> E
+    D3 --> E
+
+    E --> F{"Score"}
+    F -->|"75 or more"| G{"Safety cap:<br/>90 days of access history loaded,<br/>or table orphaned?"}
+    F -->|"50 to 74"| T2["Tier 2: likely candidate<br/>review with owner"]
+    F -->|"25 to 49"| T3["Tier 3: monitor<br/>re-check in 90 days"]
+    F -->|"under 25"| T4["Tier 4: keep"]
+
+    G -->|"Yes"| T1["Tier 1: strong candidate<br/>confirm with owner"]
+    G -->|"No: not enough history"| T2
+
+    T1 --> H["Owner approval"]
+    T2 --> H
+    H --> I["Move to a quarantine schema<br/>rename, never drop"]
+    I --> J["Monitor 30 days or more<br/>for failed queries and broken workbooks"]
+    J -->|"No issues"| K["Drop from quarantine<br/>after owner sign-off"]
+    J -->|"Something breaks"| L["Rename back and restore"]
+```
+
+Three things the diagram makes explicit:
+- **Nothing is excluded outright.** Protections reduce the score rather than removing a table from consideration, so a heavily-read or tagged table can still appear, just in a lower tier.
+- **Status is one signal, not a gate.** An archived or not-found workbook adds points but does not by itself make a table a candidate; recent reads can still outweigh it.
+- **Everything after the tier is manual.** The tool stops at the ranked list. Approval, quarantine and any drop are taken by a person.
+
 ### Model (positive components total 100; higher = stronger archival candidate)
 
 | Dimension | Max | Logic (defaults) |
