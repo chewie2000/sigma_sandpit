@@ -66,6 +66,60 @@ flowchart LR
 
 Reading it left to right: the scan gathers three kinds of evidence (edits, reads and Sigma metadata) into a handful of bookkeeping tables. The scoring views combine them under one set of tunable weights. Nothing in the pipeline changes a writeback table: any quarantine or drop is a separate, manual step taken by a person after reviewing the output.
 
+### How a table is mapped to its workbook
+
+The scan builds one row per writeback table in `SIGDS_WORKBOOK_MAP`. This is the identity half of the tool: which workbook and owner a table belongs to, and whether anything physical or in Sigma is missing. The [Decision logic](#decision-logic) diagram below picks up from the flags this produces.
+
+```mermaid
+flowchart TD
+
+subgraph P1["PHASE 1 - Choose where to look"]
+    S1["<b>Step 1: Take the writeback schemas you name</b><br/>Source: the SCAN_SCHEMAS parameter of sigds_scan<br/>How: one run covers one database and a list of schemas.<br/>Nothing is discovered from the Sigma API at this stage,<br/>so name every schema that holds Sigma writeback.<br/>Output: a list of database.schema locations to scan"]
+end
+
+subgraph P2["PHASE 2 - Inventory what is physically there"]
+    S2["<b>Step 2: List the tables in each schema</b><br/>Source: Snowflake INFORMATION_SCHEMA.TABLES<br/>Captures name, created, last altered and bytes.<br/>Storage metrics add table id and Time Travel plus Fail-safe bytes<br/>when ACCOUNT_USAGE is readable, otherwise those stay empty."]
+    S2A["<b>2a: WAL tables</b><br/>Tables named SIGDS_WAL*, matched by literal prefix,<br/>read in batches of 100.<br/>Legacy and newer naming are both recognised"]
+    S2B["<b>2b: Data tables</b><br/>Writeback data tables are not listed on their own.<br/>Their names come from the WAL, so the listing is kept<br/>as a lookup by name for step 4.<br/>A data table with no WAL record is not discovered"]
+end
+
+subgraph P3["PHASE 3 - Read the WAL to learn who the table belongs to"]
+    S3["<b>Step 3: Read the latest edit from each WAL table</b><br/>How: take the row with the highest EDIT_NUM for each tableName.<br/>Columns used: EDIT_NUM, DS_ID, TIMESTAMP, METADATA (JSON), EDIT (JSON).<br/>The highest EDIT_NUM stands in for the edit count.<br/>If two WALs cover one table, the one with the higher edit wins."]
+    S3A["<b>3a: Parse the METADATA JSON</b><br/>tableName = the data table this WAL belongs to<br/>workbookId = the Sigma workbook<br/>sigmaUrl or workbookUrl = link, whose path carries the org slug<br/>elementTitle or inputTableTitle = the input table name<br/>userEmail = last editor"]
+    S3B["<b>3b: Fall back to the EDIT JSON</b><br/>If userEmail is missing, read<br/>blameInfo.updatedBy from the updateRow or addRow edit"]
+end
+
+subgraph P4["PHASE 4 - Connect the WAL record to its data table"]
+    S4["<b>Step 4: Look up the data table by name</b><br/>Join key: tableName from the WAL METADATA equals a table name in the same schema.<br/>Found: attach size, created, last altered, total bytes and table id.<br/>Not found: the data table is gone, so the row is flagged IS_ORPHANED.<br/>On later runs, a WAL table that has disappeared is flagged IS_DELETED,<br/>unless no WAL tables are visible at all, which points to a grants problem."]
+end
+
+subgraph P5["PHASE 5 - Resolve against Sigma's records"]
+    S5["<b>Step 5: Look up the workbook and the people</b><br/>Source: Sigma API, using the credential in the Snowflake secrets<br/>How: one org-wide workbook list, plus data models, version tags and members.<br/>Match workbookId to the list. Only the org the API client belongs to is visible.<br/>Output: name, folder path, owner and display name, archived,<br/>tagged version and its parent, and not found.<br/>Not found is set for workbooks only, and only with an org-wide list"]
+end
+
+subgraph P6["PHASE 6 - Corroborate with query history"]
+    S6["<b>Step 6: Find who really reads the table</b><br/>Source: Snowflake ACCOUNT_USAGE, QUERY_HISTORY joined to ACCESS_HISTORY<br/>Needs Enterprise Edition and an imported-privileges grant.<br/>How: Sigma appends a JSON comment to every query it generates.<br/>It holds the workbook URL and user email.<br/>Take SELECT and INSERT queries that touched the scanned schemas,<br/>tag each as READ or INSERT, and match to the map by table name.<br/>Loaded incrementally with an overlap window.<br/>Output: last read, last write, read counts, distinct users and source workbooks"]
+end
+
+subgraph P7["PHASE 7 - Record flags, then score"]
+    S7["<b>Step 7: Flags in the map, evidence in the log</b><br/>IS_ORPHANED: the data table is gone.<br/>IS_DELETED: the WAL table is gone.<br/>API_IS_ARCHIVED and API_NOT_FOUND: the workbook state in Sigma.<br/>IS_TAGGED_VERSION: a Prod or QA version of a live workbook.<br/>Query history adds read evidence only. It never changes which workbook owns a table.<br/>The scoring views combine all of this, see Decision logic below.<br/>Tables are not yet classified by owning org"]
+end
+
+S1 --> S2
+S2 --> S2A
+S2 --> S2B
+S2A --> S3
+S3 --> S3A
+S3 --> S3B
+S3A --> S4
+S3B --> S4
+S2B --> S4
+S4 --> S5
+S5 --> S7
+S1 -.->|"same schemas"| S6
+S6 --> S7
+```
+
 ## Files
 
 Run them in this order, once; then just `CALL sigds_scan(...)` on a schedule.
