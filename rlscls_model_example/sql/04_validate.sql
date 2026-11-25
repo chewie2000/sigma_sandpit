@@ -100,15 +100,15 @@ WITH emea  AS (SELECT rls_visible_count(ARRAY['RLS Demo Ops EMEA'], '') AS n),
      keyac AS (SELECT rls_visible_count(ARRAY['RLS Demo Key Accounts'], '') AS n),
      u1    AS (SELECT rls_visible_count(
                    ARRAY['RLS Demo Ops EMEA','RLS Demo Ops APAC','RLS Demo Key Accounts'],
-                   'mark.oldfield+user1@sigmacomputing.com') AS n),
+                   'user1@example.com') AS n),
      u1_teams_only AS (SELECT rls_visible_count(
                    ARRAY['RLS Demo Ops EMEA','RLS Demo Ops APAC','RLS Demo Key Accounts'],
                    '') AS n),
      u2    AS (SELECT rls_visible_count(ARRAY['RLS Demo Observers'],
-                   'mark.oldfield+user2@sigmacomputing.com') AS n),
+                   'user2@example.com') AS n),
      u2_team_only AS (SELECT rls_visible_count(ARRAY['RLS Demo Observers'], '') AS n),
      nogr  AS (SELECT rls_visible_count(ARRAY[]::text[],
-                   'mark.oldfield+user@sigmacomputing.com') AS n),
+                   'nogrants@example.com') AS n),
      london AS (SELECT count(*) AS n FROM rls_shipments WHERE office = 'London'),
      london_seen AS (SELECT count(*) AS n
                      FROM rls_visible(ARRAY['RLS Demo Ops EMEA','RLS Demo Ops APAC'], '')

@@ -80,19 +80,19 @@ INSERT INTO rls_entity_grants (entity_type, entity_value, principal_type, princi
     ('company', 'Baltic Steel',   'team', 'RLS Demo Key Accounts'),
 
     -- Personal grants
-    ('office',  'Hamburg',        'user', 'mark.oldfield+user1@sigmacomputing.com'),
-    ('site',    'COB-2',          'user', 'mark.oldfield+user1@sigmacomputing.com'),
-    ('company', 'Delta Textiles', 'user', 'mark.oldfield+user2@sigmacomputing.com');
+    ('office',  'Hamburg',        'user', 'user1@example.com'),
+    ('site',    'COB-2',          'user', 'user1@example.com'),
+    ('company', 'Delta Textiles', 'user', 'user2@example.com');
 
 -- ---------------------------------------------------------------------------
 -- VALIDATION HARNESS ONLY — mirror of Sigma team membership.
 -- ---------------------------------------------------------------------------
 INSERT INTO rls_test_personas (persona, email, note) VALUES
-    ('user1',    'mark.oldfield+user1@sigmacomputing.com',
+    ('user1',    'user1@example.com',
      'Three teams (EMEA, APAC, Key Accounts) + two personal grants'),
-    ('user2',    'mark.oldfield+user2@sigmacomputing.com',
+    ('user2',    'user2@example.com',
      'One team with zero grants + one personal company grant'),
-    ('nogrants', 'mark.oldfield+user@sigmacomputing.com',
+    ('nogrants', 'nogrants@example.com',
      'No teams, no personal grants — must see zero rows');
 
 INSERT INTO rls_test_persona_teams (persona, team_name) VALUES
