@@ -2,7 +2,7 @@
 
 > **IN DEVELOPMENT — Do not use.** This toolkit is under active development. Content may be incomplete, incorrect, or subject to breaking changes without notice.
 >
-> **Test status.** v2 has been deployed and run end to end on one Snowflake account (Enterprise Edition) against a schema of 218 WAL tables: scan, merge, orphan detection, access-log load and its incremental overlap, score snapshots, the scoring views, the coverage cap, and every report query. **Not yet exercised against a live Sigma API** (workbook names, owners, archived and not-found state): that path is covered only by local unit tests with synthetic data. Treat your first run with real Sigma credentials as a test.
+> **Test status.** Deployed and exercised end to end on a Snowflake Enterprise Edition account with a writeback schema of roughly 200 WAL tables, including the Sigma API enrichment. Behaviour on other accounts, editions and writeback volumes may differ, so run it first against a non-critical schema and review the output before relying on it. In particular, `API_NOT_FOUND` means "not visible to the Sigma API client you configured", which is not always the same as "deleted" (see [Known limitations](#known-limitations)).
 
 A standalone, **read-only information tool** for Sigma writeback (input table) estates on Snowflake. It runs **entirely inside Snowflake** as a stored procedure — call it from a Snowsight worksheet or notebook, or schedule it with a task; nothing runs on your machine. It answers three questions about every `SIGDS_*` table:
 
@@ -15,6 +15,56 @@ It never drops, renames, or alters writeback tables. It does not depend on any o
 ## Overview
 
 When Sigma writebacks are enabled, Sigma creates a WAL table (`SIGDS_WAL_*`) and a data table (`SIGDS_*`) in Snowflake for each input table. Over time these accumulate — workbooks get archived or deleted, tables go stale, WAL records are orphaned. This toolkit gives administrators visibility into that state so cleanup can be planned safely.
+
+### How it fits together
+
+```mermaid
+flowchart LR
+    subgraph SRC["Evidence sources (read only)"]
+        WB["Writeback schemas<br/>SIGDS_WAL_* and SIGDS_* tables<br/>who edits, what exists"]
+        AU["Snowflake ACCOUNT_USAGE<br/>QUERY_HISTORY x ACCESS_HISTORY<br/>who reads, storage incl. Time Travel"]
+        API["Sigma REST API<br/>workbook, owner, archived,<br/>version tags"]
+    end
+
+    SCAN{{"sigds_scan<br/>stored procedure<br/>run on demand or by a TASK"}}
+
+    subgraph STORE["Bookkeeping tables (the only thing written)"]
+        MAP[("SIGDS_WORKBOOK_MAP<br/>one row per SIGDS table")]
+        LOG[("SIGDS_ACCESS_LOG<br/>one row per Sigma read")]
+        RUNS[("SIGDS_ACCESS_LOAD_RUNS<br/>how much history is loaded")]
+        HIST[("SIGDS_SCORE_HISTORY<br/>snapshot per run")]
+    end
+
+    subgraph MODEL["Scoring model (views)"]
+        CFG["SIGDS_SCORING_CONFIG<br/>tunable weights and tiers"]
+        ACC["V_SIGDS_ACCESS_SUMMARY"]
+        SCORE["V_SIGDS_ARCHIVAL_SCORE<br/>score and tier per table"]
+        TIER["V_SIGDS_TIER_SUMMARY"]
+    end
+
+    REVIEW["Review the ranked candidates<br/>archival_scoring.sql<br/>geninfo_queries.sql"]
+    ACT["Human decision<br/>1. move to a quarantine schema<br/>2. monitor 30 days or more<br/>3. drop only after owner sign-off"]
+
+    WB -->|"scan and merge"| SCAN
+    AU -->|"incremental load"| SCAN
+    API -->|"enrich"| SCAN
+    SCAN --> MAP
+    SCAN --> LOG
+    SCAN --> RUNS
+    SCAN --> HIST
+
+    LOG --> ACC
+    MAP --> SCORE
+    ACC --> SCORE
+    RUNS -->|"coverage cap on Tier 1"| SCORE
+    CFG --> SCORE
+    SCORE --> TIER
+    SCORE --> REVIEW
+    TIER --> REVIEW
+    REVIEW --> ACT
+```
+
+Reading it left to right: the scan gathers three kinds of evidence (edits, reads and Sigma metadata) into a handful of bookkeeping tables. The scoring views combine them under one set of tunable weights. Nothing in the pipeline changes a writeback table: any quarantine or drop is a separate, manual step taken by a person after reviewing the output.
 
 ## Files
 
@@ -141,7 +191,9 @@ Start with `archival_scoring.sql` query 3 (is access evidence loaded?), then que
 
 Sigma appends a JSON comment (`-- Sigma Σ {...}`) to every warehouse query it generates, carrying the source workbook URL and the acting user's email. The tool joins `QUERY_HISTORY` × `ACCESS_HISTORY`, keeps those queries that touched a scanned writeback schema, and lands one row per (query, table, `READ`/`INSERT`) in `SIGDS_ACCESS_LOG`.
 
-> **In practice this is read evidence.** On the account it was tested on, Sigma's writeback statements arrive as `MERGE`s that carry **no** Sigma comment, so the `INSERT` branch captured nothing (0 of 196 rows) and `ACCESS_WRITE_COUNT` / `ACCESS_LAST_WRITE_AT` stay empty. That is fine for scoring — **writes are seen through the WAL** (`WAL_LAST_EDIT_AT`), and query history supplies the half the WAL cannot: **reads**. Don't read a zero write count as "never written".
+> **In practice this is read evidence.** In testing, Sigma's writeback statements arrived as `MERGE`s that carry **no** Sigma comment, so the `INSERT` branch captured nothing and `ACCESS_WRITE_COUNT` / `ACCESS_LAST_WRITE_AT` stay empty. That is fine for scoring — **writes are seen through the WAL** (`WAL_LAST_EDIT_AT`), and query history supplies the half the WAL cannot: **reads**. Don't read a zero write count as "never written".
+
+> **Where the access evidence lives.** It is deliberately **not** stored in `SIGDS_WORKBOOK_MAP`: access figures are windowed (a count of 23 means little without knowing whether the log covers 7 or 90 days) and a copy in the map could drift from the log. Query **`V_SIGDS_ARCHIVAL_SCORE`** for the combined picture (map + access summary + score), or `V_SIGDS_ACCESS_SUMMARY` for the per-table access roll-up (last read, read/write counts, distinct users and source workbooks, last source URL).
 
 This matters because the WAL only records *edits*. An input table that dashboards read daily but nobody edits looks abandoned from the WAL alone; query history shows it is live. In scoring, recent access applies a large penalty, and **absence of access is never treated as proof of abandonment** — it just removes a protection.
 
@@ -287,7 +339,7 @@ Recovery is simple when a table was moved rather than dropped — rename it back
 
 ## Known limitations
 
-- **Sigma API enrichment is untested against a live org** — see the test-status note at the top.
+- **`API_NOT_FOUND` means "not visible to this API client", not necessarily "deleted".** The Sigma API only lists workbooks in the org the client belongs to. If the writeback schema receives writes from more than one Sigma org (check the org slug in `SIGDS_ACCESS_LOG.SIGMA_SOURCE_URL` and `ORG_SLUG` in the map), workbooks from the other orgs resolve as not found. Compare those org slugs with your API client's org before treating not-found tables as deletion candidates; the recent-read and recent-edit protections in the score still apply. The scan does not yet separate cross-org tables automatically.
 - Access evidence needs Enterprise Edition + `IMPORTED PRIVILEGES`; single Snowflake account only; it is effectively read evidence (writes come from the WAL); relies on Sigma's query-comment format.
 - A SIGDS data table with **no WAL record** is invisible to the scan (discovery is WAL-driven). The tool's own `SIGDS_*` tables are not confused with writeback tables, for the same reason.
 - The procedure runs with the **caller's** rights, so the calling role needs every grant from the setup file.
