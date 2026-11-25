@@ -303,7 +303,7 @@ def get_token():
     out = subprocess.run(
         ["bash", "-lc",
          'source ~/.zshrc >/dev/null 2>&1; '
-         'bash /Users/mark.oldfield/Skills/sigma-api/scripts/get-token.sh'],
+         'bash $HOME/Skills/sigma-api/scripts/get-token.sh'],
         capture_output=True, text=True, check=True).stdout
     for line in out.splitlines():
         if "SIGMA_API_TOKEN=" in line:

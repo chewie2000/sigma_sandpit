@@ -3,7 +3,7 @@
 Working reference implementation of **additive** row-level security: a person's
 visible scope is the **union** of every team grant and every personal grant they
 hold. Built and validated end to end against a real Sigma org
-(`marko-eutest-mcp`) and a real warehouse (Postgres on Snowflake).
+(`your-org`) and a real warehouse (Postgres on Snowflake).
 
 No user attributes are involved. Team membership is never replicated into the
 warehouse — only *grant* data lives there, and Sigma resolves membership at query
