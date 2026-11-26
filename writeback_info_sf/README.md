@@ -6,6 +6,44 @@
 
 > **Test status.** Deployed and exercised end to end on a Snowflake Enterprise Edition account with a writeback schema of roughly 200 WAL tables, including the Sigma API enrichment. Behaviour on other accounts, editions and writeback volumes may differ, so run it first against a non-critical schema and review the output before relying on it. In particular, `API_NOT_FOUND` means "not visible to the Sigma API client you configured", which is not always the same as "deleted" (see [Known limitations](#known-limitations)).
 
+## The problem
+
+When Sigma writebacks are enabled, Sigma creates a WAL table (`SIGDS_WAL_*`) and a data table (`SIGDS_*`) in your warehouse for every input table. Over time these accumulate: workbooks are archived or deleted, tables go stale, and WAL records are left behind. Cleaning up is hard to do safely because:
+
+- **The names tell you nothing.** A table name does not say which workbook, input table or owner it belongs to. That lives in the WAL record's metadata and in Sigma.
+- **Neither side has the full picture.** The warehouse knows size and age but not the workbook or owner. The Sigma API knows workbooks and owners but not which tables exist or how much space they use.
+- **Edit history alone misleads.** The WAL only records edits. A table that dashboards read every day but nobody edits looks abandoned.
+- **Mistakes are costly.** Removing the wrong table breaks workbooks and input tables immediately, and a `DROP` may not be recoverable.
+
+Administrators need to see whose each table is, whether anyone still uses it, and what could be reclaimed, before anything is touched.
+
+## An approach
+
+One way to solve this is to gather three independent kinds of evidence for each table, score them in the open, and keep a person in the loop.
+
+```mermaid
+flowchart LR
+    W["WAL tables<br/>identity and last edit"] --> C["Combine<br/>per table"]
+    A["Sigma API<br/>workbook, owner, archived"] --> C
+    Q["Query history<br/>who reads it"] --> C
+    C --> S["Score and tier<br/>tunable weights"]
+    S --> R["Human review"]
+    R --> M["Quarantine, monitor,<br/>then drop"]
+```
+
+1. **Identity from the WAL.** Each WAL record carries the data table name, the Sigma workbook, the input table name and the last editor, so it ties an opaque table name to its workbook.
+2. **Ownership and state from the Sigma API.** The workbook list shows who owns each workbook and whether it is archived, deleted or a tagged version.
+3. **Usage from warehouse query history.** Sigma marks every query it generates, so reads of a writeback table can be attributed to a workbook and user. This catches tables that are read but never edited.
+4. **Score, then decide.** Combine the evidence into a tunable score and tier. Nothing is removed automatically: candidates are moved to a quarantine schema, watched for a period, and dropped only after the owner agrees.
+
+Principles that keep it safe:
+- **Read-only.** The analysis never changes a writeback table.
+- **Reads protect.** Recent reads reduce a table's score, even when nothing has edited it.
+- **Absence of evidence is not proof.** No access seen only removes a protection. It never proves abandonment.
+- **The weights are opinions.** Thresholds differ between customers, so they are configuration, not code.
+
+## This project
+
 A standalone, **read-only information tool** for Sigma writeback (input table) estates on Snowflake. It runs **entirely inside Snowflake** as a stored procedure — call it from a Snowsight worksheet or notebook, or schedule it with a task; nothing runs on your machine. It answers three questions about every `SIGDS_*` table:
 
 1. **Whose is it?** — maps each WAL / data table to its Sigma workbook or data model, owner, folder, and archived / deleted state.
@@ -13,10 +51,6 @@ A standalone, **read-only information tool** for Sigma writeback (input table) e
 3. **What could be reclaimed?** — a transparent, tunable score and tier per table, plus reclaimable storage including Time Travel / Fail-safe.
 
 It never drops, renames, or alters writeback tables. It does not depend on any other toolkit. The only elevated step is a **one-time ACCOUNTADMIN setup** (a network rule, secrets and an external access integration), which is what lets a Snowflake procedure call the Sigma API.
-
-## Overview
-
-When Sigma writebacks are enabled, Sigma creates a WAL table (`SIGDS_WAL_*`) and a data table (`SIGDS_*`) in Snowflake for each input table. Over time these accumulate — workbooks get archived or deleted, tables go stale, WAL records are orphaned. This toolkit gives administrators visibility into that state so cleanup can be planned safely.
 
 ### How it fits together
 
@@ -68,72 +102,24 @@ flowchart LR
 
 Reading it left to right: the scan gathers three kinds of evidence (edits, reads and Sigma metadata) into a handful of bookkeeping tables. The scoring views combine them under one set of tunable weights. Nothing in the pipeline changes a writeback table: any quarantine or drop is a separate, manual step taken by a person after reviewing the output.
 
-### How one run works, step by step
+### The scan at a glance
 
-The logic of the `sigds_scan` procedure, in the order the code runs it. Phases 1 to 4 build the identity of each table in `SIGDS_WORKBOOK_MAP`, phase 5 asks Sigma who owns it, phase 6 adds read evidence from query history, and phase 7 scores and records the result. The [Decision logic](#decision-logic) diagram below expands phase 7.
+What `sigds_scan` does each time it runs. [What the scan does, in detail](#what-the-scan-does-in-detail) explains each step, and the [Decision logic](#decision-logic) diagram expands the final scoring step.
 
 ```mermaid
 flowchart TD
-
-subgraph P0["PHASE 0 - Prepare the run"]
-    S0["<b>Step 0: Validate and set up</b><br/>Inputs: writeback database, SCAN_SCHEMAS (comma list), MAP_SCHEMA, MAP_DATABASE,<br/>SKIP_ACCESS_LOG, BACKFILL_DAYS, OVERLAP_HOURS, MAX_WAL_TABLES.<br/>Sets the session database and schema to the map location.<br/>Stops with a clear error if the bookkeeping tables are missing.<br/>Reads the Sigma URL and client credentials from the Snowflake secrets"]
-end
-
-subgraph P1["PHASE 1 - Choose where to look"]
-    S1["<b>Step 1: Take the writeback schemas you name</b><br/>Nothing is discovered from the Sigma API at this stage,<br/>so name every schema that holds Sigma writeback.<br/>The steps in phases 2 to 4 repeat once for each schema"]
-end
-
-subgraph P2["PHASE 2 - Inventory what is physically there"]
-    S2["<b>Step 2: List the tables in the schema</b><br/>Source: Snowflake INFORMATION_SCHEMA.TABLES<br/>Captures name, created, last altered and bytes.<br/>Storage metrics add table id and Time Travel plus Fail-safe bytes<br/>when ACCOUNT_USAGE is readable, otherwise those stay empty"]
-    S2A["<b>2a: WAL tables</b><br/>Tables named SIGDS_WAL*, matched by literal prefix, read in batches of 100.<br/>A WAL name without sigds_wal_ds_ is flagged IS_LEGACY_WAL.<br/>MAX_WAL_TABLES, if set, limits how many are read"]
-    S2B["<b>2b: Data tables</b><br/>Writeback data tables are not listed on their own.<br/>Their names come from the WAL, so this listing is kept<br/>as a lookup by name for step 4.<br/>A data table with no WAL record is never discovered"]
-end
-
-subgraph P3["PHASE 3 - Read the WAL to learn who the table belongs to"]
-    S3["<b>Step 3: Read the latest edit from each WAL table</b><br/>How: take the row with the highest EDIT_NUM for each tableName.<br/>Columns used: EDIT_NUM, DS_ID, TIMESTAMP, METADATA (JSON), EDIT (JSON).<br/>The highest EDIT_NUM stands in for the edit count.<br/>If two WALs cover one table, the one with the higher edit wins"]
-    S3A["<b>3a: Parse the METADATA JSON</b><br/>tableName = the data table this WAL belongs to<br/>workbookId = the Sigma workbook<br/>sigmaUrl or workbookUrl = link, whose path carries the org slug<br/>elementTitle or inputTableTitle = the input table name<br/>userEmail = last editor"]
-    S3B["<b>3b: Fall back to the EDIT JSON</b><br/>If userEmail is missing, read<br/>blameInfo.updatedBy from the updateRow or addRow edit"]
-end
-
-subgraph P4["PHASE 4 - Connect the WAL record to its data table and save"]
-    S4["<b>Step 4: Look up the data table by name, then MERGE into the map</b><br/>Join key: tableName from the WAL METADATA equals a table name in the same schema.<br/>Found: attach size, created, last altered, total bytes and table id.<br/>Not found: the data table is gone, so the row is flagged IS_ORPHANED.<br/>Every row is refreshed on every run, so reruns are safe.<br/>A WAL table seen on an earlier run but missing now is flagged IS_DELETED,<br/>unless no WAL tables are visible at all, which points to a grants problem.<br/>Rows no longer fed by a WAL still get their physical metadata refreshed"]
-end
-
-subgraph P5["PHASE 5 - Resolve against Sigma's records"]
-    D5{"Sigma API reachable<br/>and credentials valid?"}
-    S5["<b>Step 5: Look up the workbook and the people</b><br/>How: one org-wide workbook list (admin scope), plus data models,<br/>version tags and members, matched on workbookId.<br/>Only the org the API client belongs to is visible.<br/>Output: name, folder path, owner and display name, archived,<br/>tagged version and its parent, and not found.<br/>Not found is set for workbooks only, and only when the list was org-wide.<br/>If the org-wide list is refused, not found is switched off for the run"]
-    S5F["<b>Enrichment failed</b><br/>The error is logged, the run continues, and workbook names,<br/>owners and flags keep their values from the last successful run"]
-end
-
-subgraph P6["PHASE 6 - Corroborate with query history"]
-    D6{"Access log wanted<br/>and ACCESS_HISTORY readable?"}
-    S6["<b>Step 6: Find who really reads the table</b><br/>Source: Snowflake ACCOUNT_USAGE, QUERY_HISTORY joined to ACCESS_HISTORY<br/>How: Sigma appends a JSON comment to every query it generates,<br/>holding the workbook URL and user email.<br/>Take SELECT and INSERT queries that touched the scanned schemas,<br/>tag each as READ or INSERT, match to the map by table name.<br/>Loads only the window since the last good run, minus an overlap.<br/>The first run backfills BACKFILL_DAYS.<br/>Output rows go to SIGDS_ACCESS_LOG, the load goes to SIGDS_ACCESS_LOAD_RUNS"]
-    S6F["<b>Skipped</b><br/>SKIP_ACCESS_LOG is set, or ACCESS_HISTORY cannot be read.<br/>An unreadable ACCESS_HISTORY is recorded as a SKIPPED run, which adds no coverage.<br/>Scores then reflect WAL edits only and Tier 1 stays capped"]
-end
-
-subgraph P7["PHASE 7 - Score and record"]
-    S7["<b>Step 7: Score, snapshot and report</b><br/>V_SIGDS_ARCHIVAL_SCORE combines the map, the access summary and the config.<br/>Status flags, WAL and size signals, protections and the coverage cap give a tier.<br/>A snapshot of every score is saved to SIGDS_SCORE_HISTORY.<br/>The tier summary and the whole run log are returned to the caller.<br/>Query history adds read evidence only. It never changes which workbook owns a table.<br/>Tables are not yet classified by owning org"]
-end
-
-S0 --> S1
-S1 --> S2
-S2 --> S2A
-S2 --> S2B
-S2A --> S3
-S3 --> S3A
-S3 --> S3B
-S3A --> S4
-S3B --> S4
-S2B --> S4
-S4 --> D5
-D5 -->|"Yes"| S5
-D5 -->|"No"| S5F
-S5 --> D6
-S5F --> D6
-D6 -->|"Yes"| S6
-D6 -->|"No"| S6F
-S6 --> S7
-S6F --> S7
+    A["Prepare<br/>check inputs and secrets"] --> B["Scan each schema<br/>list the SIGDS_WAL tables"]
+    B --> C["Read the latest WAL edit<br/>table, workbook, editor"]
+    C --> D["Match the data table by name<br/>flag orphaned or deleted"]
+    D --> E{"Sigma API reachable?"}
+    E -->|"Yes"| F["Resolve workbook, owner,<br/>archived, version tag"]
+    E -->|"No"| G["Log the error,<br/>keep last known values"]
+    F --> H{"Access log available?"}
+    G --> H
+    H -->|"Yes"| I["Load Sigma reads<br/>from query history"]
+    H -->|"No"| J["Skip it: scores use edits only,<br/>Tier 1 stays capped"]
+    I --> K["Score, snapshot and report"]
+    J --> K
 ```
 
 ## Files
@@ -173,6 +159,22 @@ Run them in this order, once; then just `CALL sigds_scan(...)` on a schedule.
 | Azure US | `api.us.azure.sigmacomputing.com` |
 | Azure EU | `api.eu.azure.sigmacomputing.com` |
 | GCP US | `api.sigmacomputing.com` |
+
+### How credentials are handled
+
+The Sigma API credential is held in **Snowflake secrets**, never in the code.
+
+- **Three secrets:** `sigds_sigma_base_url`, `sigds_sigma_client_id` and `sigds_sigma_client_secret` (type `GENERIC_STRING`). Step 1 of the deploy below creates them.
+- **Nothing sensitive in this repository.** The SQL files contain placeholders only (`<YOUR_SIGMA_CLIENT_ID>` and so on). The real values exist only in your Snowflake account, so you will not find them on GitHub.
+- **How the procedure uses them.** `sigds_scan` is bound to the three secrets in its `CREATE PROCEDURE` statement and reads them at run time through Snowflake's secret API. They are not passed as parameters and do not appear in the procedure source, in task definitions or in the run log.
+- **Where it can connect.** The procedure can only reach Sigma through the external access integration, and its network rule allows the single host you enter in step 1.
+- **Who can use them.** The role that calls the procedure needs `USAGE` on the integration and `READ` on each secret. Snowflake does not return a secret's value through SQL, so having that access does not let someone read the credential back.
+
+Things to be aware of:
+- `CREATE SECRET` and `ALTER SECRET` record the statement text, including the value, in Snowflake's query history. Treat the credential as exposed to anyone who can read your account's query history, and rotate it afterwards if that matters.
+- Use a dedicated Sigma API client for this tool, with **Admin** scope (needed for the org-wide workbook list), and revoke it in Sigma when you stop using the tool.
+- To rotate or replace a value later, run `ALTER SECRET <db>.<schema>.sigds_sigma_client_secret SET SECRET_STRING = '<new value>';` as the secret's owner. No change to the procedure is needed.
+- To reuse an integration and secrets you already have, see "Reusing an existing integration" at the bottom of `setup_prerequisites.sql`.
 
 ### Deploy — in a Snowsight worksheet
 
@@ -248,7 +250,7 @@ Start with `archival_scoring.sql` query 3 (is access evidence loaded?), then que
 
 ---
 
-## How a run works
+## What the scan does, in detail
 
 1. **Scan each schema** — discovers `SIGDS_WAL_*` tables from `INFORMATION_SCHEMA.TABLES`, reads the latest WAL entry per SIGDS table (batched `UNION ALL`, 100 tables per query), attaches physical metadata (size, created, last altered; Time Travel + Fail-safe from `TABLE_STORAGE_METRICS` when readable), and MERGEs into `SIGDS_WORKBOOK_MAP`.
    **Every row is refreshed on every run.** (The pre-v2 script only updated rows whose WAL edit number had grown, so size, owner, and archive state silently froze.)
