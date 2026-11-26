@@ -2,7 +2,7 @@
 
 > **IN DEVELOPMENT — Do not use.** This toolkit is currently under active development. Content may be incomplete, incorrect, or subject to breaking changes without notice.
 
-> **Disclaimer:** This repository contains personal scripts and tools written independently by the author. Although the author is employed by Sigma Computing, this work is not created, endorsed, tested, or supported by Sigma Computing in any capacity. These scripts are provided as-is, with no warranty or guarantee of fitness for any purpose. Use at your own risk. For official Sigma Computing documentation, support, and tooling, refer to [Sigma's official documentation](https://help.sigmacomputing.com).
+> **Personal project.** This is my own work, shared as a reference. I work at Sigma Computing, but this is not an official Sigma product and Sigma does not support it. It is provided as-is, without warranty, so try it on a non-critical schema first. For official Sigma tooling and support, see [Sigma's documentation](https://help.sigmacomputing.com).
 
 A Snowflake-native toolkit for mapping the Sigma data model dependency graph — which data models source from which other data models, how deep the chains run, and which warehouse connection each model sources from.
 

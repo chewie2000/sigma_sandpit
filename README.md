@@ -2,7 +2,7 @@
 
 > **Proof of concept.** This is a personal sandpit — the projects here are reference implementations shared to demonstrate approaches and give others something to extrapolate from, not finished, supported, or authoritative tools. Take the ideas, adapt the patterns, build your own.
 
-> **Disclaimer:** This repository contains personal scripts and tools written independently by the author. Although the author is employed by Sigma Computing, this work is not created, endorsed, tested, or supported by Sigma Computing in any capacity. These scripts are provided as-is, with no warranty or guarantee of fitness for any purpose. Use at your own risk. For official Sigma Computing documentation, support, and tooling, refer to [Sigma's official documentation](https://help.sigmacomputing.com).
+> **Personal project.** This is my own work, shared as a reference. I work at Sigma Computing, but this is not an official Sigma product and Sigma does not support it. It is provided as-is, without warranty, so try it on a non-critical schema first. For official Sigma tooling and support, see [Sigma's documentation](https://help.sigmacomputing.com).
 
 A sandpit for Sigma Computing related projects, focused on Databricks and Snowflake integrations.
 
